@@ -38,7 +38,7 @@ A browser-based tool that converts firewall configurations into an intermediate 
 
 ### Prerequisites
 
-- **Node.js** 18+ and **npm** — only needed for development and building. The built app is a static SPA that runs entirely in the browser with no server required.
+- **Node.js** 20.19+ or 22.12+ and **npm** — only needed for development and building. The built app is a static SPA that runs entirely in the browser with no server required.
 
 ### Development
 

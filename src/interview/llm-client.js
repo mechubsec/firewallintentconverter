@@ -7,12 +7,10 @@
  * API keys are stored in the browser's localStorage and sent directly from
  * the frontend to the LLM provider — never touching this server.
  *
- * Supported providers (Phase 3):
- *   - Claude (Anthropic) — default
- *   - OpenAI (GPT-4o, GPT-4-turbo)
- *   - Ollama (local)
- *   - LM Studio (local)
- *   - Custom OpenAI-compatible endpoint
+ * Provider selection and API calls are implemented by the browser-side client
+ * in public/utils/llm-client.js. The UI defaults to Claude when AI is enabled,
+ * switches to Ollama for local-only mode, and supports a deterministic No-AI
+ * mode that makes no LLM calls.
  *
  * This server-side module provides helper functions for prompt construction;
  * actual API calls happen client-side.
