@@ -220,7 +220,7 @@ async function run() {
   saveLLMSettings({ provider: 'claude', apiKey: 'FAKE-TEST-KEY-0001', model: 'claude-sonnet-4-6' });
   fetchCalls = [];
   await getLLMSuggestion('hi');
-  assert(fetchCalls.length === 1 && fetchCalls[0].startsWith('https://api.anthropic.com'), 'cloud provider remains reachable when risk mode is not local-only');
+  assert(fetchCalls.length === 1 && new URL(fetchCalls[0]).origin === 'https://api.anthropic.com', 'cloud provider remains reachable when risk mode is not local-only');
 }
 
 run().then(() => {

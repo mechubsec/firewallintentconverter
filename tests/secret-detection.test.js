@@ -521,4 +521,45 @@ describe('firewall secret registry', () => {
   ])('does not classify non-secret syntax: %s', text => {
     expect(findSecretsInText(text)).toEqual([]);
   });
+
+  it('scans pathological hierarchical AAA input in bounded time', () => {
+    const hostile = `radius-server !{{:;${' :;'.repeat(20000)}`;
+    const started = Date.now();
+    findSecretsInText(hostile);
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
+
+  it.each([
+    'radius-server h { ; secret q; }',
+    'radius-server h { port 1; ; secret q; }',
+    'radius-server h {\n;secret q;}',
+    'radius-server h {;secret q;}',
+    'tacacs-server h { ; key "quoted secret"; }',
+    'tacplus-server h { ; secret bare-secret; }',
+  ])('redacts a hierarchical server secret after an empty statement: %s', text => {
+    const findings = findSecretsInText(text);
+    const redacted = redactConfigSecrets(text);
+    expect(findings).toEqual([
+      expect.objectContaining({ ruleId: 'aaa-secret-hierarchical', category: 'key' }),
+    ]);
+    expect(redacted.replacements).toEqual([
+      expect.objectContaining({ type: 'key' }),
+    ]);
+    expect(redacted.text).not.toContain(redacted.replacements[0].original);
+    expect(findSecretsInText(redacted.text)).toEqual([]);
+  });
+
+  it('scans hierarchical server blocks that contain empty statements in bounded time', () => {
+    const inputs = [
+      `radius-server h {${' ;'.repeat(20000)} secret q; }`,
+      `radius-server h {${';'.repeat(20000)} secret q; }`,
+    ];
+    const started = Date.now();
+    for (const input of inputs) {
+      expect(findSecretsInText(input)).toEqual([
+        expect.objectContaining({ ruleId: 'aaa-secret-hierarchical' }),
+      ]);
+    }
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
 });
