@@ -152,7 +152,7 @@ const SECRET_SYNTAXES = Object.freeze([
     (groups, placeholder) => groups[1] + placeholder + groups[4]),
   syntax('aaa-secret-cli', 'key', 'KEY', /((?:radius-server|tacacs-server|tacplus-server|set\s+system\s+(?:radius-server|tacplus-server))\s+(?:host\s+)?\S+\s+(?:secret|key)\s+)(?:"([^"]+)"|([^\s;]+))/gi, [2, 3], quoted),
   syntax('asa-aaa-server-key', 'key', 'KEY', /((?:^|\n)\s*aaa-server\s+\S+\s+\([^\)\r\n]+\)\s+host\s+\S+\s*\r?\n\s*(?:key|secret)\s+)(?:"([^"]+)"|(\S+))/gim, [2, 3], quoted),
-  syntax('aaa-secret-hierarchical', 'key', 'KEY', /((?:radius-server|tacacs-server|tacplus-server)\s+\S+\s*\{\s*(?:[^{};]+;\s*)*(?:secret|key)\s+)(?:"([^"]+)"|([^\s;}]+))/gi, [2, 3], quoted),
+  syntax('aaa-secret-hierarchical', 'key', 'KEY', /((?:radius-server|tacacs-server|tacplus-server)\s+\S+\s*\{\s*(?:[^{};\s][^{};]*;\s*)*(?:secret|key)\s+)(?:"([^"]+)"|([^\s;}]+))/gi, [2, 3], quoted),
 
   syntax('cli-pre-shared-key', 'key', 'KEY', /((?:(?:ikev[12]\s+(?:(?:local|remote)-authentication\s+)?)?pre-shared-key\s+)(?:(?:ascii-text|hexadecimal)\s+)?)(?!\{)(?:"([^"]+)"|([^\s;]+))/gi, [2, 3], quoted),
   syntax('hierarchical-pre-shared-key', 'key', 'KEY', /(pre-shared-key\s*\{\s*(?:ascii-text|hexadecimal)\s+)(?:"([^"]+)"|([^\s;}]+))/gi, [2, 3], quoted),

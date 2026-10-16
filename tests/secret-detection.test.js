@@ -521,4 +521,11 @@ describe('firewall secret registry', () => {
   ])('does not classify non-secret syntax: %s', text => {
     expect(findSecretsInText(text)).toEqual([]);
   });
+
+  it('scans pathological hierarchical AAA input in bounded time', () => {
+    const hostile = `radius-server !{{:;${' :;'.repeat(20000)}`;
+    const started = Date.now();
+    findSecretsInText(hostile);
+    expect(Date.now() - started).toBeLessThan(2000);
+  });
 });
