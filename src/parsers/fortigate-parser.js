@@ -1822,7 +1822,9 @@ function parseSecurityPolicies(tree, warnings) {
 function parseNatRules(tree, warnings) {
   const natRules = [];
   const ifaceToZone = {};
+  const zoneMemberCounts = {};
   for (const zone of parseZones(tree, warnings)) {
+    zoneMemberCounts[zone.name] = zone.interfaces.length;
     for (const iface of zone.interfaces) ifaceToZone[iface] = zone.name;
   }
   let ruleIndex = 1;
@@ -1865,12 +1867,20 @@ function parseNatRules(tree, warnings) {
     const extIntf = getString(entry['extintf']);
     // An interface that belongs to an explicit zone is matched by that zone.
     const extZone = extIntf ? (ifaceToZone[extIntf] || extIntf) : '';
+    // Destination NAT rule-sets are zone-scoped, so a VIP limited to one member
+    // of a multi-interface zone widens to the whole zone; record it so the
+    // converter can say so.
+    const zoneMemberCount = extZone ? (zoneMemberCounts[extZone] || 0) : 0;
+    const scopeWidened = ifaceToZone[extIntf] && zoneMemberCount > 1
+      ? { interface: extIntf, zone: extZone }
+      : null;
 
     natRules.push({
       name,
       type: 'destination',
       src_zones: extZone && extZone !== 'any' ? [extZone] : [],
       dst_zones: [],
+      ...(scopeWidened ? { _scope_widened: scopeWidened } : {}),
       src_addresses: ['any'],
       dst_addresses: [extIp || name],
       translated_src: null,

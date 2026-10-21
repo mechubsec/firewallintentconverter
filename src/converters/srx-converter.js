@@ -2722,6 +2722,16 @@ function convertNatRules(
         const ruleName = ruleNameFor(ruleIndex, rule, 'destination', fromZone, toZone);
         const rulePath = `${ruleSetPath} rule ${ruleName}`;
 
+        if (rule._scope_widened) {
+          // Names are single-lined so a hostile value cannot start a new command line.
+          const oneLine = (value) => String(value).replace(/[\r\n]+/g, ' ');
+          const { interface: widenedInterface, zone: widenedZone } = rule._scope_widened;
+          commands.push(`# CAVEAT: VIP ${oneLine(rule.name)} was limited to interface ${oneLine(widenedInterface)}; SRX rule-set matches all of zone ${oneLine(widenedZone)} — restrict manually`);
+          warnings.push(createWarning('warning', `nat/destination/${ruleName}`,
+            `VIP ${rule.name} was limited to interface ${widenedInterface}, but SRX destination NAT is zone-scoped and now matches all interfaces in zone ${widenedZone}`,
+            'Restrict the NAT match manually (for example with a policy or a source/destination address match)'));
+        }
+
         // Fix 1: Pre-validate translated destination address BEFORE emitting any match lines
         let resolvedDstAddr = null;
         if (rule.translated_dst) {

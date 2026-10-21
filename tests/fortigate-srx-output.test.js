@@ -109,4 +109,27 @@ config firewall address`);
     expect(text).toContain('added_by_fpic');
     expect(convert().join('\n')).not.toContain('added_by_fpic');
   });
+
+  describe('VIP interface scope inside a zone', () => {
+    const withZone = (members) => CONFIG.replace('config firewall address', `config system zone
+    edit "WAN"
+        set interface ${members.map((member) => `"${member}"`).join(' ')}
+    next
+end
+config firewall address`);
+    const run = (text) => convertToSrxSetCommands(parseFortigateConfig(text).intermediateConfig, {}, null, {});
+
+    it('warns and adds a CAVEAT when the zone has several member interfaces', () => {
+      const { commands, warnings } = run(withZone(['port1', 'port3']));
+      expect(commands.filter((line) => / from zone WAN$/.test(line) && line.includes('nat destination'))).toHaveLength(1);
+      expect(commands).toContain('# CAVEAT: VIP vip-web-01 was limited to interface port1; SRX rule-set matches all of zone WAN — restrict manually');
+      expect(warnings.some((warning) => JSON.stringify(warning).includes('vip-web-01') && JSON.stringify(warning).includes('zone WAN'))).toBe(true);
+    });
+
+    it('stays silent for a single-member zone', () => {
+      const { commands, warnings } = run(withZone(['port1']));
+      expect(commands.some((line) => line.includes('restrict manually'))).toBe(false);
+      expect(warnings.some((warning) => JSON.stringify(warning).includes('limited to interface'))).toBe(false);
+    });
+  });
 });
