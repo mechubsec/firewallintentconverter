@@ -1736,7 +1736,7 @@ function emitPolicyBody(commands, policyPath, policyName, ctx) {
 
   // Description (include source tags as comments)
   let fullDescription = policy.description || '';
-  const sourceTags = (policy.tags || []).filter((tag) => tag !== INTERNAL_IMPLICIT_RULE_TAG);
+  const sourceTags = (policy.tags || []).filter((tag) => !(policy._implicit && tag === INTERNAL_IMPLICIT_RULE_TAG));
   if (sourceTags.length > 0) {
     const tagLabel = !sourceVendor || sourceVendor === 'panos' ? 'PAN-OS tags' : 'Source tags';
     const tagNote = `[${tagLabel}: ${sourceTags.join(', ')}]`;

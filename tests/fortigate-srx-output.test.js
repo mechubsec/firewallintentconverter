@@ -84,4 +84,29 @@ describe('FortiGate to SRX output', () => {
     expect(convert(withTag('panos')).join('\n')).toContain('[PAN-OS tags: web]');
     expect(convert(withTag('fortigate')).join('\n')).toContain('[Source tags: web]');
   });
+
+  it('resolves a VIP external interface to its explicit zone', () => {
+    const zoned = CONFIG.replace('config firewall address', `config system zone
+    edit "WAN"
+        set interface "port1"
+    next
+end
+config firewall address`);
+    const commands = convertToSrxSetCommands(parseFortigateConfig(zoned).intermediateConfig, {}, null, {}).commands;
+    const fromZones = commands.filter((line) => /^set security nat destination rule-set \S+ from zone /.test(line));
+    expect(fromZones).toHaveLength(1);
+    expect(fromZones[0]).toMatch(/ from zone WAN$/);
+    expect(commands.some((line) => /security zones security-zone port1\b/.test(line))).toBe(false);
+  });
+
+  it('keeps added_by_fpic on a real policy but hides it on implicit rules', () => {
+    const tagged = (config) => ({
+      ...config,
+      security_policies: config.security_policies.map((policy) =>
+        policy.name === 'web-inbound' ? { ...policy, tags: ['added_by_fpic'] } : policy),
+    });
+    const text = convert(tagged).join('\n');
+    expect(text).toContain('added_by_fpic');
+    expect(convert().join('\n')).not.toContain('added_by_fpic');
+  });
 });

@@ -1821,6 +1821,10 @@ function parseSecurityPolicies(tree, warnings) {
 // --- NAT Rules (VIP + IP Pool + Central SNAT) ---
 function parseNatRules(tree, warnings) {
   const natRules = [];
+  const ifaceToZone = {};
+  for (const zone of parseZones(tree, warnings)) {
+    for (const iface of zone.interfaces) ifaceToZone[iface] = zone.name;
+  }
   let ruleIndex = 1;
 
   // Central SNAT map
@@ -1859,11 +1863,13 @@ function parseNatRules(tree, warnings) {
     // The VIP's external interface is where the traffic arrives: it is the
     // rule-set's from-zone, not a destination zone.
     const extIntf = getString(entry['extintf']);
+    // An interface that belongs to an explicit zone is matched by that zone.
+    const extZone = extIntf ? (ifaceToZone[extIntf] || extIntf) : '';
 
     natRules.push({
       name,
       type: 'destination',
-      src_zones: extIntf && extIntf !== 'any' ? [extIntf] : [],
+      src_zones: extZone && extZone !== 'any' ? [extZone] : [],
       dst_zones: [],
       src_addresses: ['any'],
       dst_addresses: [extIp || name],
