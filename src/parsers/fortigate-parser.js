@@ -1230,6 +1230,17 @@ function getString(val) {
   return val || '';
 }
 
+/**
+ * Returns a FortiOS "address mask" value as CIDR. FortiOS tokenises
+ * `set ip 10.0.0.1 255.255.255.0` into an array, which getString would cut
+ * to its first token and lose the mask. Single-token values pass through.
+ */
+function ipMaskToCidr(val) {
+  const parts = Array.isArray(val) ? val : String(val || '').trim().split(/\s+/).filter(Boolean);
+  if (parts.length === 2) return `${parts[0]}/${maskToCidr(parts[1])}`;
+  return parts[0] || '';
+}
+
 // ---------------------------------------------------------------------------
 // Section Parsers
 // ---------------------------------------------------------------------------
@@ -1455,7 +1466,7 @@ function parseInterfaces(tree, warnings) {
     interfaces.push({
       name,
       alias: getString(entry['alias']) || '',
-      ip: getString(entry['ip']) || '',
+      ip: ipMaskToCidr(entry['ip']),
       ipv6,
       type: getString(entry['type']) || 'physical',
       vdom: getString(entry['vdom']) || 'root',
@@ -1518,7 +1529,7 @@ function parseAddressObjects(tree, warnings) {
 
     switch (addrType) {
       case 'ipmask': {
-        const subnet = getString(entry['subnet']);
+        const subnet = ensureArray(entry['subnet']).join(' ');
         if (subnet) {
           // FortiOS uses "10.1.1.0 255.255.255.0" format
           const parts = subnet.split(/\s+/);
@@ -1845,12 +1856,15 @@ function parseNatRules(tree, warnings) {
     const extPort = getString(entry['extport']) || '';
     const mappedPort = getString(entry['mappedport']) || '';
     const vipProtocol = getString(entry['protocol']) || '';
+    // The VIP's external interface is where the traffic arrives: it is the
+    // rule-set's from-zone, not a destination zone.
+    const extIntf = getString(entry['extintf']);
 
     natRules.push({
       name,
       type: 'destination',
-      src_zones: [],
-      dst_zones: [getString(entry['extintf']) || 'any'],
+      src_zones: extIntf && extIntf !== 'any' ? [extIntf] : [],
+      dst_zones: [],
       src_addresses: ['any'],
       dst_addresses: [extIp || name],
       translated_src: null,

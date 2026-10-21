@@ -66,6 +66,10 @@ function serializeSetComments(commands) {
 // Main Converter Entry Point
 // ---------------------------------------------------------------------------
 
+// Internal marker every parser puts on the implicit rules it synthesises;
+// the rules carry their own descriptions, so it is never printed.
+const INTERNAL_IMPLICIT_RULE_TAG = 'added_by_fpic';
+
 /**
  * Converts an intermediate config to SRX set commands.
  *
@@ -1133,7 +1137,7 @@ function convertServiceGroups(groups, commands, warnings, summary, sourceVendor 
   if (!groups || groups.length === 0) return;
 
   commands.push('# =============================================');
-  commands.push('# Application Sets (from PAN-OS Service Groups)');
+  commands.push('# Application Sets (from Service Groups)');
   commands.push('# =============================================');
 
   const groupNameSet = new Set(groups.map(g => g.name));
@@ -1730,10 +1734,12 @@ function emitPolicyBody(commands, policyPath, policyName, ctx) {
     policyReferenceIssues, unmappedAppPolicyIndices,
   } = ctx;
 
-  // Description (include PAN-OS tags as comments)
+  // Description (include source tags as comments)
   let fullDescription = policy.description || '';
-  if (policy.tags && policy.tags.length > 0) {
-    const tagNote = `[PAN-OS tags: ${policy.tags.join(', ')}]`;
+  const sourceTags = (policy.tags || []).filter((tag) => tag !== INTERNAL_IMPLICIT_RULE_TAG);
+  if (sourceTags.length > 0) {
+    const tagLabel = !sourceVendor || sourceVendor === 'panos' ? 'PAN-OS tags' : 'Source tags';
+    const tagNote = `[${tagLabel}: ${sourceTags.join(', ')}]`;
     fullDescription = fullDescription ? `${fullDescription} ${tagNote}` : tagNote;
   }
   if (fullDescription) {
@@ -2000,7 +2006,7 @@ function convertSecurityPolicies(policies, commands, warnings, summary, profileM
     if (deactivateCaveats.length > 0) {
       commands.push(...deactivateCaveats);
     }
-    commands.push('# Disabled rules (PAN-OS disabled → Junos deactivate)');
+    commands.push('# Deactivated rules (disabled in source, or see caveats above)');
     commands.push(...deactivateCommands);
   }
 
