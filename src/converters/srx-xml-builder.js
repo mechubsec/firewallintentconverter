@@ -10,7 +10,7 @@
  * Phase 2+: Full XML with NAT, routing, VPN, UTM.
  */
 
-import { sanitizeJunosName, mapAppToJunos, mapProfileToSrx, createWarning, isPredefEquivalent } from '../parsers/parser-utils.js';
+import { sanitizeJunosName, mapAppToJunos, mapProfileToSrx, createWarning, isPredefEquivalent, findWidenedIngressScope } from '../parsers/parser-utils.js';
 import {
   setEnum,
   setInteger,
@@ -819,6 +819,12 @@ function buildNatXml(natRules, configuredZones, lines, warnings, identifierNames
         const ruleIndex = natRules.indexOf(rule);
         const rulePath = natRuleNamePath(rule, ruleIndex, 'destination', fromZone, toZone);
         const ruleName = identifierNames.definition(rulePath);
+        const widened = findWidenedIngressScope(rule, configuredZones);
+        if (widened) {
+          warnings.push(createWarning('warning', `nat/destination/${ruleName}`,
+            `VIP ${rule.name} was limited to interface ${widened.interfaceName}, but the SRX destination NAT rule-set is zone-scoped and matches all interfaces in zone ${widened.zone}`,
+            `Scope the rule-set with "from interface ${widened.interfaceName}"`));
+        }
         lines.push('          <rule>');
         lines.push(`            <name>${xmlText(ruleName)}</name>`);
         const dnatAny = natAnyAddress(rule);

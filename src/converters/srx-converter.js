@@ -18,7 +18,7 @@
  * (clean / warning / unsupported) for the warnings panel.
  */
 
-import { sanitizeJunosName, mapAppToJunos, mapProfileToSrx, createWarning, isPredefEquivalent, JUNOS_PREDEFINED_APPS } from '../parsers/parser-utils.js';
+import { sanitizeJunosName, mapAppToJunos, mapProfileToSrx, createWarning, isPredefEquivalent, findWidenedIngressScope, JUNOS_PREDEFINED_APPS } from '../parsers/parser-utils.js';
 import { getJunosEmission } from '../utils/app-mappings.js';
 import {
   setAddressOrPrefix,
@@ -2722,14 +2722,14 @@ function convertNatRules(
         const ruleName = ruleNameFor(ruleIndex, rule, 'destination', fromZone, toZone);
         const rulePath = `${ruleSetPath} rule ${ruleName}`;
 
-        if (rule._scope_widened) {
+        const widened = findWidenedIngressScope(rule, configuredZones);
+        if (widened) {
           // Names are single-lined so a hostile value cannot start a new command line.
           const oneLine = (value) => String(value).replace(/[\r\n]+/g, ' ');
-          const { interface: widenedInterface, zone: widenedZone } = rule._scope_widened;
-          commands.push(`# CAVEAT: VIP ${oneLine(rule.name)} was limited to interface ${oneLine(widenedInterface)}; SRX rule-set matches all of zone ${oneLine(widenedZone)} — restrict manually`);
+          commands.push(`# CAVEAT: VIP ${oneLine(rule.name)} was limited to interface ${oneLine(widened.interfaceName)}; this rule-set matches all of zone ${oneLine(widened.zone)} — scope it with "from interface ${oneLine(widened.interfaceName)}"`);
           warnings.push(createWarning('warning', `nat/destination/${ruleName}`,
-            `VIP ${rule.name} was limited to interface ${widenedInterface}, but SRX destination NAT is zone-scoped and now matches all interfaces in zone ${widenedZone}`,
-            'Restrict the NAT match manually (for example with a policy or a source/destination address match)'));
+            `VIP ${rule.name} was limited to interface ${widened.interfaceName}, but the SRX destination NAT rule-set is zone-scoped and matches all interfaces in zone ${widened.zone}`,
+            `Scope the rule-set with "from interface ${widened.interfaceName}"`));
         }
 
         // Fix 1: Pre-validate translated destination address BEFORE emitting any match lines

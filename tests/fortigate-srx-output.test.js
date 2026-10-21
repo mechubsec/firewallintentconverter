@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { parseFortigateConfig } from '../src/parsers/fortigate-parser.js';
 import { convertToSrxSetCommands } from '../src/converters/srx-converter.js';
+import { buildSrxXml } from '../src/converters/srx-xml-builder.js';
 
 const CONFIG = `config system interface
     edit "port1"
@@ -117,19 +118,39 @@ config firewall address`);
     next
 end
 config firewall address`);
-    const run = (text) => convertToSrxSetCommands(parseFortigateConfig(text).intermediateConfig, {}, null, {});
+    const parse = (text) => parseFortigateConfig(text).intermediateConfig;
+    const run = (config) => convertToSrxSetCommands(config, {}, null, {});
+    const isWidening = (warning) => JSON.stringify(warning).includes('limited to interface');
+    const CAVEAT = '# CAVEAT: VIP vip-web-01 was limited to interface port1; this rule-set matches all of zone WAN — scope it with "from interface port1"';
 
-    it('warns and adds a CAVEAT when the zone has several member interfaces', () => {
-      const { commands, warnings } = run(withZone(['port1', 'port3']));
-      expect(commands.filter((line) => / from zone WAN$/.test(line) && line.includes('nat destination'))).toHaveLength(1);
-      expect(commands).toContain('# CAVEAT: VIP vip-web-01 was limited to interface port1; SRX rule-set matches all of zone WAN — restrict manually');
-      expect(warnings.some((warning) => JSON.stringify(warning).includes('vip-web-01') && JSON.stringify(warning).includes('zone WAN'))).toBe(true);
+    it('uses the zone as from-zone and flags a multi-member zone in set output', () => {
+      const { commands, warnings } = run(parse(withZone(['port1', 'port3'])));
+      expect(commands.filter((line) => line.includes('nat destination') && / from zone WAN$/.test(line))).toHaveLength(1);
+      expect(commands).toContain(CAVEAT);
+      expect(warnings.some(isWidening)).toBe(true);
     });
 
-    it('stays silent for a single-member zone', () => {
-      const { commands, warnings } = run(withZone(['port1']));
-      expect(commands.some((line) => line.includes('restrict manually'))).toBe(false);
-      expect(warnings.some((warning) => JSON.stringify(warning).includes('limited to interface'))).toBe(false);
+    it('returns the same warning from the XML builder', () => {
+      const { warnings } = buildSrxXml(parse(withZone(['port1', 'port3'])));
+      expect(warnings.some(isWidening)).toBe(true);
+    });
+
+    it('evaluates membership at conversion time, not parse time', () => {
+      const config = parse(withZone(['port1']));
+      expect(run(config).warnings.some(isWidening)).toBe(false);
+      const zone = config.zones.find((candidate) => candidate.name === 'WAN');
+      zone.interfaces = [...zone.interfaces, 'port3'];
+      expect(run(config).warnings.some(isWidening)).toBe(true);
+      expect(buildSrxXml(config).warnings.some(isWidening)).toBe(true);
+    });
+
+    it('stays silent for a single-member zone and for a zone-less interface', () => {
+      for (const text of [withZone(['port1']), CONFIG]) {
+        const { commands, warnings } = run(parse(text));
+        expect(commands.some((line) => line.includes('scope it with'))).toBe(false);
+        expect(warnings.some(isWidening)).toBe(false);
+        expect(buildSrxXml(parse(text)).warnings.some(isWidening)).toBe(false);
+      }
     });
   });
 });

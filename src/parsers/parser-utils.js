@@ -791,3 +791,23 @@ export function detectVendor(configText) {
 
   return { vendor: 'unknown', format: 'unknown', confidence: 0 };
 }
+
+/**
+ * Returns a warning message when a NAT rule's original ingress interface is one
+ * of several members of its from-zone (the zone-scoped SRX rule-set then matches
+ * every member), or null. Evaluated against the current zone list so zone edits
+ * made after parsing are honoured.
+ *
+ * @param {Object} rule - NAT rule with optional `ingress_interface` and `src_zones`
+ * @param {Object[]} zones - Current config.zones entries
+ * @returns {{interfaceName: string, zone: string}|null}
+ */
+export function findWidenedIngressScope(rule, zones) {
+  const interfaceName = rule?.ingress_interface;
+  const zone = rule?.src_zones?.[0];
+  if (!interfaceName || !zone) return null;
+  const zoneEntry = (zones || []).find((candidate) => candidate.name === zone);
+  const members = zoneEntry?.interfaces || [];
+  if (members.length <= 1 || !members.includes(interfaceName)) return null;
+  return { interfaceName, zone };
+}
