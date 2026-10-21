@@ -121,7 +121,7 @@ config firewall address`);
     const parse = (text) => parseFortigateConfig(text).intermediateConfig;
     const run = (config) => convertToSrxSetCommands(config, {}, null, {});
     const isWidening = (warning) => JSON.stringify(warning).includes('limited to interface');
-    const CAVEAT = '# CAVEAT: VIP vip-web-01 was limited to interface port1; this rule-set matches all of zone WAN — scope it with "from interface port1"';
+    const CAVEAT = '# CAVEAT: VIP vip-web-01 was limited to interface port1; this rule-set matches all of zone WAN — scope it with "from interface ge-0/0/0.0"';
 
     it('uses the zone as from-zone and flags a multi-member zone in set output', () => {
       const { commands, warnings } = run(parse(withZone(['port1', 'port3'])));
@@ -142,6 +142,72 @@ config firewall address`);
       zone.interfaces = [...zone.interfaces, 'port3'];
       expect(run(config).warnings.some(isWidening)).toBe(true);
       expect(buildSrxXml(config).warnings.some(isWidening)).toBe(true);
+    });
+
+    const withMapping = { port1: 'ge-0/0/5', port3: 'ge-0/0/7' };
+    const runMapped = (config) => convertToSrxSetCommands(config, withMapping, null, {});
+    const twoVips = (secondInterface) => parse(withZone(['port1', 'port3', 'port4']).replace(
+      'config firewall policy', `config firewall vip
+    edit "vip-web-02"
+        set extip 203.0.113.4
+        set extintf "${secondInterface}"
+        set mappedip "192.168.10.20"
+    next
+end
+config firewall policy`));
+
+    it('warns when the ingress interface was moved out of the from-zone', () => {
+      const config = parse(withZone(['port1', 'port3']));
+      config.zones.find((candidate) => candidate.name === 'WAN').interfaces = ['port3', 'port4'];
+      const { commands, warnings } = run(config);
+      expect(commands.some((line) => line.startsWith('# CAVEAT: ') && line.includes('not in zone WAN') && line.includes("matches that zone's interfaces instead"))).toBe(true);
+      expect(warnings.some((warning) => JSON.stringify(warning).includes('not in zone WAN'))).toBe(true);
+      expect(buildSrxXml(config).warnings.some((warning) => JSON.stringify(warning).includes('not in zone WAN'))).toBe(true);
+    });
+
+    it('warns when the zone was reduced to one member that is not the ingress interface', () => {
+      const config = parse(withZone(['port1']));
+      config.zones.find((candidate) => candidate.name === 'WAN').interfaces = ['port3'];
+      expect(run(config).warnings.some((warning) => JSON.stringify(warning).includes('not in zone WAN'))).toBe(true);
+    });
+
+    it('suggests the mapped SRX interface name in set and XML', () => {
+      const config = parse(withZone(['port1', 'port3']));
+      const set = runMapped(config);
+      expect(set.commands.some((line) => line.startsWith('# CAVEAT: ') && line.includes('"from interface ge-0/0/5.0"'))).toBe(true);
+      expect(set.warnings.some((warning) => JSON.stringify(warning).includes('from interface ge-0/0/5.0'))).toBe(true);
+      expect(set.commands.some((line) => line.includes('from interface port1'))).toBe(false);
+      const xml = buildSrxXml(config, withMapping);
+      expect(xml.warnings.some((warning) => JSON.stringify(warning).includes('from interface ge-0/0/5.0'))).toBe(true);
+      expect(xml.warnings.some((warning) => JSON.stringify(warning).includes('from interface port1'))).toBe(false);
+    });
+
+    it('advises splitting the rule-set when VIPs in it widen from different interfaces', () => {
+      const config = twoVips('port3');
+      const set = runMapped(config);
+      const caveats = set.commands.filter((line) => line.startsWith('# CAVEAT: '));
+      expect(caveats).toHaveLength(1);
+      expect(caveats[0]).toContain('split');
+      expect(caveats[0]).toContain('vip-web-01');
+      expect(caveats[0]).toContain('vip-web-02');
+      expect(caveats[0]).toContain('ge-0/0/5.0');
+      expect(caveats[0]).toContain('ge-0/0/7.0');
+      expect(set.commands.some((line) => line.includes('scope it with'))).toBe(false);
+      const widening = set.warnings.filter((warning) => /split/i.test(JSON.stringify(warning)));
+      expect(widening).toHaveLength(1);
+      expect(set.warnings.some((warning) => JSON.stringify(warning).includes('scope the rule-set with'))).toBe(false);
+      const xmlWarnings = buildSrxXml(config, withMapping).warnings;
+      expect(xmlWarnings.filter((warning) => /split/i.test(JSON.stringify(warning)))).toHaveLength(1);
+      expect(xmlWarnings.some((warning) => JSON.stringify(warning).includes('Scope the rule-set with'))).toBe(false);
+    });
+
+    it('keeps per-interface advice when VIPs in a rule-set share the same interface', () => {
+      const config = twoVips('port1');
+      const set = runMapped(config);
+      const caveats = set.commands.filter((line) => line.startsWith('# CAVEAT: '));
+      expect(caveats).toHaveLength(2);
+      expect(caveats.every((line) => line.includes('"from interface ge-0/0/5.0"'))).toBe(true);
+      expect(buildSrxXml(config, withMapping).warnings.filter((warning) => JSON.stringify(warning).includes('from interface ge-0/0/5.0'))).toHaveLength(2);
     });
 
     it('stays silent for a single-member zone and for a zone-less interface', () => {

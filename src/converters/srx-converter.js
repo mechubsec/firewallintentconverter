@@ -18,7 +18,7 @@
  * (clean / warning / unsupported) for the warnings panel.
  */
 
-import { sanitizeJunosName, mapAppToJunos, mapProfileToSrx, createWarning, isPredefEquivalent, findWidenedIngressScope, JUNOS_PREDEFINED_APPS } from '../parsers/parser-utils.js';
+import { sanitizeJunosName, mapAppToJunos, mapProfileToSrx, createWarning, isPredefEquivalent, planIngressScopeAdvice, JUNOS_PREDEFINED_APPS } from '../parsers/parser-utils.js';
 import { getJunosEmission } from '../utils/app-mappings.js';
 import {
   setAddressOrPrefix,
@@ -2717,20 +2717,20 @@ function convertNatRules(
         commands.push(`set ${ruleSetPath} from zone ${zoneReference(zoneRuleIndex, zoneRule, 'source', fromZone)}`);
       }
 
+      // Names are single-lined so a hostile value cannot start a new command line.
+      const oneLine = (value) => String(value).replace(/[\r\n]+/g, ' ');
+      for (const advice of planIngressScopeAdvice(rules, configuredZones, (name) => mapInterfaceName(name, interfaceMappings))) {
+        commands.push(`# CAVEAT: ${oneLine(advice.caveat)}`);
+        const adviceTarget = advice.grouped
+          ? ruleSetName
+          : ruleNameFor(natRuleIndex.get(advice.rules[0]), advice.rules[0], 'destination', fromZone, toZone);
+        warnings.push(createWarning('warning', `nat/destination/${adviceTarget}`, advice.message, advice.suggestion));
+      }
+
       for (const rule of rules) {
         const ruleIndex = natRuleIndex.get(rule);
         const ruleName = ruleNameFor(ruleIndex, rule, 'destination', fromZone, toZone);
         const rulePath = `${ruleSetPath} rule ${ruleName}`;
-
-        const widened = findWidenedIngressScope(rule, configuredZones);
-        if (widened) {
-          // Names are single-lined so a hostile value cannot start a new command line.
-          const oneLine = (value) => String(value).replace(/[\r\n]+/g, ' ');
-          commands.push(`# CAVEAT: VIP ${oneLine(rule.name)} was limited to interface ${oneLine(widened.interfaceName)}; this rule-set matches all of zone ${oneLine(widened.zone)} — scope it with "from interface ${oneLine(widened.interfaceName)}"`);
-          warnings.push(createWarning('warning', `nat/destination/${ruleName}`,
-            `VIP ${rule.name} was limited to interface ${widened.interfaceName}, but the SRX destination NAT rule-set is zone-scoped and matches all interfaces in zone ${widened.zone}`,
-            `Scope the rule-set with "from interface ${widened.interfaceName}"`));
-        }
 
         // Fix 1: Pre-validate translated destination address BEFORE emitting any match lines
         let resolvedDstAddr = null;
