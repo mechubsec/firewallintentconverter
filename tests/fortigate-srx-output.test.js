@@ -201,6 +201,21 @@ config firewall policy`));
       expect(xmlWarnings.some((warning) => JSON.stringify(warning).includes('Scope the rule-set with'))).toBe(false);
     });
 
+    it('advises splitting, not scoping, when a zone edit flags only one of two VIP interfaces', () => {
+      const config = twoVips('port3');
+      config.zones.find((candidate) => candidate.name === 'WAN').interfaces = ['port1'];
+      const set = runMapped(config);
+      const caveats = set.commands.filter((line) => line.startsWith('# CAVEAT: '));
+      expect(caveats).toHaveLength(1);
+      expect(caveats[0]).toContain('split');
+      expect(caveats[0]).toContain('vip-web-01: ge-0/0/5.0');
+      expect(caveats[0]).toContain('vip-web-02: ge-0/0/7.0');
+      expect(set.commands.some((line) => line.includes('scope it with'))).toBe(false);
+      const xmlWarnings = buildSrxXml(config, withMapping).warnings;
+      expect(xmlWarnings.filter((warning) => /split/i.test(JSON.stringify(warning)))).toHaveLength(1);
+      expect(xmlWarnings.some((warning) => JSON.stringify(warning).includes('Scope the rule-set with'))).toBe(false);
+    });
+
     it('keeps per-interface advice when VIPs in a rule-set share the same interface', () => {
       const config = twoVips('port1');
       const set = runMapped(config);

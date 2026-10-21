@@ -835,12 +835,17 @@ export function planIngressScopeAdvice(rules, zones, mapInterface = (name) => na
   }
   if (flagged.length === 0) return [];
 
-  const distinctInterfaces = new Set(flagged.map((entry) => entry.mapped));
+  // A rule-set's `from` applies to every rule in it, so judge the whole rule-set:
+  // unflagged VIPs with another ingress interface would be broken by scoping.
+  const ingressRules = (rules || [])
+    .filter((rule) => rule?.ingress_interface)
+    .map((rule) => ({ rule, mapped: mapInterface(rule.ingress_interface) }));
+  const distinctInterfaces = new Set(ingressRules.map((entry) => entry.mapped));
   if (distinctInterfaces.size > 1) {
     const zone = flagged[0].scope.zone;
-    const listing = flagged.map((entry) => `${entry.rule.name}: ${entry.mapped}`).join(', ');
+    const listing = ingressRules.map((entry) => `${entry.rule.name}: ${entry.mapped}`).join(', ');
     return [{
-      rules: flagged.map((entry) => entry.rule),
+      rules: ingressRules.map((entry) => entry.rule),
       grouped: true,
       message: `VIPs in one destination NAT rule-set (zone ${zone}) have different ingress interfaces (${listing}), but the rule-set is zone-scoped and matches every interface in zone ${zone}`,
       suggestion: 'Split the rule-set by ingress interface, giving each its own "from interface <iface>"',
