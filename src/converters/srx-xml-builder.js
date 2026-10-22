@@ -10,7 +10,7 @@
  * Phase 2+: Full XML with NAT, routing, VPN, UTM.
  */
 
-import { sanitizeJunosName, mapAppToJunos, mapProfileToSrx, createWarning, isPredefEquivalent } from '../parsers/parser-utils.js';
+import { sanitizeJunosName, mapAppToJunos, mapProfileToSrx, createWarning, isPredefEquivalent, planIngressScopeAdvice } from '../parsers/parser-utils.js';
 import {
   setEnum,
   setInteger,
@@ -159,7 +159,7 @@ export function buildSrxXml(config, interfaceMappings = {}, targetContext = null
   buildPoliciesXml(config.security_policies, lines, warnings, { utmPolicyMap, idpPolicyMap, secIntelEnabled, secIntelPolicyName }, config.application_groups, sourceVendor, config._rule_groups, identifierNames);
 
   // NAT
-  buildNatXml(config.nat_rules, config.zones, lines, warnings, identifierNames);
+  buildNatXml(config.nat_rules, config.zones, lines, warnings, identifierNames, interfaceMappings);
 
   // IDP
   buildIdpXml(config, lines, identifierNames);
@@ -251,6 +251,22 @@ export function buildSrxXml(config, interfaceMappings = {}, targetContext = null
 // Zone XML Builder
 // ---------------------------------------------------------------------------
 
+/**
+ * Maps a source interface to the name emitted on a security-zone `interfaces`
+ * line: user mapping if present (unit .0 appended), else the name as-is.
+ */
+function mapZoneInterfaceName(iface, interfaceMappings = {}) {
+  if (interfaceMappings[iface]) {
+    return interfaceMappings[iface].includes('.') ? interfaceMappings[iface] : `${interfaceMappings[iface]}.0`;
+  }
+  const base = iface.split('.')[0];
+  if (interfaceMappings[base]) {
+    const unit = iface.includes('.') ? iface.split('.')[1] : '0';
+    return `${interfaceMappings[base].split('.')[0]}.${unit}`;
+  }
+  return iface;
+}
+
 function buildZonesXml(zones, lines, interfaceMappings = {}, identifierNames) {
   if (!zones || zones.length === 0) return;
 
@@ -265,18 +281,7 @@ function buildZonesXml(zones, lines, interfaceMappings = {}, identifierNames) {
       lines.push(`        <description>${xmlText(zone.description)}</description>`);
     }
     for (const iface of zone.interfaces || []) {
-      // Use user-defined mapping if available, otherwise use as-is
-      let srxIface = iface;
-      if (interfaceMappings[iface]) {
-        srxIface = interfaceMappings[iface];
-        if (!srxIface.includes('.')) srxIface += '.0';
-      } else {
-        const base = iface.split('.')[0];
-        if (interfaceMappings[base]) {
-          const unit = iface.includes('.') ? iface.split('.')[1] : '0';
-          srxIface = `${interfaceMappings[base].split('.')[0]}.${unit}`;
-        }
-      }
+      const srxIface = mapZoneInterfaceName(iface, interfaceMappings);
       lines.push(`        <interfaces>`);
       lines.push(`          <name>${xmlText(srxIface)}</name>`);
       lines.push(`        </interfaces>`);
@@ -663,7 +668,7 @@ function natRuleNamePath(rule, ruleIndex, targetType, targetFrom, targetTo) {
   throw new Error('NAT identifier path was not cataloged');
 }
 
-function buildNatXml(natRules, configuredZones, lines, warnings, identifierNames) {
+function buildNatXml(natRules, configuredZones, lines, warnings, identifierNames, interfaceMappings = {}) {
   if (!natRules || natRules.length === 0) return;
 
   for (let ruleIndex = 0; ruleIndex < natRules.length; ruleIndex += 1) {
@@ -814,6 +819,13 @@ function buildNatXml(natRules, configuredZones, lines, warnings, identifierNames
         ? `nat_rules[${firstRuleIndex}].src_zones[${firstSourceIndex}]`
         : `nat_rules[${firstRuleIndex}]#effective-source-zone`;
       lines.push(`          <from><zone>${xmlText(identifierNames.reference(fromPath))}</zone></from>`);
+
+      for (const advice of planIngressScopeAdvice(rules, configuredZones, (name) => mapZoneInterfaceName(name, interfaceMappings))) {
+        const adviceTarget = advice.grouped
+          ? ruleSetName
+          : identifierNames.definition(natRuleNamePath(advice.rules[0], natRules.indexOf(advice.rules[0]), 'destination', fromZone, toZone));
+        warnings.push(createWarning('warning', `nat/destination/${adviceTarget}`, advice.message, advice.suggestion));
+      }
 
       for (const rule of rules) {
         const ruleIndex = natRules.indexOf(rule);

@@ -791,3 +791,80 @@ export function detectVendor(configText) {
 
   return { vendor: 'unknown', format: 'unknown', confidence: 0 };
 }
+
+/**
+ * Detects a NAT rule whose original ingress interface is not scoped by its
+ * zone-keyed SRX rule-set: either the interface is one of several members of the
+ * from-zone (`widened`), or it is no longer a member of that zone at all
+ * (`not-member`). Evaluated against the current zone list so zone edits made
+ * after parsing are honoured. Zone-less rules (from-zone named after the
+ * interface itself) and single-member zones containing the interface return null.
+ *
+ * @param {Object} rule - NAT rule with optional `ingress_interface` and `src_zones`
+ * @param {Object[]} zones - Current config.zones entries
+ * @returns {{interfaceName: string, zone: string, kind: 'widened'|'not-member'}|null}
+ */
+export function findWidenedIngressScope(rule, zones) {
+  const interfaceName = rule?.ingress_interface;
+  const zone = rule?.src_zones?.[0];
+  if (!interfaceName || !zone) return null;
+  const zoneEntry = (zones || []).find((candidate) => candidate.name === zone);
+  if (!zoneEntry && zone === interfaceName) return null;
+  const members = zoneEntry?.interfaces || [];
+  if (!members.includes(interfaceName)) return { interfaceName, zone, kind: 'not-member' };
+  if (members.length <= 1) return null;
+  return { interfaceName, zone, kind: 'widened' };
+}
+
+/**
+ * Plans the ingress-scope advice for the rules of ONE destination NAT rule-set.
+ * A rule-set's `from` applies to all its rules, so when the flagged rules need
+ * different ingress interfaces a single "split the rule-set" item is returned;
+ * otherwise one per-rule item suggests `from interface <iface>`.
+ *
+ * @param {Object[]} rules - NAT rules sharing one rule-set
+ * @param {Object[]} zones - Current config.zones entries
+ * @param {function(string): string} [mapInterface] - Source -> SRX interface name
+ * @returns {{rules: Object[], grouped: boolean, message: string, suggestion: string, caveat: string}[]}
+ */
+export function planIngressScopeAdvice(rules, zones, mapInterface = (name) => name) {
+  const flagged = [];
+  for (const rule of rules || []) {
+    const scope = findWidenedIngressScope(rule, zones);
+    if (scope) flagged.push({ rule, scope, mapped: mapInterface(scope.interfaceName) });
+  }
+  if (flagged.length === 0) return [];
+
+  // A rule-set's `from` applies to every rule in it, so judge the whole rule-set:
+  // unflagged VIPs with another ingress interface would be broken by scoping.
+  const ingressRules = (rules || [])
+    .filter((rule) => rule?.ingress_interface)
+    .map((rule) => ({ rule, mapped: mapInterface(rule.ingress_interface) }));
+  const distinctInterfaces = new Set(ingressRules.map((entry) => entry.mapped));
+  if (distinctInterfaces.size > 1) {
+    const zone = flagged[0].scope.zone;
+    const listing = ingressRules.map((entry) => `${entry.rule.name}: ${entry.mapped}`).join(', ');
+    return [{
+      rules: ingressRules.map((entry) => entry.rule),
+      grouped: true,
+      message: `VIPs in one destination NAT rule-set (zone ${zone}) have different ingress interfaces (${listing}), but the rule-set is zone-scoped and matches every interface in zone ${zone}`,
+      suggestion: 'Split the rule-set by ingress interface, giving each its own "from interface <iface>"',
+      caveat: `rule-set for zone ${zone} mixes VIPs with different ingress interfaces (${listing}) — split the rule-set by ingress interface`,
+    }];
+  }
+
+  return flagged.map(({ rule, scope, mapped }) => {
+    const notMember = scope.kind === 'not-member';
+    return {
+      rules: [rule],
+      grouped: false,
+      message: notMember
+        ? `VIP ${rule.name}'s ingress interface ${scope.interfaceName} is not in zone ${scope.zone}, but the SRX destination NAT rule-set is zone-scoped and matches that zone's interfaces instead`
+        : `VIP ${rule.name} was limited to interface ${scope.interfaceName}, but the SRX destination NAT rule-set is zone-scoped and matches all interfaces in zone ${scope.zone}`,
+      suggestion: `Scope the rule-set with "from interface ${mapped}"`,
+      caveat: notMember
+        ? `VIP ${rule.name}'s ingress interface ${scope.interfaceName} is not in zone ${scope.zone}; this rule-set matches that zone's interfaces instead — scope it with "from interface ${mapped}"`
+        : `VIP ${rule.name} was limited to interface ${scope.interfaceName}; this rule-set matches all of zone ${scope.zone} — scope it with "from interface ${mapped}"`,
+    };
+  });
+}
