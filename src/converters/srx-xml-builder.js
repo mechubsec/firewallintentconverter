@@ -788,7 +788,12 @@ function buildNatXml(natRules, configuredZones, lines, warnings, identifierNames
         lines.push('        <pool>');
         lines.push(`          <name>${xmlText(poolName)}</name>`);
         for (const addr of rule.translated_src.addresses) {
-          lines.push(`          <address><name>${xmlText(addr)}</name></address>`);
+          // A "start-end" pool range is Junos "address A/32 to B/32".
+          // njsscan regex_dos: false positive. \d excludes the literal dot and hyphen, so no token backtracks.
+          const range = String(addr).match(/^(\d+\.\d+\.\d+\.\d+)-(\d+\.\d+\.\d+\.\d+)$/);  // njsscan-ignore: regex_dos
+          lines.push(range
+            ? `          <address><name>${xmlText(`${range[1]}/32`)}</name><to><ipaddr>${xmlText(`${range[2]}/32`)}</ipaddr></to></address>`
+            : `          <address><name>${xmlText(addr)}</name></address>`);
         }
         lines.push('        </pool>');
       } else if (rule.translated_src && rule.translated_src.type === 'static' && rule.translated_src.address) {

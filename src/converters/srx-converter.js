@@ -2436,6 +2436,14 @@ function convertNatRules(
     const plannedName = rawAddressNames.get(rawAddress);
     return resolveNatAddress(plannedName || rawAddress, addrLookup, warnings);
   };
+  // A "start-end" source pool range (FortiGate ippool) is Junos "A/32 to B/32".
+  // Source pools only: a match address takes a prefix, and a destination pool
+  // range would leave a range VIP's rule with nothing to match.
+  const sourcePoolAddress = rawAddress => {
+    // njsscan regex_dos: false positive. \d excludes the literal dot and hyphen, so no token backtracks.
+    const range = String(rawAddress || '').match(/^(\d+\.\d+\.\d+\.\d+)-(\d+\.\d+\.\d+\.\d+)$/);  // njsscan-ignore: regex_dos
+    return range ? `${range[1]}/32 to ${range[2]}/32` : translatedAddress(rawAddress);
+  };
 
   commands.push('# =============================================');
   commands.push('# NAT Rules');
@@ -2522,6 +2530,8 @@ function convertNatRules(
       }
 
       for (const rule of rules) {
+        // Single-lined so a hostile policy name cannot start a new command line.
+        if (rule.caveat) commands.push(`# CAVEAT: ${String(rule.caveat).replace(/[\r\n]+/g, ' ')}`);
         const ruleIndex = natRuleIndex.get(rule);
         const ruleName = ruleNameFor(ruleIndex, rule, 'source', fromZone, toZone);
         const rulePath = `${ruleSetPath} rule ${ruleName}`;
@@ -2633,7 +2643,7 @@ function convertNatRules(
             let allResolved = true;
             const poolCmds = [];
             for (const addr of rule.translated_src.addresses) {
-              const resolvedPoolAddr = translatedAddress(addr);
+              const resolvedPoolAddr = sourcePoolAddress(addr);
               if (resolvedPoolAddr) {
                 poolCmds.push(`set security nat source pool ${poolName} address ${resolvedPoolAddr}`);
               } else {
