@@ -51,6 +51,7 @@ export function parseFortigateConfig(configText) {
   const securityPolicies = parseSecurityPolicies(tree, warnings);
   const natRules = parseNatRules(tree, warnings);
   const vipObjects = parseVipObjects(tree, warnings);
+  synthesizeVipAddresses(tree, securityPolicies, addressObjects, addressGroups);
   const schedules = parseSchedules(tree, warnings);
   const profileGroups = parseProfileGroups(tree, warnings);
   const securityProfileDefinitions = parseSecurityProfileDefinitions(tree, warnings);
@@ -1854,6 +1855,14 @@ function parseNatRules(tree, warnings) {
   for (const [name, entry] of Object.entries(vipSection)) {
     if (typeof entry !== 'object') continue;
     const extIp = getString(entry['extip']) || '';
+    // Without an external IP there is nothing to match; 'any' would DNAT the whole zone.
+    // extip 0.0.0.0 means "the extintf's own address", which a static match cannot express.
+    if (!extIp || extIp === '0.0.0.0') {
+      warnings.push(createWarning('warning', `nat/${name}`,
+        `VIP "${name}" has no static extip — destination NAT not converted`,
+        'Add the external IP to the SRX destination NAT rule manually'));
+      continue;
+    }
     const mappedIp = getString(entry['mappedip']);
     const mappedIpArr = ensureArray(entry['mappedip']);
     const portForward = getString(entry['portforward']) === 'enable';
@@ -1874,7 +1883,7 @@ function parseNatRules(tree, warnings) {
       // flag a VIP that the zone-scoped SRX rule-set matches more widely.
       ingress_interface: extIntf && extIntf !== 'any' ? extIntf : null,
       src_addresses: ['any'],
-      dst_addresses: [extIp || name],
+      dst_addresses: [extIp],
       translated_src: null,
       translated_dst: mappedIpArr[0] || mappedIp || '',
       translated_port: portForward ? mappedPort : null,
@@ -1908,6 +1917,74 @@ function parseNatRules(tree, warnings) {
   }
 
   return natRules;
+}
+
+
+/**
+ * A FortiGate policy may name a VIP (or VIP group) as its dstaddr. SRX matches
+ * policy after destination NAT, so the VIP stands for its mapped address.
+ * Adds an address object per referenced VIP, plus an address group per
+ * referenced vipgrp. Never overwrites an existing object or group.
+ */
+function synthesizeVipAddresses(tree, securityPolicies, addressObjects, addressGroups) {
+  const vipSection = tree['firewall vip'] || {};
+  const vipGroupSection = tree['firewall vipgrp'] || {};
+  const knownNames = new Set([...addressObjects, ...addressGroups].map(entry => entry.name));
+
+  // The generated DNAT rule models only a plain static-nat VIP: one static
+  // extip, one mapped address, optional tcp/udp port forward. Leave any other
+  // VIP unresolved so its policy stays deactivated instead of permitting
+  // traffic the conversion does not translate as the FortiGate would.
+  const unmodeledVipFields = ['src-filter', 'srcintf-filter', 'service'];
+  const mappedAddressOf = (vipName) => {
+    const vipEntry = vipSection[vipName];
+    if (typeof vipEntry !== 'object') return null;
+    if ((getString(vipEntry['type']) || 'static-nat') !== 'static-nat') return null;
+    if (unmodeledVipFields.some((field) => vipEntry[field])) return null;
+    const protocol = getString(vipEntry['protocol']) || 'tcp';
+    if (getString(vipEntry['portforward']) === 'enable' && protocol !== 'tcp' && protocol !== 'udp') return null;
+    const extIp = getString(vipEntry['extip']) || '';
+    const mappedIps = ensureArray(vipEntry['mappedip']);
+    const mappedIp = mappedIps.length === 1 ? mappedIps[0] : '';
+    if (!extIp || extIp === '0.0.0.0' || !mappedIp || extIp.includes('-') || mappedIp.includes('-')) return null;
+    return mappedIp.includes('/') ? mappedIp : `${mappedIp}/32`;
+  };
+
+  const addVipAddress = (vipName, value) => {
+    if (knownNames.has(vipName)) return;
+    knownNames.add(vipName);
+    addressObjects.push({
+      name: vipName,
+      type: value.endsWith('/32') ? 'host' : 'subnet',
+      value,
+      description: `VIP ${vipName} mapped (post-DNAT) address`,
+      tags: [],
+      ip_version: detectIpVersion(value),
+    });
+  };
+
+  const referencedNames = new Set(securityPolicies.flatMap(policy => policy.dst_addresses));
+  for (const referencedName of referencedNames) {
+    if (knownNames.has(referencedName)) continue;
+    const groupEntry = vipGroupSection[referencedName];
+    if (typeof groupEntry !== 'object') {
+      const value = mappedAddressOf(referencedName);
+      if (value) addVipAddress(referencedName, value);
+      continue;
+    }
+    const members = ensureArray(groupEntry['member']);
+    const memberValues = members.map(mappedAddressOf);
+    // One unconvertible member would leave the address-set naming a missing address.
+    if (members.length === 0 || memberValues.some(value => !value)) continue;
+    members.forEach((member, index) => addVipAddress(member, memberValues[index]));
+    knownNames.add(referencedName);
+    addressGroups.push({
+      name: referencedName,
+      members,
+      description: getString(groupEntry['comment']) || getString(groupEntry['comments']) || '',
+      tags: [],
+    });
+  }
 }
 
 
