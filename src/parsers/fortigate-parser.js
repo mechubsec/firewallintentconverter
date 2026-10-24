@@ -46,8 +46,9 @@ export function parseFortigateConfig(configText) {
   const interfaces = parseInterfaces(tree, warnings);
   const addressObjects = parseAddressObjects(tree, warnings);
   const addressGroups = parseAddressGroups(tree, warnings);
-  const serviceObjects = parseServiceObjects(tree, warnings);
-  const serviceGroups = parseServiceGroups(tree, warnings);
+  const splitServiceGroups = [];
+  const serviceObjects = parseServiceObjects(tree, warnings, splitServiceGroups);
+  const serviceGroups = [...parseServiceGroups(tree, warnings), ...splitServiceGroups];
   const securityPolicies = parseSecurityPolicies(tree, warnings);
   const natRules = parseNatRules(tree, warnings);
   const vipObjects = parseVipObjects(tree, warnings);
@@ -1623,7 +1624,9 @@ function parseAddressGroups(tree, warnings) {
 
 
 // --- Service Objects ---
-function parseServiceObjects(tree, warnings) {
+// Multi-protocol services are split per protocol; a group under the original
+// name (pushed to splitGroups) keeps policy references resolvable.
+function parseServiceObjects(tree, warnings, splitGroups = []) {
   const svcSection = tree['firewall service custom'] || {};
   const services = [];
 
@@ -1656,32 +1659,22 @@ function parseServiceObjects(tree, warnings) {
       const udpPorts = getString(entry['udp-portrange']) || '';
       const sctpPorts = getString(entry['sctp-portrange']) || '';
 
-      if (tcpPorts) {
+      const portsByProtocol = { tcp: tcpPorts, udp: udpPorts, sctp: sctpPorts };
+      const usedProtocols = Object.keys(portsByProtocol).filter((proto) => portsByProtocol[proto]);
+      const isSplit = usedProtocols.length > 1;
+      const description = getString(entry['comment']) || '';
+
+      for (const proto of usedProtocols) {
         services.push({
-          name: udpPorts ? `${name}_tcp` : name,
-          protocol: 'tcp',
-          port_range: normalizePortRange(tcpPorts),
+          name: isSplit ? `${name}_${proto}` : name,
+          protocol: proto,
+          port_range: normalizePortRange(portsByProtocol[proto]),
           source_port: '',
-          description: getString(entry['comment']) || '',
+          description,
         });
       }
-      if (udpPorts) {
-        services.push({
-          name: tcpPorts ? `${name}_udp` : name,
-          protocol: 'udp',
-          port_range: normalizePortRange(udpPorts),
-          source_port: '',
-          description: getString(entry['comment']) || '',
-        });
-      }
-      if (sctpPorts) {
-        services.push({
-          name,
-          protocol: 'sctp',
-          port_range: normalizePortRange(sctpPorts),
-          source_port: '',
-          description: getString(entry['comment']) || '',
-        });
+      if (isSplit) {
+        splitGroups.push({ name, members: usedProtocols.map((proto) => `${name}_${proto}`), description });
       }
       // If no ports specified, it's a protocol-level match
       if (!tcpPorts && !udpPorts && !sctpPorts) {
