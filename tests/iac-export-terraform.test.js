@@ -114,7 +114,7 @@ describe('exportToTerraform policies', () => {
     expect(policyResources(hcl)).toHaveLength(0);
     expect(hcl).toContain('# Zone pair lan -> wan exported as raw set commands');
     const raw = rawConfigOf(hcl);
-    expect(raw).toContain(`"${extraLine.replace(/"/g, '\\"')}"`);
+    expect(raw).toContain(JSON.stringify(extraLine)); // same escaping as HCL for these lines (no ${ or %{)
     expect(raw).toContain(`"${POL} p match source-address a"`);
   });
 
