@@ -1942,8 +1942,16 @@ function synthesizeVipAddresses(tree, securityPolicies, addressObjects, addressG
     if (typeof vipEntry !== 'object') return null;
     if ((getString(vipEntry['type']) || 'static-nat') !== 'static-nat') return null;
     if (unmodeledVipFields.some((field) => vipEntry[field])) return null;
-    const protocol = getString(vipEntry['protocol']) || 'tcp';
-    if (getString(vipEntry['portforward']) === 'enable' && protocol !== 'tcp' && protocol !== 'udp') return null;
+    if (getString(vipEntry['portforward']) === 'enable') {
+      const protocol = getString(vipEntry['protocol']) || 'tcp';
+      if (protocol !== 'tcp' && protocol !== 'udp') return null;
+      // The DNAT rule maps one port to one port; range and m-to-n forwarding are not modeled.
+      const extPort = getString(vipEntry['extport']) || '';
+      const mappedPort = getString(vipEntry['mappedport']) || extPort;
+      if (extPort.includes('-') || mappedPort.includes('-') || getString(vipEntry['portmapping-type']) === 'm-to-n') return null;
+      // SRX matches policy after DNAT, so a translated port no longer matches the policy's service.
+      if (mappedPort !== extPort) return null;
+    }
     const extIp = getString(vipEntry['extip']) || '';
     const mappedIps = ensureArray(vipEntry['mappedip']);
     const mappedIp = mappedIps.length === 1 ? mappedIps[0] : '';

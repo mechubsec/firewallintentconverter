@@ -110,6 +110,9 @@ describe('FortiGate VIP used as policy dstaddr', () => {
     ['a non-static type', '        set type dns-translation\n'],
     ['a VIP service', '        set service "HTTPS"\n'],
     ['several mapped addresses', '        set mappedip "192.168.10.20" "192.168.10.22"\n'],
+    ['a forwarded port range', '        set portforward enable\n        set extport 1000-1002\n        set mappedport 2000-2002\n'],
+    ['m-to-n port mapping', '        set portforward enable\n        set portmapping-type m-to-n\n        set extport 1000\n        set mappedport 1000\n'],
+    ['a translated port', '        set portforward enable\n        set extport 443\n        set mappedport 8443\n'],
   ])('keeps the policy deactivated for a VIP with %s', (_label, extraLine) => {
     const commands = convertToSrxSetCommands(parseFortigateConfig(withVipLines(extraLine) + policy('"vip-web-01"')).intermediateConfig, {}, null, {}).commands;
     expect(commands.join('\n')).not.toContain('address vip-web-01 ');
@@ -121,6 +124,13 @@ describe('FortiGate VIP used as policy dstaddr', () => {
     const sctp = withVipLines('        set portforward enable\n        set protocol sctp\n        set extport 443\n        set mappedport 443\n');
     const { intermediateConfig } = parseFortigateConfig(sctp + policy('"vip-web-01"'));
     expect(intermediateConfig.address_objects.some((object) => object.name === 'vip-web-01')).toBe(false);
+  });
+
+  it('resolves a port-forward VIP that keeps its port', () => {
+    const samePort = withVipLines('        set portforward enable\n        set extport 443\n        set mappedport 443\n');
+    const commands = convertToSrxSetCommands(parseFortigateConfig(samePort + policy('"vip-web-01"')).intermediateConfig, {}, null, {}).commands;
+    expect(commands).toContain('set security address-book global address vip-web-01 192.168.10.20/32');
+    expect(isDeactivated(commands)).toBe(false);
   });
 
   it('defaults a port-forward VIP without protocol to tcp', () => {
