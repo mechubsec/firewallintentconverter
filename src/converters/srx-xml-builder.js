@@ -10,7 +10,7 @@
  * Phase 2+: Full XML with NAT, routing, VPN, UTM.
  */
 
-import { sanitizeJunosName, mapAppToJunos, mapProfileToSrx, createWarning, isPredefEquivalent, planIngressScopeAdvice } from '../parsers/parser-utils.js';
+import { sanitizeJunosName, mapAppToJunos, mapProfileToSrx, createWarning, isPredefEquivalent } from '../parsers/parser-utils.js';
 import {
   setEnum,
   setInteger,
@@ -30,21 +30,7 @@ import {
 import { canonicalizeJunosSecurityFeatures } from '../security/junos-identifier-catalog.js';
 import { validateXmlOutput } from '../security/junos-output-validation.js';
 import { versionStamp } from '../version.js';
-
-/**
- * Returns the correct ANY address for NAT rules based on whether the rule
- * contains IPv6 addresses.
- */
-function natAnyAddress(rule) {
-  const allAddrs = [
-    ...(rule.src_addresses || []),
-    ...(rule.dst_addresses || []),
-    ...(rule.translated_src?.addresses || []),
-    ...(rule.translated_src?.address ? [rule.translated_src.address] : []),
-    ...(rule.translated_dst?.address ? [rule.translated_dst.address] : []),
-  ];
-  return allAddrs.some(a => a && typeof a === 'string' && a.includes(':')) ? '::/0' : '0.0.0.0/0';
-}
+import { planNat } from './nat-plan.js';
 
 /**
  * Builds a Junos XML configuration from the intermediate config.
@@ -161,7 +147,7 @@ export function buildSrxXml(config, interfaceMappings = {}, targetContext = null
   buildPoliciesXml(config.security_policies, lines, warnings, { utmPolicyMap, idpPolicyMap, secIntelEnabled, secIntelPolicyName }, config.application_groups, sourceVendor, config._rule_groups, identifierNames, findPolicyReferenceIssues(config));
 
   // NAT
-  buildNatXml(config.nat_rules, config.zones, lines, warnings, identifierNames, interfaceMappings);
+  buildNatXml(config, lines, warnings, identifierNames, interfaceMappings);
 
   // IDP
   buildIdpXml(config, lines, identifierNames);
@@ -654,156 +640,98 @@ function buildPoliciesXml(policies, lines, warnings, profileMaps = {}, appGroups
 }
 
 // ---------------------------------------------------------------------------
-// NAT XML Builder (basic Phase 1 structure)
+// NAT XML Builder (renders the plan shared with the set converter)
 // ---------------------------------------------------------------------------
 
-function groupNatByZonePair(rules) {
-  const groups = new Map();
-  for (const rule of rules) {
-    const fromZones = rule.src_zones.length > 0 ? rule.src_zones : ['any'];
-    const toZones = rule.dst_zones.length > 0 ? rule.dst_zones : ['any'];
-    for (const from of fromZones) {
-      for (const to of toZones) {
-        const key = encodeJunosZonePair(from, to);
-        if (!groups.has(key)) groups.set(key, { fromZone: from, toZone: to, rules: [] });
-        groups.get(key).rules.push(rule);
+function buildNatXml(config, lines, warnings, identifierNames, interfaceMappings = {}) {
+  const plan = planNat({
+    natRules: config.nat_rules,
+    addressObjects: config.address_objects,
+    addressGroups: config.address_groups,
+    zones: config.zones,
+    interfaces: config.interfaces,
+    // XML keeps source interface names unless mapped, so NAT names them the same way.
+    mapInterface: name => mapZoneInterfaceName(name, interfaceMappings),
+    naming: identifierNames,
+  });
+  if (!plan) return;
+  warnings.push(...plan.warnings);
+
+  const comments = (indent, texts) => {
+    for (const text of texts) lines.push(`${indent}${xmlComment(text, 'nat_rules')}`);
+  };
+  const zoneElements = (tag, zoneNames) => (
+    `<${tag}>${zoneNames.map(zone => `<zone>${xmlText(zone)}</zone>`).join('')}</${tag}>`
+  );
+  const matchElements = (indent, element, entries) => {
+    for (const entry of entries) {
+      const tag = entry.kind === 'address-name' ? `${element}-name` : element;
+      lines.push(`${indent}<${tag}>${xmlText(entry.value)}</${tag}>`);
+    }
+  };
+  // destination-port is a list keyed by name.
+  const portElement = (indent, port) => (
+    `${indent}<destination-port><name>${xmlText(String(port))}</name></destination-port>`
+  );
+  // DNAT and static rules take a destination-address container holding one dst-addr.
+  const dstAddrElements = (indent, entries) => {
+    for (const entry of entries) {
+      lines.push(`${indent}<destination-address><dst-addr>${xmlText(entry.value)}</dst-addr></destination-address>`);
+    }
+  };
+  const ruleSetHeader = (indent, ruleSet) => {
+    lines.push(`${indent}<rule-set>`);
+    lines.push(`${indent}  <name>${xmlText(ruleSet.name)}</name>`);
+    if (ruleSet.fromZones.length > 0) lines.push(`${indent}  ${zoneElements('from', ruleSet.fromZones)}`);
+    if (ruleSet.toZones.length > 0) lines.push(`${indent}  ${zoneElements('to', ruleSet.toZones)}`);
+  };
+  const poolsOf = ruleSets => {
+    const pools = new Map();
+    for (const ruleSet of ruleSets) {
+      for (const rule of ruleSet.rules) {
+        if (!rule.skipped && rule.then?.pool) pools.set(rule.then.pool.name, rule.then.pool);
       }
     }
-  }
-  return [...groups.values()];
-}
+    return [...pools.values()];
+  };
 
-function effectiveNatTypes(rule) {
-  return rule.type === 'source-and-destination'
-    ? ['source', 'destination']
-    : [rule.type || 'source'];
-}
-
-function natRuleNamePath(rule, ruleIndex, targetType, targetFrom, targetTo) {
-  const types = effectiveNatTypes(rule);
-  let occurrence = 0;
-  for (const type of types) {
-    const pairs = type === 'static'
-      ? [{ from: 'STATIC-NAT', to: '*' }]
-      : (rule.src_zones?.length ? rule.src_zones : ['any']).flatMap(from => (
-        (rule.dst_zones?.length ? rule.dst_zones : ['any']).map(to => ({ from, to }))
-      ));
-    for (const { from, to } of pairs) {
-      occurrence += 1;
-      if (type === targetType && from === targetFrom && to === targetTo) {
-        return occurrence === 1
-          ? `nat_rules[${ruleIndex}].name`
-          : `nat_rules[${ruleIndex}].name#${type}:${encodeJunosZonePair(from, to)}`;
-      }
-    }
-  }
-  throw new Error('NAT identifier path was not cataloged');
-}
-
-function buildNatXml(natRules, configuredZones, lines, warnings, identifierNames, interfaceMappings = {}) {
-  if (!natRules || natRules.length === 0) return;
-
-  for (let ruleIndex = 0; ruleIndex < natRules.length; ruleIndex += 1) {
-    const rule = natRules[ruleIndex];
-    const sourceZones = rule.src_zones?.length ? rule.src_zones : ['any'];
-    const destinationZones = rule.dst_zones?.length ? rule.dst_zones : ['any'];
-    for (let zoneIndex = 0; zoneIndex < sourceZones.length; zoneIndex += 1) {
-      identifierNames.reference(rule.src_zones?.length
-        ? `nat_rules[${ruleIndex}].src_zones[${zoneIndex}]`
-        : `nat_rules[${ruleIndex}]#effective-source-zone`);
-    }
-    for (let zoneIndex = 0; zoneIndex < destinationZones.length; zoneIndex += 1) {
-      identifierNames.reference(rule.dst_zones?.length
-        ? `nat_rules[${ruleIndex}].dst_zones[${zoneIndex}]`
-        : `nat_rules[${ruleIndex}]#effective-destination-zone`);
-    }
-    for (const field of ['src_addresses', 'dst_addresses']) {
-      for (let addressIndex = 0; addressIndex < (rule[field] || []).length; addressIndex += 1) {
-        identifierNames.reference(`nat_rules[${ruleIndex}].${field}[${addressIndex}]`);
-      }
-    }
-  }
-
-  const configuredZoneNames = new Set((configuredZones || []).map(zone => zone.name));
-  const missingZones = new Set();
-  for (const rule of natRules) {
-    for (const zone of [...(rule.src_zones?.length ? rule.src_zones : ['any']), ...(rule.dst_zones?.length ? rule.dst_zones : ['any'])]) {
-      if (zone !== 'any' && !configuredZoneNames.has(zone)) missingZones.add(zone);
-    }
-  }
-  if (missingZones.size > 0) {
+  if (plan.missingZones.length > 0) {
     lines.push('    <zones>');
-    for (const zone of [...missingZones].sort()) {
-      const name = identifierNames.generated('nat_rules', `nat-missing-zone:${zone}`);
-      lines.push(`      <security-zone><name>${xmlText(name)}</name></security-zone>`);
+    for (const zoneName of plan.missingZones) {
+      lines.push(`      <security-zone><name>${xmlText(zoneName)}</name></security-zone>`);
     }
     lines.push('    </zones>');
   }
 
   lines.push('    <nat>');
 
-  const sourceRules = natRules.filter(rule => effectiveNatTypes(rule).includes('source'));
-  const destRules = natRules.filter(rule => effectiveNatTypes(rule).includes('destination'));
-  const staticRules = natRules.filter(rule => effectiveNatTypes(rule).includes('static'));
-
-  // --- Source NAT ---
-  if (sourceRules.length > 0) {
+  if (plan.source) {
     lines.push('      <source>');
-    const groups = groupNatByZonePair(sourceRules);
-    for (const { fromZone, toZone, rules } of groups) {
-      const firstRuleIndex = natRules.indexOf(rules[0]);
-      const ruleSetName = identifierNames.generated(
-        `nat_rules[${firstRuleIndex}]`,
-        `source-nat-rule-set:${encodeJunosZonePair(fromZone, toZone)}`,
-      );
-      lines.push('        <rule-set>');
-      lines.push(`          <name>${xmlText(ruleSetName)}</name>`);
-      const firstSourceIndex = (rules[0].src_zones?.length ? rules[0].src_zones : ['any']).indexOf(fromZone);
-      const firstDestIndex = (rules[0].dst_zones?.length ? rules[0].dst_zones : ['any']).indexOf(toZone);
-      const fromPath = rules[0].src_zones?.length
-        ? `nat_rules[${firstRuleIndex}].src_zones[${firstSourceIndex}]`
-        : `nat_rules[${firstRuleIndex}]#effective-source-zone`;
-      const toPath = rules[0].dst_zones?.length
-        ? `nat_rules[${firstRuleIndex}].dst_zones[${firstDestIndex}]`
-        : `nat_rules[${firstRuleIndex}]#effective-destination-zone`;
-      lines.push(`          <from><zone>${xmlText(identifierNames.reference(fromPath))}</zone></from>`);
-      lines.push(`          <to><zone>${xmlText(identifierNames.reference(toPath))}</zone></to>`);
-
-      for (const rule of rules) {
-        const ruleIndex = natRules.indexOf(rule);
-        const rulePath = natRuleNamePath(rule, ruleIndex, 'source', fromZone, toZone);
-        const ruleName = identifierNames.definition(rulePath);
+    for (const ruleSet of plan.source) {
+      if (ruleSet.skipped) {
+        comments('        ', ruleSet.comments);
+        continue;
+      }
+      ruleSetHeader('        ', ruleSet);
+      for (const rule of ruleSet.rules) {
+        comments('          ', rule.comments);
+        if (rule.skipped) continue;
         lines.push('          <rule>');
-        lines.push(`            <name>${xmlText(ruleName)}</name>`);
-        const anyAddr = natAnyAddress(rule);
+        lines.push(`            <name>${xmlText(rule.name)}</name>`);
         lines.push('            <src-nat-rule-match>');
-        for (let addressIndex = 0; addressIndex < (rule.src_addresses || [anyAddr]).length; addressIndex += 1) {
-          const addr = (rule.src_addresses || [anyAddr])[addressIndex];
-          const output = rule.src_addresses
-            ? identifierNames.reference(`nat_rules[${ruleIndex}].src_addresses[${addressIndex}]`)
-            : anyAddr;
-          lines.push(`              <source-address>${xmlText(output === 'any' ? anyAddr : output)}</source-address>`);
-        }
-        for (let addressIndex = 0; addressIndex < (rule.dst_addresses || [anyAddr]).length; addressIndex += 1) {
-          const output = rule.dst_addresses
-            ? identifierNames.reference(`nat_rules[${ruleIndex}].dst_addresses[${addressIndex}]`)
-            : anyAddr;
-          lines.push(`              <destination-address>${xmlText(output === 'any' ? anyAddr : output)}</destination-address>`);
-        }
+        matchElements('              ', 'source-address', rule.match.source);
+        matchElements('              ', 'destination-address', rule.match.destination);
+        if (rule.match.protocol) lines.push(`              <protocol>${xmlText(rule.match.protocol)}</protocol>`);
+        if (rule.match.destinationPort) lines.push(portElement('              ', rule.match.destinationPort));
         lines.push('            </src-nat-rule-match>');
+        comments('            ', rule.thenComments);
         lines.push('            <then>');
-        if (rule.translated_src) {
-          if (rule.translated_src.type === 'interface') {
-            lines.push('              <source-nat><interface/></source-nat>');
-          } else if (rule.translated_src.type === 'dynamic-ip-pool') {
-            const poolName = identifierNames.generated(`nat_rules[${ruleIndex}]`, 'source-nat-pool');
-            lines.push(`              <source-nat><pool><pool-name>${xmlText(poolName)}</pool-name></pool></source-nat>`);
-          } else if (rule.translated_src.type === 'static') {
-            const poolName = identifierNames.generated(`nat_rules[${ruleIndex}]`, 'static-source-nat-pool');
-            lines.push(`              <source-nat><pool><pool-name>${xmlText(poolName)}</pool-name></pool></source-nat>`);
-          }
+        if (rule.then.kind === 'pool') {
+          lines.push(`              <source-nat><pool><pool-name>${xmlText(rule.then.pool.name)}</pool-name></pool></source-nat>`);
+        } else {
+          lines.push('              <source-nat><interface/></source-nat>');
         }
-        if (rule._uturn) {
+        if (rule.persistent) {
           lines.push('              <persistent-nat><permit>target-host</permit></persistent-nat>');
         }
         lines.push('            </then>');
@@ -811,134 +739,84 @@ function buildNatXml(natRules, configuredZones, lines, warnings, identifierNames
       }
       lines.push('        </rule-set>');
     }
-
-    // Source NAT pools
-    for (const rule of sourceRules) {
-      const ruleIndex = natRules.indexOf(rule);
-      if (rule.translated_src && rule.translated_src.type === 'dynamic-ip-pool') {
-        const poolName = identifierNames.generated(`nat_rules[${ruleIndex}]`, 'source-nat-pool');
-        lines.push('        <pool>');
-        lines.push(`          <name>${xmlText(poolName)}</name>`);
-        for (const addr of rule.translated_src.addresses) {
-          // A "start-end" pool range is Junos "address A/32 to B/32".
-          // njsscan regex_dos: false positive. \d excludes the literal dot and hyphen, so no token backtracks.
-          const range = String(addr).match(/^(\d+\.\d+\.\d+\.\d+)-(\d+\.\d+\.\d+\.\d+)$/);  // njsscan-ignore: regex_dos
-          lines.push(range
-            ? `          <address><name>${xmlText(`${range[1]}/32`)}</name><to><ipaddr>${xmlText(`${range[2]}/32`)}</ipaddr></to></address>`
-            : `          <address><name>${xmlText(addr)}</name></address>`);
-        }
-        lines.push('        </pool>');
-      } else if (rule.translated_src && rule.translated_src.type === 'static' && rule.translated_src.address) {
-        const poolName = identifierNames.generated(`nat_rules[${ruleIndex}]`, 'static-source-nat-pool');
-        lines.push('        <pool>');
-        lines.push(`          <name>${xmlText(poolName)}</name>`);
-        lines.push(`          <address><name>${xmlText(rule.translated_src.address)}</name></address>`);
-        lines.push('        </pool>');
+    for (const pool of poolsOf(plan.source)) {
+      lines.push('        <pool>');
+      lines.push(`          <name>${xmlText(pool.name)}</name>`);
+      for (const address of pool.addresses) {
+        lines.push(address.to
+          ? `          <address><name>${xmlText(address.prefix)}</name><to><ipaddr>${xmlText(address.to)}</ipaddr></to></address>`
+          : `          <address><name>${xmlText(address.prefix)}</name></address>`);
       }
+      lines.push('        </pool>');
     }
     lines.push('      </source>');
   }
 
-  // --- Destination NAT ---
-  if (destRules.length > 0) {
+  if (plan.destination) {
     lines.push('      <destination>');
-    const groups = groupNatByZonePair(destRules);
-    for (const { fromZone, toZone, rules } of groups) {
-      const firstRuleIndex = natRules.indexOf(rules[0]);
-      const ruleSetName = identifierNames.generated(
-        `nat_rules[${firstRuleIndex}]`,
-        `destination-nat-rule-set:${encodeJunosZonePair(fromZone, toZone)}`,
-      );
-      lines.push('        <rule-set>');
-      lines.push(`          <name>${xmlText(ruleSetName)}</name>`);
-      const firstSourceIndex = (rules[0].src_zones?.length ? rules[0].src_zones : ['any']).indexOf(fromZone);
-      const fromPath = rules[0].src_zones?.length
-        ? `nat_rules[${firstRuleIndex}].src_zones[${firstSourceIndex}]`
-        : `nat_rules[${firstRuleIndex}]#effective-source-zone`;
-      lines.push(`          <from><zone>${xmlText(identifierNames.reference(fromPath))}</zone></from>`);
-
-      for (const advice of planIngressScopeAdvice(rules, configuredZones, (name) => mapZoneInterfaceName(name, interfaceMappings))) {
-        const adviceTarget = advice.grouped
-          ? ruleSetName
-          : identifierNames.definition(natRuleNamePath(advice.rules[0], natRules.indexOf(advice.rules[0]), 'destination', fromZone, toZone));
-        warnings.push(createWarning('warning', `nat/destination/${adviceTarget}`, advice.message, advice.suggestion));
+    for (const ruleSet of plan.destination) {
+      if (ruleSet.skipped) {
+        comments('        ', ruleSet.comments);
+        continue;
       }
-
-      for (const rule of rules) {
-        const ruleIndex = natRules.indexOf(rule);
-        const rulePath = natRuleNamePath(rule, ruleIndex, 'destination', fromZone, toZone);
-        const ruleName = identifierNames.definition(rulePath);
+      ruleSetHeader('        ', ruleSet);
+      comments('          ', ruleSet.comments);
+      for (const rule of ruleSet.rules) {
+        comments('          ', rule.comments);
+        if (rule.skipped) continue;
         lines.push('          <rule>');
-        lines.push(`            <name>${xmlText(ruleName)}</name>`);
-        const dnatAny = natAnyAddress(rule);
+        lines.push(`            <name>${xmlText(rule.name)}</name>`);
         lines.push('            <dest-nat-rule-match>');
-        for (let addressIndex = 0; addressIndex < (rule.dst_addresses || [dnatAny]).length; addressIndex += 1) {
-          const output = rule.dst_addresses
-            ? identifierNames.reference(`nat_rules[${ruleIndex}].dst_addresses[${addressIndex}]`)
-            : dnatAny;
-          lines.push(`              <destination-address>${xmlText(output === 'any' ? dnatAny : output)}</destination-address>`);
-        }
-        if (rule.match_port) {
-          lines.push(`              <destination-port>${xmlText(rule.match_port)}</destination-port>`);
-        }
+        dstAddrElements('              ', rule.match.destination);
+        if (rule.match.destinationPort) lines.push(portElement('              ', rule.match.destinationPort));
+        if (rule.match.protocol) lines.push(`              <protocol>${xmlText(rule.match.protocol)}</protocol>`);
         lines.push('            </dest-nat-rule-match>');
         lines.push('            <then>');
-        const dstAddr = typeof rule.translated_dst === 'string' ? rule.translated_dst : (rule.translated_dst?.address || '');
-        if (dstAddr) {
-          const poolName = identifierNames.generated(`nat_rules[${ruleIndex}]`, 'destination-nat-pool');
-          lines.push(`              <destination-nat><pool><pool-name>${xmlText(poolName)}</pool-name></pool></destination-nat>`);
+        if (rule.then) {
+          lines.push(`              <destination-nat><pool><pool-name>${xmlText(rule.then.pool.name)}</pool-name></pool></destination-nat>`);
         }
         lines.push('            </then>');
         lines.push('          </rule>');
       }
       lines.push('        </rule-set>');
     }
-
-    // Destination NAT pools
-    for (const rule of destRules) {
-      const ruleIndex = natRules.indexOf(rule);
-      const dstAddr = typeof rule.translated_dst === 'string' ? rule.translated_dst : (rule.translated_dst?.address || '');
-      if (dstAddr) {
-        const poolName = identifierNames.generated(`nat_rules[${ruleIndex}]`, 'destination-nat-pool');
-        lines.push('        <pool>');
-        lines.push(`          <name>${xmlText(poolName)}</name>`);
-        lines.push(`          <address><ip-prefix>${xmlText(dstAddr)}</ip-prefix></address>`);
-        if (rule.translated_port) {
-          lines.push(`          <address><port>${xmlText(String(rule.translated_port))}</port></address>`);
-        }
-        lines.push('        </pool>');
-      }
+    for (const pool of poolsOf(plan.destination)) {
+      lines.push('        <pool>');
+      lines.push(`          <name>${xmlText(pool.name)}</name>`);
+      lines.push(`          <address><ipaddr>${xmlText(pool.prefix)}</ipaddr>${pool.port ? `<port>${xmlText(String(pool.port))}</port>` : ''}</address>`);
+      lines.push('        </pool>');
     }
     lines.push('      </destination>');
   }
 
-  // --- Static NAT ---
-  if (staticRules.length > 0) {
-    lines.push('      <static>');
-    lines.push('        <rule-set>');
-    const firstStaticIndex = natRules.indexOf(staticRules[0]);
-    lines.push(`          <name>${xmlText(identifierNames.generated(`nat_rules[${firstStaticIndex}]`, 'static-nat-rule-set'))}</name>`);
-    for (const rule of staticRules) {
-      const ruleIndex = natRules.indexOf(rule);
-      const ruleName = identifierNames.definition(natRuleNamePath(rule, ruleIndex, 'static', 'STATIC-NAT', '*'));
-      lines.push('          <rule>');
-      lines.push(`            <name>${xmlText(ruleName)}</name>`);
-      lines.push('            <match>');
-      for (let addressIndex = 0; addressIndex < (rule.dst_addresses || []).length; addressIndex += 1) {
-        if (rule.dst_addresses[addressIndex] === 'any') continue;
-        lines.push(`              <destination-address>${xmlText(identifierNames.reference(`nat_rules[${ruleIndex}].dst_addresses[${addressIndex}]`))}</destination-address>`);
-      }
-      lines.push('            </match>');
-      lines.push('            <then>');
-      if (rule.translated_src && rule.translated_src.address) {
-        lines.push('              <static-nat>');
-        lines.push(`                <prefix><addr-prefix>${xmlText(rule.translated_src.address)}</addr-prefix></prefix>`);
-        lines.push('              </static-nat>');
-      }
-      lines.push('            </then>');
-      lines.push('          </rule>');
+  if (plan.static && !plan.static.some(ruleSet => ruleSet.rules.some(rule => !rule.skipped))) {
+    // Every static rule was skipped: an empty rule-set is not valid Junos, so keep only the comments.
+    for (const ruleSet of plan.static) {
+      for (const rule of ruleSet.rules) comments('      ', rule.comments);
     }
-    lines.push('        </rule-set>');
+  } else if (plan.static) {
+    lines.push('      <static>');
+    for (const ruleSet of plan.static) {
+      ruleSetHeader('        ', ruleSet);
+      for (const rule of ruleSet.rules) {
+        comments('          ', rule.comments);
+        if (rule.skipped) continue;
+        lines.push('          <rule>');
+        lines.push(`            <name>${xmlText(rule.name)}</name>`);
+        lines.push('            <static-nat-rule-match>');
+        dstAddrElements('              ', rule.match.destination);
+        lines.push('            </static-nat-rule-match>');
+        lines.push('            <then>');
+        if (rule.then) {
+          lines.push('              <static-nat>');
+          lines.push(`                <prefix><addr-prefix>${xmlText(rule.then.prefix)}</addr-prefix></prefix>`);
+          lines.push('              </static-nat>');
+        }
+        lines.push('            </then>');
+        lines.push('          </rule>');
+      }
+      lines.push('        </rule-set>');
+    }
     lines.push('      </static>');
   }
 
