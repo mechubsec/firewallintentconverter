@@ -1911,8 +1911,11 @@ function parseNatRules(tree, warnings) {
         translationKey: JSON.stringify(translation),
       };
     });
-  const sharesZonePair = (policy, other) => policy.srcZones.some((zone) => other.srcZones.includes(zone))
-    && policy.dstZones.some((zone) => other.dstZones.includes(zone));
+  // "any" expands to every zone at emission, so it overlaps every zone here.
+  const zonesOverlap = (zones, otherZones) => zones.includes('any') || otherZones.includes('any')
+    || zones.some((zone) => otherZones.includes(zone));
+  const sharesZonePair = (policy, other) => zonesOverlap(policy.srcZones, other.srcZones)
+    && zonesOverlap(policy.dstZones, other.dstZones);
   // FortiGate's built-in "all" is any address.
   const natAddresses = (value) => ensureArray(value).map((address) => (address === 'all' ? 'any' : address));
   // Conflicts depend only on a policy's zones and translation, so scan once per distinct combination.
@@ -1934,6 +1937,11 @@ function parseNatRules(tree, warnings) {
         `Policy "${policy.name}" enables NAT on a negated address — source NAT not converted`,
         'Build it manually: a "source-nat off" rule for the excluded addresses above the translating rule'));
       continue;
+    }
+    if (getString(policy.entry['fixedport']) === 'enable') {
+      warnings.push(createWarning('warning', `nat/${policy.name}`,
+        `Policy "${policy.name}" uses fixed-port NAT, but the SRX source NAT rule translates source ports`,
+        'Use a source pool with "port no-translation" if the source port must be preserved'));
     }
     // shortcut: SRX source NAT matches neither policy order nor service, so a zone pair
     // whose policies translate differently is flagged, not converted; upgrade to ordered

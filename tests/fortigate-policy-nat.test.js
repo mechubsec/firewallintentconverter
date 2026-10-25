@@ -171,6 +171,19 @@ end`);
     }
   });
 
+  it('treats an "any" interface as overlapping every zone', () => {
+    const anyOut = CONFIG.replace('        set name "lan-out"\n        set srcintf "port2"', '        set name "lan-out"\n        set srcintf "any"');
+    const { warnings } = parseFortigateConfig(anyOut);
+    expect(warnings.some((warning) => /source NAT for policy "lan-out" ignores policy order/.test(warning.message)
+      && warning.message.includes('"guest-out-no-nat"'))).toBe(true);
+  });
+
+  it('warns that fixed-port NAT is not preserved', () => {
+    const fixedPort = CONFIG.replace('        set nat enable\n    next\n    edit 2', '        set nat enable\n        set fixedport enable\n    next\n    edit 2');
+    const { warnings } = parseFortigateConfig(fixedPort);
+    expect(warnings.filter((warning) => /Policy "lan-out" uses fixed-port NAT/.test(warning.message))).toHaveLength(1);
+  });
+
   it('adds no caveat when one policy NATs its zone pair', () => {
     const single = CONFIG.replace(/    edit 2\n[\s\S]*    next\n(?=end$)/, '');
     const singleLines = convertToSrxSetCommands(parseFortigateConfig(single).intermediateConfig, {}, null, {}).commands;
