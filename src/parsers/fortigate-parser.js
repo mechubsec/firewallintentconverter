@@ -1888,7 +1888,8 @@ function parseNatRules(tree, warnings) {
       translated_dst: mappedIpArr[0] || mappedIp || '',
       translated_port: portForward ? mappedPort : null,
       match_port: portForward ? extPort : null,
-      match_protocol: vipProtocol || null,
+      // FortiOS applies protocol only to port forwarding, and defaults it to tcp.
+      match_protocol: portForward ? (vipProtocol || 'tcp') : null,
       description: getString(entry['comment']) || getString(entry['comments']) || '',
       _rule_index: ruleIndex++,
     });

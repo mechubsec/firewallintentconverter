@@ -123,6 +123,13 @@ describe('FortiGate VIP used as policy dstaddr', () => {
     expect(intermediateConfig.address_objects.some((object) => object.name === 'vip-web-01')).toBe(false);
   });
 
+  it('defaults a port-forward VIP without protocol to tcp', () => {
+    const portForward = withVipLines('        set portforward enable\n        set extport 443\n        set mappedport 8443\n');
+    const commands = convertToSrxSetCommands(parseFortigateConfig(portForward + policy('"vip-web-01"')).intermediateConfig, {}, null, {}).commands;
+    expect(commands.some((line) => / rule vip-web-01 match protocol tcp$/.test(line))).toBe(true);
+    expect(commands.some((line) => / rule vip-web-01 match destination-port 443$/.test(line))).toBe(true);
+  });
+
   it('leaves a vipgrp with an unconvertible member unresolved', () => {
     const missingMember = BASE.replace('set member "vip-web-01" "vip-web-02"', 'set member "vip-web-01" "vip-missing"');
     const commands = convertToSrxSetCommands(parseFortigateConfig(missingMember + policy('"vipgrp-web"')).intermediateConfig, {}, null, {}).commands;
