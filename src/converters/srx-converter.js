@@ -2335,6 +2335,7 @@ function convertNatRules(
   warnings.push(...plan.warnings);
 
   const comment = text => commands.push(`# ${text}`);
+  const portText = port => `${port.name}${port.high ? ` to ${port.high}` : ''}`;
   const matchLines = (rulePath, field, entries) => entries.map(entry => (
     `set ${rulePath} match ${field}${entry.kind === 'address-name' ? '-name' : ''} ${entry.value}`
   ));
@@ -2361,17 +2362,19 @@ function convertNatRules(
       commands.push(...matchLines(rulePath, 'source-address', rule.match.source));
       commands.push(...matchLines(rulePath, 'destination-address', rule.match.destination));
       if (rule.match.protocol) commands.push(`set ${rulePath} match protocol ${rule.match.protocol}`);
-      if (rule.match.destinationPort) commands.push(`set ${rulePath} match destination-port ${rule.match.destinationPort}`);
+      if (rule.match.destinationPort) commands.push(`set ${rulePath} match destination-port ${portText(rule.match.destinationPort)}`);
       rule.thenComments.forEach(comment);
+      const persistent = rule.persistent ? ' persistent-nat permit target-host' : '';
       if (rule.then.kind === 'pool') {
         for (const address of rule.then.pool.addresses) {
           commands.push(`set security nat source pool ${rule.then.pool.name} address ${address.prefix}${address.to ? ` to ${address.to}` : ''}`);
         }
-        commands.push(`set ${rulePath} then source-nat pool ${rule.then.pool.name}`);
+        commands.push(`set ${rulePath} then source-nat pool ${rule.then.pool.name}${persistent}`);
+      } else if (rule.then.kind === 'off') {
+        commands.push(`set ${rulePath} then source-nat off`);
       } else {
-        commands.push(`set ${rulePath} then source-nat interface`);
+        commands.push(`set ${rulePath} then source-nat interface${persistent}`);
       }
-      if (rule.persistent) commands.push(`set ${rulePath} then persistent-nat permit target-host`);
       summary.nat_rules_converted++;
     }
   }
@@ -2389,7 +2392,7 @@ function convertNatRules(
       if (rule.skipped) continue;
       const rulePath = `${ruleSetPath} rule ${rule.name}`;
       commands.push(...matchLines(rulePath, 'destination-address', rule.match.destination));
-      if (rule.match.destinationPort) commands.push(`set ${rulePath} match destination-port ${rule.match.destinationPort}`);
+      if (rule.match.destinationPort) commands.push(`set ${rulePath} match destination-port ${portText(rule.match.destinationPort)}`);
       if (rule.match.protocol) commands.push(`set ${rulePath} match protocol ${rule.match.protocol}`);
       if (rule.then) {
         const { pool } = rule.then;

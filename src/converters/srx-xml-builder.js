@@ -671,7 +671,7 @@ function buildNatXml(config, lines, warnings, identifierNames, interfaceMappings
   };
   // destination-port is a list keyed by name.
   const portElement = (indent, port) => (
-    `${indent}<destination-port><name>${xmlText(String(port))}</name></destination-port>`
+    `${indent}<destination-port><name>${xmlText(port.name)}</name>${port.high ? `<to><high>${xmlText(port.high)}</high></to>` : ''}</destination-port>`
   );
   // DNAT and static rules take a destination-address container holding one dst-addr.
   const dstAddrElements = (indent, entries) => {
@@ -726,13 +726,13 @@ function buildNatXml(config, lines, warnings, identifierNames, interfaceMappings
         lines.push('            </src-nat-rule-match>');
         comments('            ', rule.thenComments);
         lines.push('            <then>');
+        const persistent = rule.persistent ? '<persistent-nat><permit><target-host/></permit></persistent-nat>' : '';
         if (rule.then.kind === 'pool') {
-          lines.push(`              <source-nat><pool><pool-name>${xmlText(rule.then.pool.name)}</pool-name></pool></source-nat>`);
+          lines.push(`              <source-nat><pool><pool-name>${xmlText(rule.then.pool.name)}</pool-name>${persistent}</pool></source-nat>`);
+        } else if (rule.then.kind === 'off') {
+          lines.push('              <source-nat><off/></source-nat>');
         } else {
-          lines.push('              <source-nat><interface/></source-nat>');
-        }
-        if (rule.persistent) {
-          lines.push('              <persistent-nat><permit>target-host</permit></persistent-nat>');
+          lines.push(persistent ? `              <source-nat><interface>${persistent}</interface></source-nat>` : '              <source-nat><interface/></source-nat>');
         }
         lines.push('            </then>');
         lines.push('          </rule>');

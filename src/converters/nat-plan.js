@@ -35,6 +35,7 @@ function natAnyAddress(rule) {
     ...(rule.translated_src?.addresses || []),
     ...(rule.translated_src?.address ? [rule.translated_src.address] : []),
     ...(rule.translated_dst?.address ? [rule.translated_dst.address] : []),
+    ...(typeof rule.translated_dst === 'string' ? [rule.translated_dst] : []),
   ];
   return allAddrs.some(a => a && typeof a === 'string' && a.includes(':')) ? '::/0' : '0.0.0.0/0';
 }
@@ -101,8 +102,10 @@ const oneLine = value => String(value).replace(/[\r\n]+/g, ' ');
  * - source / destination / static: rule-set arrays, or null when no rule has that type
  * - rule-set: { type, name, fromZones, toZones, comments, skipped, rules }
  * - rule: { name, comments, skipped, match: { source, destination, protocol, destinationPort },
- *           then, persistent }; match entries are { kind: 'prefix' | 'address-name', value }
- * - then: { kind: 'interface' } | { kind: 'pool', pool: { name, addresses: [{ prefix, to? }] } }
+ *           then, persistent }; match entries are { kind: 'prefix' | 'address-name', value };
+ *           destinationPort is { name, high? } ("high" for a start-end range);
+ *           destination and static rules keep one destination entry (Junos takes one)
+ * - then: { kind: 'interface' } | { kind: 'off' } | { kind: 'pool', pool: { name, addresses: [{ prefix, to? }] } }
  *       | { kind: 'destination-pool', pool: { name, prefix, port } } | { kind: 'static-prefix', prefix }
  * - comments are plain text; the emitters add their own comment syntax
  * - warnings: warning objects for the caller's warning list
@@ -268,7 +271,7 @@ export function planNat({
         naming.reference(referencePath);
         succeeded += 1;
         if (keepAny) entries.push({ kind: 'prefix', value: anyAddress });
-      } else if (allowGroups && !isLiteralAddress(addr) && groupNames.has(addr)) {
+      } else if (allowGroups && groupNames.has(addr)) {
         entries.push({ kind: 'address-name', value: naming.reference(referencePath) });
         succeeded += 1;
       } else {
@@ -295,6 +298,29 @@ export function planNat({
     const proto = rule.match_protocol ? String(rule.match_protocol).toLowerCase() : '';
     return proto === 'tcp' || proto === 'udp' ? proto : null;
   };
+  // A match port is one port or a "start-end" range; other forms are kept as written.
+  const planPort = rule => {
+    if (!rule.match_port) return null;
+    const port = String(rule.match_port);
+    // njsscan regex_dos: false positive. \d excludes the hyphen, so no token backtracks.
+    const range = port.match(/^(\d+)-(\d+)$/);  // njsscan-ignore: regex_dos
+    return range ? { name: range[1], high: range[2] } : { name: port };
+  };
+  // Junos takes one destination address per DNAT/static rule; later ones would silently replace it.
+  const firstDestination = (type, ruleName, entries, anyAddress) => {
+    if (entries.length <= 1) return entries;
+    // A wildcard among them already matches every listed address.
+    const wildcard = entries.find(entry => entry.value === anyAddress);
+    if (wildcard) return [wildcard];
+    const dropped = entries.slice(1).map(entry => entry.value).join(', ');
+    warnings.push(createWarning(
+      'warning',
+      `nat/${type}/${ruleName}`,
+      `${type === 'static' ? 'Static' : 'Destination'} NAT rule "${ruleName}" matches several destination addresses, but Junos takes one: kept ${entries[0].value}, dropped ${oneLine(dropped)}`,
+      'Add one NAT rule per destination address',
+    ));
+    return entries.slice(0, 1);
+  };
   const caveatComments = rule => (
     rule.caveat ? [`CAVEAT: ${oneLine(rule.caveat)}`] : []
   );
@@ -303,6 +329,8 @@ export function planNat({
     const translated = rule.translated_src;
     const interfaceThen = { kind: 'interface' };
     if (!translated) return interfaceThen;
+    // An explicit no-NAT exemption (SRX `source-nat off`) must stay one, not fall through to interface NAT.
+    if (translated.type === 'no-nat') return { kind: 'off' };
     if (translated.type === 'interface') {
       const interfaceName = translated.interface || '';
       const providerIp = providerInterfaceIp(interfaceName);
@@ -400,7 +428,7 @@ export function planNat({
           source: source.entries,
           destination: destination.entries,
           protocol: planProtocol(rule),
-          destinationPort: rule.match_port || null,
+          destinationPort: planPort(rule),
         };
         planned.then = planSourceThen(ruleIndex, rule, planned.thenComments);
         // U-turn/hairpin NAT: persistent-nat for return traffic
@@ -472,9 +500,9 @@ export function planNat({
         }
         planned.match = {
           source: [],
-          destination: destination.entries,
+          destination: firstDestination('destination', ruleName, destination.entries, natAnyAddress(rule)),
           protocol: planProtocol(rule),
-          destinationPort: rule.match_port || null,
+          destinationPort: planPort(rule),
         };
         planned.then = resolvedDestination
           ? {
@@ -527,7 +555,7 @@ export function planNat({
           'Build the static NAT rule manually'));
         continue;
       }
-      planned.match = { source: [], destination: destination.entries, protocol: null, destinationPort: null };
+      planned.match = { source: [], destination: firstDestination('static', ruleName, destination.entries, natAnyAddress(rule)), protocol: null, destinationPort: null };
       planned.then = { kind: 'static-prefix', prefix };
     }
     return [ruleSet];

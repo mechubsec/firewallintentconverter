@@ -4,6 +4,7 @@ import { buildSrxXml } from '../src/converters/srx-xml-builder.js';
 import { parseFortigateConfig } from '../src/parsers/fortigate-parser.js';
 import { parsePanosConfig } from '../src/parsers/panos-parser.js';
 import { parseCiscoAsaConfig } from '../src/parsers/cisco-asa-parser.js';
+import { parseSrxConfig } from '../src/parsers/srx-parser.js';
 
 // ---------------------------------------------------------------------------
 // Normalizers: both outputs become { zones, source, destination, static, pools, comments }
@@ -63,8 +64,14 @@ function normalizeSet(commands) {
     }
     match = line.match(/^set security nat (source|destination|static) rule-set (\S+) rule (\S+) (match|then) (.+)$/);
     if (!match) continue;
-    const [, type, setName, ruleName, section, rest] = match;
+    const [, type, setName, ruleName, section] = match;
+    let rest = match[5];
     const rule = ruleOf(ruleSetOf(shape, type, setName), ruleName);
+    const persistentSuffix = ' persistent-nat permit target-host';
+    if (section === 'then' && rest.endsWith(persistentSuffix)) {
+      rule.persistent = true;
+      rest = rest.slice(0, -persistentSuffix.length);
+    }
     if (section === 'match') {
       const [field, value] = [rest.split(' ')[0], rest.split(' ').slice(1).join(' ')];
       if (field === 'protocol') rule.protocol = value;
@@ -72,10 +79,10 @@ function normalizeSet(commands) {
       else if (field.endsWith('-name')) rule[field.replace('-address-name', '')].push(`name:${value}`);
       else rule[field.replace('-address', '')].push(`prefix:${value}`);
     } else if (rest === 'source-nat interface') rule.then = 'interface';
+    else if (rest === 'source-nat off') rule.then = 'off';
     else if (rest.startsWith('source-nat pool ')) rule.then = `pool:${rest.slice(16)}`;
     else if (rest.startsWith('destination-nat pool ')) rule.then = `dnat-pool:${rest.slice(21)}`;
     else if (rest.startsWith('static-nat prefix ')) rule.then = `static:${rest.slice(18)}`;
-    else if (rest === 'persistent-nat permit target-host') rule.persistent = true;
   }
   return shape;
 }
@@ -164,7 +171,10 @@ function normalizeXmlRule(ruleSet, node, shape) {
   const match = child(node, 'src-nat-rule-match') || child(node, 'dest-nat-rule-match') || child(node, 'static-nat-rule-match');
   for (const field of match?.children || []) {
     if (field.tag === 'protocol') rule.protocol = field.text;
-    else if (field.tag === 'destination-port') rule.port = child(field, 'name').text;
+    else if (field.tag === 'destination-port') {
+      const high = child(field, 'to') && child(child(field, 'to'), 'high').text;
+      rule.port = high ? `${child(field, 'name').text} to ${high}` : child(field, 'name').text;
+    }
     else if (child(field, 'dst-addr')) rule.destination.push(`prefix:${child(field, 'dst-addr').text}`);
     else if (child(field, 'dst-addr-name')) rule.destination.push(`name:${child(field, 'dst-addr-name').text}`);
     else if (field.tag.endsWith('-address-name')) rule[field.tag.replace('-address-name', '')].push(`name:${field.text}`);
@@ -172,12 +182,17 @@ function normalizeXmlRule(ruleSet, node, shape) {
   }
   const then = child(node, 'then');
   const sourceNat = child(then, 'source-nat');
-  if (sourceNat) rule.then = child(sourceNat, 'interface') ? 'interface' : `pool:${child(child(sourceNat, 'pool'), 'pool-name').text}`;
+  if (sourceNat) {
+    const target = child(sourceNat, 'interface') || child(sourceNat, 'pool');
+    if (child(sourceNat, 'off')) rule.then = 'off';
+    else rule.then = target.tag === 'interface' ? 'interface' : `pool:${child(target, 'pool-name').text}`;
+    const persistent = target && child(target, 'persistent-nat');
+    if (persistent) rule.persistent = Boolean(child(child(persistent, 'permit'), 'target-host'));
+  }
   const destinationNat = child(then, 'destination-nat');
   if (destinationNat) rule.then = `dnat-pool:${child(child(destinationNat, 'pool'), 'pool-name').text}`;
   const staticNat = child(then, 'static-nat');
   if (staticNat) rule.then = `static:${child(child(staticNat, 'prefix'), 'addr-prefix').text}`;
-  if (child(then, 'persistent-nat')) rule.persistent = true;
 }
 
 // ---------------------------------------------------------------------------
@@ -288,6 +303,17 @@ object network WEB
  nat (inside,outside) static 203.0.113.10
 `;
 
+const SRX_NO_NAT = `set security zones security-zone trust interfaces ge-0/0/1.0
+set security zones security-zone untrust interfaces ge-0/0/0.0
+set security nat source rule-set rs1 from zone trust
+set security nat source rule-set rs1 to zone untrust
+set security nat source rule-set rs1 rule vpn-exempt match source-address 10.0.0.0/8
+set security nat source rule-set rs1 rule vpn-exempt match destination-address 172.16.0.0/12
+set security nat source rule-set rs1 rule vpn-exempt then source-nat off
+set security nat source rule-set rs1 rule hide match source-address 10.0.0.0/8
+set security nat source rule-set rs1 rule hide then source-nat interface
+`;
+
 const zone = name => ({ name, interfaces: [] });
 const sourceRule = overrides => ({
   name: 'snat',
@@ -362,6 +388,31 @@ const CASES = {
     src_addresses: ['any'], dst_addresses: ['203.0.113.5'], translated_dst: '192.168.10.10',
     translated_port: '8443', match_port: '443', match_protocol: 'tcp',
   }]),
+  'port ranges in source and destination NAT': () => handBuilt([
+    sourceRule({ name: 'snat-range', match_protocol: 'tcp', match_port: '8000-8010' }),
+    {
+      name: 'dnat-range', type: 'destination', src_zones: ['untrust'], dst_zones: ['trust'],
+      src_addresses: ['any'], dst_addresses: ['203.0.113.5'], translated_dst: '192.168.10.10',
+      match_protocol: 'udp', match_port: '5000-5004',
+    },
+  ]),
+  'persistent NAT on interface and pool': () => handBuilt([
+    sourceRule({ name: 'uturn-if', _uturn: true }),
+    sourceRule({
+      name: 'uturn-pool', _uturn: true,
+      translated_src: { type: 'dynamic-ip-pool', addresses: ['203.0.113.9/32'] },
+    }),
+  ]),
+  'several destination addresses keep the first': () => handBuilt([
+    {
+      name: 'dnat-many', type: 'destination', src_zones: ['untrust'], dst_zones: ['trust'],
+      src_addresses: ['any'], dst_addresses: ['203.0.113.5', '203.0.113.6'], translated_dst: '192.168.10.10',
+    },
+    {
+      name: 'static-many', type: 'static', dst_addresses: ['203.0.113.7', '203.0.113.8'],
+      translated_src: { address: '192.168.10.11' },
+    },
+  ]),
   'destination NAT whose translated address does not resolve is skipped': () => handBuilt([{
     name: 'dnat-bad', type: 'destination', src_zones: ['untrust'], dst_zones: ['trust'],
     src_addresses: ['any'], dst_addresses: ['203.0.113.5'], translated_dst: 'nowhere',
@@ -374,6 +425,7 @@ const CASES = {
   'IPv6 any address': () => handBuilt([sourceRule({ src_addresses: undefined, dst_addresses: ['2001:db8::/64'] })]),
   'PAN-OS NAT': () => parsePanosConfig(PANOS_NAT).intermediateConfig,
   'Cisco ASA NAT': () => parseCiscoAsaConfig(ASA_NAT).intermediateConfig,
+  'SRX source-nat off exemption before interface NAT': () => parseSrxConfig(SRX_NO_NAT).intermediateConfig,
   'no zones to expand any': () => ({ ...handBuilt([sourceRule({ src_zones: ['any'], dst_zones: ['any'] })]), zones: [] }),
 };
 
@@ -470,6 +522,36 @@ describe('NAT XML: the issue symptoms', () => {
   });
 });
 
+describe('NAT: Junos schema shapes', () => {
+  it('nests persistent-nat under source-nat and uses the set keyword order', () => {
+    const { set, xml } = render(CASES['persistent NAT on interface and pool']());
+    expect(set.commands).toContain('set security nat source rule-set trust-to-untrust rule uturn-if then source-nat interface persistent-nat permit target-host');
+    expect(set.commands.some(line => / then source-nat pool \S+ persistent-nat permit target-host$/.test(line))).toBe(true);
+    expect(set.commands.some(line => / then persistent-nat /.test(line))).toBe(false);
+    expect(xml.xml).toContain('<source-nat><interface><persistent-nat><permit><target-host/></permit></persistent-nat></interface></source-nat>');
+    expect(xml.xml).toMatch(/<pool-name>[^<]+<\/pool-name><persistent-nat><permit><target-host\/><\/permit><\/persistent-nat><\/pool>/);
+  });
+
+  it('renders port ranges as "A to B" and <to><high>', () => {
+    const { set, xml } = render(CASES['port ranges in source and destination NAT']());
+    expect(set.commands.some(line => line.endsWith('rule snat-range match destination-port 8000 to 8010'))).toBe(true);
+    expect(set.commands.some(line => line.endsWith('rule dnat-range match destination-port 5000 to 5004'))).toBe(true);
+    expect(xml.xml).toContain('<destination-port><name>8000</name><to><high>8010</high></to></destination-port>');
+    expect(xml.xml).toContain('<destination-port><name>5000</name><to><high>5004</high></to></destination-port>');
+  });
+
+  it('keeps one destination address and warns about the dropped ones', () => {
+    const { set, xml } = render(CASES['several destination addresses keep the first']());
+    for (const output of [set, xml]) {
+      const messages = output.warnings.map(item => item.message);
+      expect(messages.some(text => /dnat-many.*kept 203\.0\.113\.5, dropped 203\.0\.113\.6/.test(text))).toBe(true);
+      expect(messages.some(text => /static-many.*kept 203\.0\.113\.7, dropped 203\.0\.113\.8/.test(text))).toBe(true);
+    }
+    expect(set.commands.filter(line => line.includes('rule dnat-many match destination-address'))).toHaveLength(1);
+    expect(xml.xml).not.toContain('203.0.113.6');
+  });
+});
+
 describe('NAT: a rule is never widened', () => {
   it('skips an unresolvable rule in both outputs and warns once per output', () => {
     const { set, xml } = render(CASES['rule with an unresolvable address is skipped']());
@@ -477,5 +559,11 @@ describe('NAT: a rule is never widened', () => {
     expect(xml.xml).not.toContain('<name>ghost-rule</name>');
     expect(set.warnings.filter(item => /ghost-rule/.test(item.message))).toHaveLength(1);
     expect(xml.warnings.filter(item => /ghost-rule/.test(item.message))).toHaveLength(1);
+  });
+  it('keeps an SRX source-nat off exemption in both outputs', () => {
+    const { set, xml } = render(parseSrxConfig(SRX_NO_NAT).intermediateConfig);
+    expect(set.commands.some(line => /rule \S*vpn-exempt then source-nat off$/.test(line))).toBe(true);
+    expect(set.commands.some(line => /rule \S*vpn-exempt then source-nat interface/.test(line))).toBe(false);
+    expect(xml.xml).toContain('<source-nat><off/></source-nat>');
   });
 });

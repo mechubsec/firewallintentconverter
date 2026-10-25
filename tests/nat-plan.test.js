@@ -66,4 +66,21 @@ end`);
     config.address_objects.push({ name: 'dead:beef', value: '10.9.9.0/24' });
     expect(natLines(config).some(line => line.endsWith('match source-address 10.9.9.0/24'))).toBe(true);
   });
+  it('keeps the wildcard when a DNAT rule lists a host and any', () => {
+    const config = baseConfig({ type: 'destination', dst_zones: [], dst_addresses: ['203.0.113.5', 'any'], translated_dst: '192.168.10.10', translated_src: null });
+    const lines = natLines(config);
+    expect(lines.some(line => line.endsWith('match destination-address 0.0.0.0/0'))).toBe(true);
+    expect(lines.some(line => line.endsWith('match destination-address 203.0.113.5'))).toBe(false);
+  });
+
+  it('matches IPv6 any for a DNAT rule with a string IPv6 target', () => {
+    const config = baseConfig({ type: 'destination', dst_zones: [], dst_addresses: ['any'], translated_dst: '2001:db8::10', translated_src: null });
+    expect(natLines(config).some(line => line.endsWith('match destination-address ::/0'))).toBe(true);
+  });
+
+  it('prefers a defined group over a literal-looking name', () => {
+    const config = baseConfig({ src_addresses: ['2001:db8::1'] });
+    config.address_groups = [{ name: '2001:db8::1', members: ['lan-net'] }];
+    expect(natLines(config).some(line => /match source-address-name n-2001-db8-1$/.test(line))).toBe(true);
+  });
 });
