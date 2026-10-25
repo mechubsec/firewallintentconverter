@@ -2418,6 +2418,13 @@ function convertNatRules(
     }
   }
 
+  if (plan.proxyArp.length > 0) {
+    commands.push('# Proxy ARP (NAT addresses inside a connected subnet)');
+    for (const entry of plan.proxyArp) {
+      commands.push(`set security nat proxy-arp interface ${entry.interface} address ${entry.address}${entry.to ? ` to ${entry.to}` : ''}`);
+    }
+  }
+
   commands.push('');
 }
 

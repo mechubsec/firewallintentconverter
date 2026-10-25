@@ -1910,7 +1910,10 @@ function parseNatRules(tree, warnings) {
     }
     const ranges = pools
       .map((poolName) => `${getString(ippoolSection[poolName]['startip'])}-${getString(ippoolSection[poolName]['endip'])}`);
-    return ranges.length > 0 ? { type: 'dynamic-ip-pool', addresses: ranges } : { type: 'interface' };
+    if (ranges.length === 0) return { type: 'interface' };
+    // FortiOS pools answer ARP by default; carry only the pools that opt out.
+    const arpDisabled = ranges.filter((_, index) => getString(ippoolSection[pools[index]]['arp-reply']) === 'disable');
+    return { type: 'dynamic-ip-pool', addresses: ranges, ...(arpDisabled.length > 0 ? { arp_reply_disabled: arpDisabled } : {}) };
   };
 
   // FortiGate's built-in "all" is any address.
@@ -2063,6 +2066,8 @@ function parseNatRules(tree, warnings) {
       translated_src: null,
       translated_dst: mappedIpArr[0] || mappedIp || '',
       translated_port: portForward ? mappedPort : null,
+      // FortiOS VIPs answer ARP by default; only an explicit disable is carried.
+      ...(getString(entry['arp-reply']) === 'disable' ? { arp_reply: false } : {}),
       match_port: portForward ? extPort : null,
       // FortiOS applies protocol only to port forwarding, and defaults it to tcp.
       match_protocol: portForward ? (vipProtocol || 'tcp') : null,

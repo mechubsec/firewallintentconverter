@@ -820,6 +820,21 @@ function buildNatXml(config, lines, warnings, identifierNames, interfaceMappings
     lines.push('      </static>');
   }
 
+  if (plan.proxyArp.length > 0) {
+    lines.push('      <proxy-arp>');
+    for (const interfaceName of new Set(plan.proxyArp.map(entry => entry.interface))) {
+      lines.push('        <interface>');
+      lines.push(`          <name>${xmlText(interfaceName)}</name>`);
+      for (const entry of plan.proxyArp.filter(item => item.interface === interfaceName)) {
+        lines.push(entry.to
+          ? `          <address><name>${xmlText(entry.address)}</name><to><ipaddr>${xmlText(entry.to)}</ipaddr></to></address>`
+          : `          <address><name>${xmlText(entry.address)}</name></address>`);
+      }
+      lines.push('        </interface>');
+    }
+    lines.push('      </proxy-arp>');
+  }
+
   lines.push('    </nat>');
 }
 

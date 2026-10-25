@@ -11,6 +11,8 @@ import { createWarning, planIngressScopeAdvice } from '../parsers/parser-utils.j
 import { encodeJunosZonePair } from '../security/junos-identifier-identity.js';
 
 const IPV4_ADDRESS = /^\d+\.\d+\.\d+\.\d+(\/\d+)?$/;
+// njsscan regex_dos: false positive. \d excludes the literal dot and hyphen, so no token backtracks.
+const IPV4_RANGE = /^(\d+\.\d+\.\d+\.\d+)-(\d+\.\d+\.\d+\.\d+)$/;  // njsscan-ignore: regex_dos
 
 /** True for a full or "::"-compressed IPv6 address, so names like "dead:beef" are not literals. */
 function isIpv6Address(text) {
@@ -92,6 +94,23 @@ function withPrefix(ip) {
   return ip;
 }
 
+/** Parses "A.B.C.D/len" into { address, length } (address as an integer), or null for anything else. */
+function parseIpv4Prefix(text) {
+  const parts = String(text).match(/^(\d{1,3})\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})\/(\d{1,2})$/);
+  if (!parts) return null;
+  const octets = parts.slice(1, 5).map(Number);
+  const length = Number(parts[5]);
+  if (octets.some(octet => octet > 255) || length > 32) return null;
+  return { address: octets.reduce((total, octet) => total * 256 + octet, 0), length };
+}
+
+/** First and last address of an IPv4 prefix. */
+function prefixBounds({ address, length }) {
+  const size = 2 ** (32 - length);
+  const first = Math.floor(address / size) * size;
+  return { first, last: first + size - 1 };
+}
+
 const oneLine = value => String(value).replace(/[\r\n]+/g, ' ');
 
 /**
@@ -108,6 +127,8 @@ const oneLine = value => String(value).replace(/[\r\n]+/g, ' ');
  * - then: { kind: 'interface' } | { kind: 'off' } | { kind: 'pool', pool: { name, addresses: [{ prefix, to? }] } }
  *       | { kind: 'destination-pool', pool: { name, prefix, port } } | { kind: 'static-prefix', prefix }
  * - comments are plain text; the emitters add their own comment syntax
+ * - proxyArp: [{ interface, address, to? }] host addresses and ranges (/32 forms) the SRX must
+ *   answer ARP for, named by the mapped interface whose connected subnet holds them
  * - warnings: warning objects for the caller's warning list
  *
  * @param {Object} input
@@ -172,12 +193,13 @@ export function planNat({
     resolveNatAddress(rawAddressNames.get(rawAddress) || rawAddress)
   );
   // A "start-end" source pool range (FortiGate ippool) is Junos "A/32 to B/32".
+  // A range object (ASA `range A B`) resolves to the same "A-B" form.
   const sourcePoolAddress = rawAddress => {
-    // njsscan regex_dos: false positive. \d excludes the literal dot and hyphen, so no token backtracks.
-    const range = String(rawAddress || '').match(/^(\d+\.\d+\.\d+\.\d+)-(\d+\.\d+\.\d+\.\d+)$/);  // njsscan-ignore: regex_dos
-    if (range) return { prefix: `${range[1]}/32`, to: `${range[2]}/32` };
-    const resolved = translatedAddress(rawAddress);
-    return resolved ? { prefix: withPrefix(resolved) } : null;
+    const literal = String(rawAddress || '');
+    const resolved = IPV4_RANGE.test(literal) ? literal : translatedAddress(rawAddress);
+    if (!resolved) return null;
+    const range = resolved.match(IPV4_RANGE);
+    return range ? { prefix: `${range[1]}/32`, to: `${range[2]}/32` } : { prefix: withPrefix(resolved) };
   };
   const providerInterfaceIp = interfaceName => {
     if (!interfaceName) return null;
@@ -187,6 +209,19 @@ export function planNat({
     if (host.includes(':')) return `${host}/128`;
     return null;
   };
+
+  // NAT addresses the SRX may have to answer ARP for; narrowed to proxyArp at the end.
+  const proxyCandidates = [];
+  // Each candidate keeps the zones its traffic uses (egress for pools, ingress for DNAT) so
+  // proxy ARP lands only on an interface the rule can actually see.
+  const addProxyCandidates = (candidates, scopeZones) => (
+    proxyCandidates.push(...candidates.map(candidate => ({ ...candidate, scopeZones })))
+  );
+  const destinationCandidates = (rule, entries, anyAddress) => (
+    rule.arp_reply === false ? [] : entries
+      .filter(entry => entry.kind === 'prefix' && entry.value !== anyAddress)
+      .map(entry => ({ prefix: withPrefix(entry.value) }))
+  );
 
   const natRuleIndex = new Map(natRules.map((rule, index) => [rule, index]));
   const zoneReference = (ruleIndex, rule, direction, zone) => {
@@ -354,6 +389,9 @@ export function planNat({
       const poolName = naming.generated(`nat_rules[${ruleIndex}]`, 'source-nat-pool');
       const addresses = (translated.addresses || []).map(sourcePoolAddress);
       if (addresses.length > 0 && addresses.every(Boolean)) {
+        // A pool range the source disabled ARP replies for is left to the user's own ARP setup.
+        const arpDisabled = translated.arp_reply_disabled || [];
+        if (rule.arp_reply !== false) addProxyCandidates(addresses.filter((_, index) => !arpDisabled.includes(translated.addresses[index])), natDestinationZones(rule));
         return { kind: 'pool', pool: { name: poolName, addresses } };
       }
       // Can't resolve pool addresses (e.g. Check Point hide NAT using a gateway name)
@@ -364,6 +402,7 @@ export function planNat({
       const poolName = naming.generated(`nat_rules[${ruleIndex}]`, 'static-source-nat-pool');
       const resolved = translatedAddress(translated.address);
       if (resolved) {
+        if (rule.arp_reply !== false) addProxyCandidates([{ prefix: withPrefix(resolved) }], natDestinationZones(rule));
         return { kind: 'pool', pool: { name: poolName, addresses: [{ prefix: withPrefix(resolved) }] } };
       }
       comments.push(`NAT: translated source "${translated.address}" is not a resolvable IP/prefix — using interface NAT`);
@@ -514,6 +553,7 @@ export function planNat({
             },
           }
           : null;
+        if (resolvedDestination) addProxyCandidates(destinationCandidates(rule, planned.match.destination, natAnyAddress(rule)), natSourceZones(rule));
       }
     }
     return ruleSets;
@@ -557,6 +597,9 @@ export function planNat({
       }
       planned.match = { source: [], destination: firstDestination('static', ruleName, destination.entries, natAnyAddress(rule)), protocol: null, destinationPort: null };
       planned.then = { kind: 'static-prefix', prefix };
+      // shortcut: no proxy ARP for static NAT. Parsers put the source rule's destination filter in
+      // dst_addresses, not the public address, so proxying it could claim a real host; upgrade
+      // once static rules carry the public address explicitly.
     }
     return [ruleSet];
   };
@@ -565,11 +608,106 @@ export function planNat({
   const sourceRules = rulesOfType('source');
   const destinationRules = rulesOfType('destination');
   const staticRules = rulesOfType('static');
+  const source = sourceRules.length > 0 ? planSourceRuleSets(sourceRules) : null;
+  const destination = destinationRules.length > 0 ? planDestinationRuleSets(destinationRules) : null;
+  const staticSets = staticRules.length > 0 ? planStaticRuleSets(staticRules) : null;
   return {
     missingZones,
-    source: sourceRules.length > 0 ? planSourceRuleSets(sourceRules) : null,
-    destination: destinationRules.length > 0 ? planDestinationRuleSets(destinationRules) : null,
-    static: staticRules.length > 0 ? planStaticRuleSets(staticRules) : null,
+    source,
+    destination,
+    static: staticSets,
+    proxyArp: planProxyArp(proxyCandidates, interfaces, zones, mapInterface, warnings),
     warnings,
   };
+}
+
+/**
+ * Picks the interface each NAT address belongs to by connected subnet, so the
+ * SRX answers ARP for it (it commits but passes no traffic otherwise).
+ * Skips addresses no interface owns (the upstream router routes them), the
+ * interface's own addresses, and anything ambiguous or wider than a host or
+ * range, warning where a person has to decide.
+ *
+ * shortcut: IPv4 only (proxy-ndp is not emitted), and interface ips other than
+ * "A.B.C.D/len" (dhcp, bare addresses) are ignored; upgrade if either shows up.
+ */
+function planProxyArp(candidates, interfaces, zones, mapInterface, warnings) {
+  // Zone membership lives on zones for most parsers and on interfaces for some (SonicWall).
+  const zoneInterfaces = new Map((zones || []).map(zone => [zone.name, new Set(zone.interfaces || [])]));
+  for (const iface of interfaces || []) {
+    if (!iface.zone || !iface.name) continue;
+    if (!zoneInterfaces.has(iface.zone)) zoneInterfaces.set(iface.zone, new Set());
+    zoneInterfaces.get(iface.zone).add(iface.name);
+  }
+  // Interfaces the candidate's zones hold; null for "any" (subnet alone decides), or the
+  // zones with no known member, where guessing could claim an address the rule never sees.
+  const eligibleInterfaces = scopeZones => {
+    if (!scopeZones || scopeZones.includes('any')) return { eligible: null, unknown: [] };
+    const unknown = scopeZones.filter(zoneName => !(zoneInterfaces.get(zoneName)?.size > 0));
+    const eligible = new Set(scopeZones.flatMap(zoneName => [...(zoneInterfaces.get(zoneName) || [])]));
+    return { eligible, unknown };
+  };
+  const connected = (interfaces || [])
+    // Tunnel and loopback interfaces don't ARP; not every parser types them, so check names too.
+    .filter(iface => !['tunnel', 'loopback'].includes(iface.type) && !/^(tunnel|loopback|st\d|lo\d)/i.test(iface.name || ''))
+    .map(iface => ({ name: iface.name, ip: parseIpv4Prefix(iface.ip), proxyArp: iface.proxy_arp !== false }))
+    // 0.0.0.0/x is an unset address (FortiOS default), not a subnet that holds every NAT address.
+    .filter(iface => iface.name && iface.ip && iface.ip.address !== 0)
+    .map(iface => ({ ...iface, ...prefixBounds(iface.ip) }));
+  const ownAddresses = connected.map(iface => iface.ip.address);
+  const inside = (iface, address) => address >= iface.first && address <= iface.last;
+  const warned = new Set();
+  const warn = message => {
+    if (warned.has(message)) return;
+    warned.add(message);
+    warnings.push(createWarning('warning', 'nat/proxy-arp', message,
+      'Add "set security nat proxy-arp interface <ifl> address <address>" by hand if the SRX must answer ARP for it'));
+  };
+
+  const proxyArp = [];
+  const seen = new Set();
+  for (const candidate of candidates) {
+    const start = parseIpv4Prefix(candidate.prefix);
+    const end = candidate.to ? parseIpv4Prefix(candidate.to) : start;
+    if (!start || !end) continue;
+    const label = oneLine(candidate.to ? `${candidate.prefix} to ${candidate.to}` : candidate.prefix);
+    // A prefix stands for its whole block, a range for its two ends.
+    const low = prefixBounds(start).first;
+    const high = candidate.to ? prefixBounds(end).first : prefixBounds(start).last;
+    // Any overlap counts, including a range that encloses a whole subnet.
+    const { eligible, unknown } = eligibleInterfaces(candidate.scopeZones);
+    const touching = connected.filter(iface => low <= iface.last && high >= iface.first
+      && (!eligible || eligible.has(iface.name)));
+    // An address only an unknown zone could reach can't be placed safely.
+    if (touching.length === 0 && unknown.length > 0 && connected.some(iface => low <= iface.last && high >= iface.first)) {
+      warn(`NAT address ${label} is on a connected subnet, but zone ${oneLine(unknown.join(', '))} has no known interfaces — no proxy ARP emitted`);
+      continue;
+    }
+    if (touching.length === 0) continue;
+    if (touching.length > 1) {
+      warn(`NAT address ${label} is inside more than one interface subnet (${oneLine(touching.map(iface => iface.name).join(', '))}) — no proxy ARP emitted`);
+      continue;
+    }
+    const [owner] = touching;
+    if (!inside(owner, low) || !inside(owner, high)) {
+      warn(`NAT address ${label} is only partly inside ${oneLine(owner.name)}'s subnet — no proxy ARP emitted`);
+      continue;
+    }
+    if (!candidate.to && start.length < 32) {
+      warn(`NAT address ${label} is a prefix inside ${oneLine(owner.name)}'s subnet — not proxied as a whole (it could capture the upstream gateway's address)`);
+      continue;
+    }
+    // The SRX already answers for its own address; a range around it needs a person to split it.
+    if (ownAddresses.some(own => own >= low && own <= high)) {
+      if (candidate.to) warn(`NAT address ${label} includes an interface's own address — no proxy ARP emitted`);
+      continue;
+    }
+    // The source turned proxy ARP off on this interface (ASA `sysopt noproxyarp`).
+    if (!owner.proxyArp) continue;
+    const key = `${owner.name}|${candidate.prefix}|${candidate.to || ''}`;
+    if (seen.has(key)) continue;
+    seen.add(key);
+    proxyArp.push({ interface: mapInterface(owner.name), address: candidate.prefix, ...(candidate.to ? { to: candidate.to } : {}) });
+  }
+  return proxyArp;
 }

@@ -88,6 +88,9 @@ export function parseCiscoAsaConfig(configText) {
   const qosConfig = parseCiscoQosConfig(lines, blocks, warnings);
   const flowMonitoringConfig = parseCiscoFlowExport(lines, warnings);
 
+  // `sysopt noproxyarp <nameif>` turns off ARP replies for NAT addresses on that interface.
+  const noProxyArp = new Set(lines.map(line => line.trim().match(/^sysopt noproxyarp (\S+)$/)?.[1]).filter(Boolean));
+
   // Normalize interfaces to standard schema
   const normalizedInterfaces = interfaces.map(iface => {
     let ip = '';
@@ -109,6 +112,7 @@ export function parseCiscoAsaConfig(configText) {
       description: iface.description || '',
       status: iface.shutdown ? 'shutdown' : 'up',
       speed: '',
+      ...(noProxyArp.has(iface.nameif) ? { proxy_arp: false } : {}),
     };
   });
 
@@ -881,6 +885,8 @@ function parseTwiceNatCommand(rest, srcIf, dstIf, ruleIndex) {
   return {
     name: `Manual-NAT-${ruleIndex}`,
     type,
+    // ASA answers ARP for mapped addresses unless the rule says otherwise.
+    ...(tokens.includes('no-proxy-arp') ? { arp_reply: false } : {}),
     src_zones: [srcIf],
     dst_zones: [dstIf],
     src_addresses: [srcReal || 'any'],
@@ -912,6 +918,7 @@ function parseNatRules(blocks, lines, warnings) {
         natRules.push({
           name: `Auto-NAT-${objName}`,
           type: natType === 'static' ? 'static' : 'source',
+          ...(rest.split(/\s+/).includes('no-proxy-arp') ? { arp_reply: false } : {}),
           src_zones: [srcIf.trim()],
           dst_zones: [dstIf.trim()],
           src_addresses: [objName],

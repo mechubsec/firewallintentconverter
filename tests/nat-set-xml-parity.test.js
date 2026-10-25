@@ -13,7 +13,7 @@ import { parseSrxConfig } from '../src/parsers/srx-parser.js';
 const COMMENT_PREFIX = /^(NAT:|NAT pool|CAVEAT:|WARNING:)/;
 
 function emptyShape() {
-  return { source: [], destination: [], static: [], pools: {}, comments: [] };
+  return { source: [], destination: [], static: [], pools: {}, comments: [], proxyArp: [] };
 }
 
 function ruleSetOf(shape, type, name) {
@@ -47,7 +47,12 @@ function normalizeSet(commands) {
       if (inNat && COMMENT_PREFIX.test(line.slice(2))) shape.comments.push(line.slice(2));
       continue;
     }
-    let match = line.match(/^set security nat (source|destination) pool (\S+) address port (\S+)$/);
+    let match = line.match(/^set security nat proxy-arp interface (\S+) address (.+)$/);
+    if (match) {
+      shape.proxyArp.push(`${match[1]} ${match[2]}`);
+      continue;
+    }
+    match = line.match(/^set security nat (source|destination) pool (\S+) address port (\S+)$/);
     if (match) {
       (shape.pools[match[2]] ||= { addresses: [], port: null }).port = match[3];
       continue;
@@ -122,6 +127,13 @@ function normalizeXml(xml) {
   const shape = emptyShape();
   const nat = findNat(parseXml(xml));
   if (!nat) return shape;
+  for (const interfaceNode of childrenOf(child(nat, 'proxy-arp') || { children: [] }, 'interface')) {
+    for (const address of childrenOf(interfaceNode, 'address')) {
+      const to = child(address, 'to');
+      const range = to ? ` to ${child(to, 'ipaddr').text}` : '';
+      shape.proxyArp.push(`${child(interfaceNode, 'name').text} ${child(address, 'name').text}${range}`);
+    }
+  }
   for (const type of ['source', 'destination', 'static']) {
     const section = child(nat, type);
     // Comments left directly under <nat> belong to a section with nothing live to render.
@@ -426,6 +438,18 @@ const CASES = {
   'PAN-OS NAT': () => parsePanosConfig(PANOS_NAT).intermediateConfig,
   'Cisco ASA NAT': () => parseCiscoAsaConfig(ASA_NAT).intermediateConfig,
   'SRX source-nat off exemption before interface NAT': () => parseSrxConfig(SRX_NO_NAT).intermediateConfig,
+  'proxy ARP for pool range and DNAT addresses on a connected subnet (static match excluded)': () => ({
+    ...handBuilt([
+      sourceRule({ translated_src: { type: 'dynamic-ip-pool', addresses: ['203.0.113.3-203.0.113.4'] } }),
+      {
+        name: 'dnat-proxy', type: 'destination', src_zones: ['untrust'], dst_zones: ['trust'],
+        src_addresses: ['any'], dst_addresses: ['203.0.113.5'], translated_dst: '192.168.10.10',
+      },
+      { name: 'static-proxy', type: 'static', dst_addresses: ['203.0.113.6'], translated_src: { address: '192.168.10.11' } },
+    ]),
+    zones: [{ name: 'trust', interfaces: ['lan'] }, { name: 'untrust', interfaces: ['wan'] }],
+    interfaces: [{ name: 'wan', ip: '203.0.113.2/29' }, { name: 'lan', ip: '192.168.10.1/24' }],
+  }),
   'no zones to expand any': () => ({ ...handBuilt([sourceRule({ src_zones: ['any'], dst_zones: ['any'] })]), zones: [] }),
 };
 
@@ -454,6 +478,14 @@ describe('NAT: set commands and XML render the same plan', () => {
       const planned = shape.source.length + shape.destination.length + shape.static.length + shape.comments.length;
       expect(planned, label).toBeGreaterThan(0);
     }
+  });
+
+  it('compares the proxy ARP entries, not an empty list', () => {
+    const shape = normalizeSet(render(CASES['proxy ARP for pool range and DNAT addresses on a connected subnet (static match excluded)']()).set.commands);
+    expect(shape.proxyArp).toEqual([
+      'ge-0/0/0.0 203.0.113.3/32 to 203.0.113.4/32',
+      'ge-0/0/0.0 203.0.113.5/32',
+    ]);
   });
 
   it('compares something: the repro produces rule-sets and pools on both sides', () => {
