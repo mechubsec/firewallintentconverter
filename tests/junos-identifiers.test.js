@@ -875,7 +875,7 @@ describe('Junos identifier catalog', () => {
       .map(entry => entry.outputName)).size).toBe(2);
   });
 
-  it('scopes every static NAT rule to the one STATIC-NAT rule set', () => {
+  it('gives each static NAT from-zone its own rule set', () => {
     const config = {
       zones: [{ name: 'outside a' }, { name: 'outside b' }, { name: 'inside' }],
       nat_rules: [
@@ -884,11 +884,11 @@ describe('Junos identifier catalog', () => {
       ],
     };
     const symbols = collectJunosIdentifierSymbols(config);
-    const ruleSets = symbols.definitions.filter(item => item.role === 'static-nat-rule-set');
+    const ruleSets = symbols.definitions.filter(item => item.role?.startsWith('static-nat-rule-set'));
     const rules = symbols.definitions.filter(item => item.kind === 'static-nat-rule');
 
-    expect(ruleSets).toHaveLength(1);
-    expect(new Set(rules.map(item => item.context)).size).toBe(1);
+    expect(ruleSets.map(item => item.sourceName).sort()).toEqual(['STATIC-NAT-outside a', 'STATIC-NAT-outside b']);
+    expect(new Set(rules.map(item => item.context)).size).toBe(2);
     expect(() => planJunosIdentifiers(config)).not.toThrow();
   });
 
@@ -923,8 +923,8 @@ describe('Junos identifier catalog', () => {
     ]);
     expect(rules('source')).toHaveLength(4);
     expect(rules('destination')).toHaveLength(4);
-    expect(generatedRuleSets('static')).toHaveLength(1);
-    expect(rules('static')).toHaveLength(1);
+    expect(generatedRuleSets('static')).toHaveLength(2);
+    expect(rules('static')).toHaveLength(2);
     expect(() => planJunosIdentifiers(config)).not.toThrow();
   });
 

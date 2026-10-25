@@ -789,14 +789,15 @@ function buildNatXml(config, lines, warnings, identifierNames, interfaceMappings
     lines.push('      </destination>');
   }
 
-  if (plan.static && !plan.static.some(ruleSet => ruleSet.rules.some(rule => !rule.skipped))) {
-    // Every static rule was skipped: an empty rule-set is not valid Junos, so keep only the comments.
-    for (const ruleSet of plan.static) {
-      for (const rule of ruleSet.rules) comments('      ', rule.comments);
-    }
-  } else if (plan.static) {
+  // A rule-set with no emitted rule is not valid Junos, so it keeps only its comments.
+  const emittedStatic = (plan.static || []).filter(ruleSet => !ruleSet.skipped && ruleSet.rules.some(rule => !rule.skipped));
+  for (const ruleSet of (plan.static || []).filter(item => !emittedStatic.includes(item))) {
+    comments('      ', ruleSet.comments);
+    for (const rule of ruleSet.rules) comments('      ', rule.comments);
+  }
+  if (emittedStatic.length > 0) {
     lines.push('      <static>');
-    for (const ruleSet of plan.static) {
+    for (const ruleSet of emittedStatic) {
       ruleSetHeader('        ', ruleSet);
       for (const rule of ruleSet.rules) {
         comments('          ', rule.comments);

@@ -269,18 +269,15 @@ export function planNat({
     const ownerIndex = natRules.findIndex(rule => (
       effectiveNatTypes(rule).includes(type)
       && natSourceZones(rule).includes(fromZone)
-      && natDestinationZones(rule).includes(toZone)
+      && (type === 'static' || natDestinationZones(rule).includes(toZone))
     ));
-    const role = type === 'static'
-      ? 'static-nat-rule-set'
-      : `${type}-nat-rule-set:${encodeJunosZonePair(fromZone, toZone)}`;
-    return naming.generated(`nat_rules[${ownerIndex}]`, role);
+    return naming.generated(`nat_rules[${ownerIndex}]`, `${type}-nat-rule-set:${encodeJunosZonePair(fromZone, toZone)}`);
   };
   const ruleNameFor = (ruleIndex, rule, type, fromZone, toZone) => {
     let occurrence = 0;
     for (const candidateType of effectiveNatTypes(rule)) {
       const pairs = candidateType === 'static'
-        ? [['STATIC-NAT', '*']]
+        ? natSourceZones(rule).map(source => [source, '*'])
         : natSourceZones(rule).flatMap(source => (
           natDestinationZones(rule).map(destination => [source, destination])
         ));
@@ -619,51 +616,102 @@ export function planNat({
     return ruleSets;
   };
 
+  // Junos static rule-sets take only a "from"; rules group by the zone their traffic arrives from.
   const planStaticRuleSets = staticRules => {
-    const name = naming.generated(`nat_rules[${natRuleIndex.get(staticRules[0])}]`, 'static-nat-rule-set');
-    const ruleSet = { type: 'static', name, fromZones: [], toZones: [], comments: [], skipped: false, rules: [] };
+    const groups = new Map();
     for (const rule of staticRules) {
-      const ruleIndex = natRuleIndex.get(rule);
-      const ruleName = ruleNameFor(ruleIndex, rule, 'static', 'STATIC-NAT', '*');
-      const comments = [];
-      const planned = { name: ruleName, comments, skipped: false };
-      ruleSet.rules.push(planned);
-
-      const destination = planMatchField(ruleIndex, rule, 'dst_addresses',
-        { anyAddress: natAnyAddress(rule), allowGroups: false, keepAny: false });
-      if (destination.unresolved) {
-        planned.skipped = true;
-        comments.push(skipUnresolved('static', ruleName, 'dst_addresses', rule));
-        continue;
+      for (const fromZone of natSourceZones(rule)) {
+        if (!groups.has(fromZone)) groups.set(fromZone, []);
+        groups.get(fromZone).push(rule);
       }
-      let prefix = null;
-      if (rule.translated_src && rule.translated_src.address) {
-        prefix = translatedAddress(rule.translated_src.address);
-        if (!prefix) {
+    }
+    const ruleSets = [];
+    for (const [fromZone, rules] of groups) {
+      const zoneRule = rules[0];
+      const name = ruleSetName('static', fromZone, '*');
+      const ruleSet = { type: 'static', name, fromZones: [], toZones: [], comments: [], skipped: false, rules: [] };
+      ruleSets.push(ruleSet);
+      if (fromZone === 'any') {
+        if (actualZones.length === 0) {
+          ruleSet.skipped = true;
+          ruleSet.comments.push(`WARNING: Static NAT rule-set ${fromZone} skipped — no defined zones`);
+          warnings.push(createWarning('warning', `nat/static/${fromZone}`,
+            `Static NAT rule-set from ${fromZone} skipped — 'any' is not valid and no zones defined`,
+            'Define security zones before NAT rules'));
+          continue;
+        }
+        ruleSet.fromZones = actualZones;
+      } else {
+        ruleSet.fromZones = [zoneReference(natRuleIndex.get(zoneRule), zoneRule, 'source', fromZone)];
+      }
+
+      for (const rule of rules) {
+        const ruleIndex = natRuleIndex.get(rule);
+        const ruleName = ruleNameFor(ruleIndex, rule, 'static', fromZone, '*');
+        const comments = [];
+        const planned = { name: ruleName, comments, skipped: false };
+        ruleSet.rules.push(planned);
+
+        // One mapping in several rule-sets would give the same address two static translations.
+        const ruleZones = natSourceZones(rule);
+        if (ruleZones.length > 1) {
           planned.skipped = true;
-          comments.push(`NAT: static rule "${ruleName}" skipped — translated address "${rule.translated_src.address}" is not a resolvable IP/prefix`);
+          comments.push(`NAT: static rule "${ruleName}" skipped — it is reached from ${ruleZones.length} zones (${oneLine(ruleZones.join(', '))})`);
+          if (fromZone === ruleZones[0]) {
+            warnings.push(createWarning('warning', `nat/static/${oneLine(rule.name || ruleIndex)}`,
+              `Static NAT rule "${oneLine(rule.name || ruleIndex)}" skipped — it is reached from several zones (${oneLine(ruleZones.join(', '))}), and one mapping must live in one static rule-set`,
+              'Build one static NAT rule-set with all of these from zones manually'));
+          }
+          continue;
+        }
+
+        const destination = planMatchField(ruleIndex, rule, 'dst_addresses',
+          { anyAddress: natAnyAddress(rule), allowGroups: false, keepAny: false });
+        if (destination.unresolved) {
+          planned.skipped = true;
+          comments.push(skipUnresolved('static', ruleName, 'dst_addresses', rule));
+          continue;
+        }
+        let prefix = null;
+        if (rule.translated_src && rule.translated_src.address) {
+          prefix = translatedAddress(rule.translated_src.address);
+          if (!prefix) {
+            planned.skipped = true;
+            comments.push(`NAT: static rule "${ruleName}" skipped — translated address "${rule.translated_src.address}" is not a resolvable IP/prefix`);
+            warnings.push(createWarning('warning', `nat/static/${ruleName}`,
+              `Static NAT rule "${ruleName}" skipped — translated address "${rule.translated_src.address}" could not be resolved to an IP/prefix`,
+              'Build the static NAT rule manually'));
+            continue;
+          }
+        }
+        // Junos needs both a destination match and a translated prefix for a static rule.
+        if (destination.entries.length === 0 || !prefix) {
+          planned.skipped = true;
+          comments.push(`NAT: static rule "${ruleName}" skipped — it needs both a destination match and a translated prefix`);
           warnings.push(createWarning('warning', `nat/static/${ruleName}`,
-            `Static NAT rule "${ruleName}" skipped — translated address "${rule.translated_src.address}" could not be resolved to an IP/prefix`,
+            `Static NAT rule "${ruleName}" skipped — a destination match and a translated prefix could not both be built from the source rule`,
             'Build the static NAT rule manually'));
           continue;
         }
+        const matchEntries = firstDestination('static', ruleName, destination.entries, natAnyAddress(rule))
+          .map(entry => ({ ...entry, value: withPrefix(entry.value) }));
+        // Static NAT maps one block onto another, so both sides must have the same prefix length.
+        const publicLength = withPrefix(matchEntries[0].value).split('/')[1];
+        if (publicLength !== withPrefix(prefix).split('/')[1]) {
+          planned.skipped = true;
+          comments.push(`NAT: static rule "${ruleName}" skipped — public ${matchEntries[0].value} and private ${prefix} differ in prefix length`);
+          warnings.push(createWarning('warning', `nat/static/${ruleName}`,
+            `Static NAT rule "${ruleName}" skipped — public ${oneLine(matchEntries[0].value)} and private ${oneLine(prefix)} differ in prefix length, and Junos static NAT maps equal-size blocks`,
+            'Build the static NAT rule manually'));
+          continue;
+        }
+        planned.match = { source: [], destination: matchEntries, protocol: null, destinationPort: null };
+        planned.then = { kind: 'static-prefix', prefix };
+        // The SRX must answer ARP for the public address, scoped to the zones the traffic arrives from.
+        addProxyCandidates(destinationCandidates(rule, matchEntries, natAnyAddress(rule)), natSourceZones(rule));
       }
-      // Junos needs both a destination match and a translated prefix for a static rule.
-      if (destination.entries.length === 0 || !prefix) {
-        planned.skipped = true;
-        comments.push(`NAT: static rule "${ruleName}" skipped — it needs both a destination match and a translated prefix`);
-        warnings.push(createWarning('warning', `nat/static/${ruleName}`,
-          `Static NAT rule "${ruleName}" skipped — a destination match and a translated prefix could not both be built from the source rule`,
-          'Build the static NAT rule manually'));
-        continue;
-      }
-      planned.match = { source: [], destination: firstDestination('static', ruleName, destination.entries, natAnyAddress(rule)), protocol: null, destinationPort: null };
-      planned.then = { kind: 'static-prefix', prefix };
-      // shortcut: no proxy ARP for static NAT. Parsers put the source rule's destination filter in
-      // dst_addresses, not the public address, so proxying it could claim a real host; upgrade
-      // once static rules carry the public address explicitly.
     }
-    return [ruleSet];
+    return ruleSets;
   };
 
   const rulesOfType = type => natRules.filter(rule => effectiveNatTypes(rule).includes(type));

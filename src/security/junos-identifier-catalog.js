@@ -155,14 +155,14 @@ function flowCollectorKey(collector) {
 }
 
 function natZonePairs(rule, type) {
-  if (type === 'static') return [{ fromZone: 'STATIC-NAT', toZone: '*' }];
+  if (type === 'static') return sourceZones(rule).map(fromZone => ({ fromZone, toZone: '*' }));
   return sourceZones(rule).flatMap(fromZone => (
     destinationZones(rule).map(toZone => ({ fromZone, toZone }))
   ));
 }
 
 function preferredNatRuleSetName(type, fromZone, toZone) {
-  return type === 'static' ? 'STATIC-NAT' : `${fromZone}-to-${toZone}`;
+  return type === 'static' ? `STATIC-NAT-${fromZone}` : `${fromZone}-to-${toZone}`;
 }
 
 function natMissingZoneRole(sourceName) {
@@ -1400,9 +1400,7 @@ function collectNat(config, state) {
         const ruleSetKey = encodeJunosIdentifierTuple(device, type, fromZone, toZone);
         if (!natRuleSets.has(ruleSetKey)) {
           natRuleSets.add(ruleSetKey);
-          const role = type === 'static'
-            ? 'static-nat-rule-set'
-            : `${type}-nat-rule-set:${encodeJunosZonePair(fromZone, toZone)}`;
+          const role = `${type}-nat-rule-set:${encodeJunosZonePair(fromZone, toZone)}`;
           collector.addGenerated({
             catalogKey: JUNOS_IDENTIFIER_CATALOG.NAT_RULE_SET,
             context: `${device}/nat:${type}`,

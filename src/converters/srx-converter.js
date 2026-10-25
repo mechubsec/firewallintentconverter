@@ -2407,6 +2407,12 @@ function convertNatRules(
   if (plan.static) {
     commands.push('# Static NAT Rules');
     for (const ruleSet of plan.static) {
+      // A from with no rule under it is not valid Junos, so a fully skipped rule-set keeps only its comments.
+      const emitsRules = !ruleSet.skipped && ruleSet.rules.some(rule => !rule.skipped);
+      if (ruleSet.skipped) ruleSet.comments.forEach(comment);
+      if (emitsRules) {
+        for (const zone of ruleSet.fromZones) commands.push(`set security nat static rule-set ${ruleSet.name} from zone ${zone}`);
+      }
       for (const rule of ruleSet.rules) {
         rule.comments.forEach(comment);
         if (rule.skipped) continue;

@@ -438,7 +438,7 @@ const CASES = {
   'PAN-OS NAT': () => parsePanosConfig(PANOS_NAT).intermediateConfig,
   'Cisco ASA NAT': () => parseCiscoAsaConfig(ASA_NAT).intermediateConfig,
   'SRX source-nat off exemption before interface NAT': () => parseSrxConfig(SRX_NO_NAT).intermediateConfig,
-  'proxy ARP for pool range and DNAT addresses on a connected subnet (static match excluded)': () => ({
+  'proxy ARP for pool range and DNAT addresses on a connected subnet (static public address included)': () => ({
     ...handBuilt([
       sourceRule({ translated_src: { type: 'dynamic-ip-pool', addresses: ['203.0.113.3-203.0.113.4'] } }),
       {
@@ -481,10 +481,11 @@ describe('NAT: set commands and XML render the same plan', () => {
   });
 
   it('compares the proxy ARP entries, not an empty list', () => {
-    const shape = normalizeSet(render(CASES['proxy ARP for pool range and DNAT addresses on a connected subnet (static match excluded)']()).set.commands);
+    const shape = normalizeSet(render(CASES['proxy ARP for pool range and DNAT addresses on a connected subnet (static public address included)']()).set.commands);
     expect(shape.proxyArp).toEqual([
       'ge-0/0/0.0 203.0.113.3/32 to 203.0.113.4/32',
       'ge-0/0/0.0 203.0.113.5/32',
+      'ge-0/0/0.0 203.0.113.6/32',
     ]);
   });
 

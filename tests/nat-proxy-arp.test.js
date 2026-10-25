@@ -156,12 +156,13 @@ describe('NAT proxy ARP: selection', () => {
     expect(setLines).toEqual([]);
   });
 
-  it('covers static source pools but not static NAT match destinations', () => {
-    // A static rule's dst_addresses is the source rule's destination filter, possibly a real host.
+  it('covers static source pools and the public address of static NAT', () => {
     const rules = [
       { name: 'static', type: 'static', dst_addresses: ['203.0.113.6'], translated_src: { address: '192.168.10.11' } },
       snat({ translated_src: { type: 'static', address: '203.0.113.4' } }),
     ];
+    expect(render(natConfig(rules)).setLines).toEqual([`${WAN} 203.0.113.4/32`, `${WAN} 203.0.113.6/32`]);
+    rules[0].arp_reply = false;
     expect(render(natConfig(rules)).setLines).toEqual([`${WAN} 203.0.113.4/32`]);
   });
 
