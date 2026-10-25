@@ -173,12 +173,16 @@ export function planNat({
     if (isLiteralAddress(addr)) return addr;
     const resolved = addrLookup[addr];
     if (!resolved) {
-      warnings.push(createWarning('nat', `NAT match address "${addr}" is not a known address object — skipped`));
+      warnings.push(createWarning('warning', `nat/address/${addr}`,
+        `NAT match address "${addr}" is not a known address object — skipped`,
+        'Define the address object, or use an IP/prefix in the NAT rule'));
       return null;
     }
     // Skip FQDN / dns-name values (not usable in NAT match)
     if (!/^\d+\.\d+\.\d+\.\d+/.test(resolved) && !/^[0-9a-fA-F:]+/.test(resolved)) {
-      warnings.push(createWarning('nat', `NAT match address "${addr}" resolves to FQDN "${resolved}" — skipped (Junos NAT requires IP)`));
+      warnings.push(createWarning('warning', `nat/address/${addr}`,
+        `NAT match address "${addr}" resolves to FQDN "${resolved}" — skipped (Junos NAT requires IP)`,
+        'Replace the FQDN with an IP/prefix in the NAT rule'));
       return null;
     }
     return resolved;
@@ -406,7 +410,9 @@ export function planNat({
         return { kind: 'pool', pool: { name: poolName, addresses: [{ prefix: withPrefix(resolved) }] } };
       }
       comments.push(`NAT: translated source "${translated.address}" is not a resolvable IP/prefix — using interface NAT`);
-      warnings.push(createWarning('nat', `Source NAT translated address "${translated.address}" could not be resolved to an IP/prefix — fell back to interface NAT`));
+      warnings.push(createWarning('warning', `nat/source/${rule.name || ruleIndex}`,
+        `Source NAT translated address "${translated.address}" could not be resolved to an IP/prefix — fell back to interface NAT`,
+        'Check the translated address; interface NAT may not match the source rule'));
       return interfaceThen;
     }
     // Unknown translation type: default to interface NAT (e.g. Check Point hide NAT)
@@ -524,7 +530,9 @@ export function planNat({
             if (!resolvedDestination) {
               planned.skipped = true;
               comments.push(`NAT: destination rule "${ruleName}" skipped — translated destination "${rawDestination}" is not a resolvable IP/prefix`);
-              warnings.push(createWarning('nat', `Destination NAT rule "${ruleName}" skipped — translated address "${rawDestination}" could not be resolved to an IP/prefix`));
+              warnings.push(createWarning('warning', `nat/destination/${ruleName}`,
+                `Destination NAT rule "${ruleName}" skipped — translated address "${rawDestination}" could not be resolved to an IP/prefix`,
+                'Build the destination NAT rule manually'));
               continue;
             }
           }
@@ -582,7 +590,9 @@ export function planNat({
         if (!prefix) {
           planned.skipped = true;
           comments.push(`NAT: static rule "${ruleName}" skipped — translated address "${rule.translated_src.address}" is not a resolvable IP/prefix`);
-          warnings.push(createWarning('nat', `Static NAT rule "${ruleName}" skipped — translated address "${rule.translated_src.address}" could not be resolved to an IP/prefix`));
+          warnings.push(createWarning('warning', `nat/static/${ruleName}`,
+            `Static NAT rule "${ruleName}" skipped — translated address "${rule.translated_src.address}" could not be resolved to an IP/prefix`,
+            'Build the static NAT rule manually'));
           continue;
         }
       }
