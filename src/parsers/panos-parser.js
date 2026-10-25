@@ -30,6 +30,7 @@ import {
   createWarning,
   detectVendor,
   detectIpVersion,
+  buildStaticNatFields,
 } from './parser-utils.js';
 
 // ---------------------------------------------------------------------------
@@ -2027,11 +2028,13 @@ function parseNatRules(vsys, warnings, serviceObjects) {
     let translatedSrc = null;
     let translatedDst = null;
     let translatedPort = null;
+    let staticBidirectional = false;
     let matchProtocol = null;
     let matchPort = null;
 
     // Service match (protocol/port)
-    const serviceName = typeof entry.service === 'string' ? entry.service.trim() : '';
+    // The XML parser turns a numeric name such as <service>443</service> into a number.
+    const serviceName = entry.service == null ? '' : String(entry.service).trim();
     if (serviceName && serviceName !== 'any' && serviceName !== 'application-default') {
       const svc = serviceLookup[serviceName];
       if (svc) {
@@ -2061,6 +2064,7 @@ function parseNatRules(vsys, warnings, serviceObjects) {
         }
       } else if (srcTrans['static-ip']) {
         type = 'static';
+        staticBidirectional = String(srcTrans['static-ip']['bi-directional']).trim() === 'yes';
         translatedSrc = {
           type: 'static',
           address: srcTrans['static-ip']['translated-address'] || '',
@@ -2074,6 +2078,22 @@ function parseNatRules(vsys, warnings, serviceObjects) {
       const dstTrans = entry['destination-translation'];
       translatedDst = dstTrans['translated-address'] || '';
       translatedPort = dstTrans['translated-port'] ? String(dstTrans['translated-port']) : null;
+    }
+
+    let staticFields = null;
+    if (type === 'static') {
+      staticFields = buildStaticNatFields({
+        name,
+        privateAddresses: srcAddresses,
+        publicAddresses: [translatedSrc.address],
+        destinationFilter: dstAddresses,
+        insideZones: srcZones,
+        outsideZones: dstZones,
+        bidirectional: staticBidirectional,
+        services: serviceName === 'application-default' ? [] : [serviceName],
+        warnings,
+      });
+      if (!staticFields) return null;
     }
 
     // Detect U-turn/hairpin NAT: source zones == destination zones with combo NAT
@@ -2099,6 +2119,7 @@ function parseNatRules(vsys, warnings, serviceObjects) {
       src_addresses: srcAddresses,
       dst_addresses: dstAddresses,
       translated_src: translatedSrc,
+      ...staticFields,
       translated_dst: translatedDst,
       translated_port: translatedPort,
       match_protocol: matchProtocol || undefined,
@@ -2107,7 +2128,7 @@ function parseNatRules(vsys, warnings, serviceObjects) {
       _rule_index: index + 1,
       _uturn: isUturn || undefined,
     };
-  });
+  }).filter(Boolean);
 }
 
 

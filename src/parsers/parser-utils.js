@@ -105,6 +105,55 @@ export function createWarning(severity, element, message, suggestion = '') {
 }
 
 /**
+ * Builds a bidirectional static NAT rule in the Junos convention the NAT plan reads:
+ * `dst_addresses` is the public address, `translated_src.address` the private one,
+ * `src_zones` the zone the public address is reached from and `dst_zones` the inside.
+ * Returns null, with a warning, for shapes one Junos static NAT rule cannot express.
+ *
+ * @param {Object} input
+ * @param {string} input.name - Source rule name
+ * @param {string[]} input.privateAddresses - Real (inside) addresses
+ * @param {string[]} input.publicAddresses - Mapped (outside) addresses
+ * @param {string[]} input.destinationFilter - The source rule's destination match
+ * @param {string[]} input.insideZones
+ * @param {string[]} input.outsideZones
+ * @param {boolean} [input.bidirectional=true] - False for a one-way mapping
+ * @param {string[]} [input.services=[]] - Services the mapping is scoped to ('any' is unscoped)
+ * @param {Object[]} input.warnings - Warning list to append to
+ * @returns {Object|null} The rule fields to spread into the NAT rule, or null when skipped
+ */
+export function buildStaticNatFields({
+  name, privateAddresses, publicAddresses, destinationFilter, insideZones, outsideZones,
+  bidirectional = true, services = [], warnings,
+}) {
+  const scopedServices = services.filter((service) => service && service !== 'any');
+  let reason = null;
+  // Junos static NAT translates both ways on every port, so a narrower source mapping must not widen.
+  if (!bidirectional) reason = 'it is one-way, and Junos static NAT always translates both ways';
+  else if (scopedServices.length > 0) reason = `it is scoped to service ${scopedServices.join(', ')}`;
+  else if ((destinationFilter || []).some((address) => address !== 'any')) reason = 'it matches a specific destination';
+  else if (privateAddresses.length !== 1 || publicAddresses.length !== 1) reason = 'it maps more than one address';
+  // Identity NAT exempts traffic from other NAT rules; as static NAT it would proxy ARP for an inside host.
+  else if (privateAddresses[0] === publicAddresses[0]) reason = 'it maps an address to itself (identity NAT)';
+  if (reason) {
+    warnings.push(createWarning(
+      'warning',
+      `nat/static/${name}`,
+      `Static NAT rule "${name}" skipped — ${reason}, which one Junos static NAT rule cannot express`,
+      'Build the static NAT rule manually',
+    ));
+    return null;
+  }
+  return {
+    src_zones: outsideZones,
+    dst_zones: insideZones,
+    src_addresses: ['any'],
+    dst_addresses: publicAddresses,
+    translated_src: { type: 'static', address: privateAddresses[0] },
+  };
+}
+
+/**
  * Detects the IP version of an address string.
  *
  * @param {string} value - Address string (e.g. "10.0.0.1/24" or "2001:db8::1/64")
