@@ -1187,6 +1187,14 @@ function flattenNatRulebase(rules) {
  */
 function buildNatRule(rule, uidMap, ruleIndex, warnings) {
   if (!rule) return null;
+  // Converting a disabled rule would make it active on the SRX.
+  if (rule.enabled === false) {
+    const name = rule.name || `NAT-${ruleIndex}`;
+    warnings.push(createWarning('warning', `nat/${name}`,
+      `NAT rule "${name}" is disabled — not converted`,
+      'Add it to the SRX by hand, deactivated, if you want to keep it'));
+    return null;
+  }
 
   const origSrc = resolveUidToName(rule['original-source'], uidMap, warnings, 'nat/orig-src');
   const origDst = resolveUidToName(rule['original-destination'], uidMap, warnings, 'nat/orig-dst');

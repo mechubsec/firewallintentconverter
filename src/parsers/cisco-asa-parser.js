@@ -831,6 +831,12 @@ function parseAccessGroups(lines, warnings) {
 // NAT Parser
 // ---------------------------------------------------------------------------
 
+// NAT option keywords come after the operands and before free-text "description".
+function natOptionFlags(options) {
+  const descriptionIndex = options.indexOf('description');
+  return descriptionIndex < 0 ? options : options.slice(0, descriptionIndex);
+}
+
 /**
  * Parses a Cisco ASA manual/twice-NAT command into a structured NAT rule.
  * Handles: source (static|dynamic) <real> <mapped> [destination (static|dynamic) <real> <mapped>] [service <real> <mapped>]
@@ -862,6 +868,15 @@ function parseTwiceNatCommand(rest, srcIf, dstIf, ruleIndex, warnings) {
   if (i < tokens.length && tokens[i] === 'service' && i + 2 < tokens.length) {
     svcMapped = tokens[i + 2];
     i += 3;
+  }
+
+  const flags = natOptionFlags(tokens.slice(i));
+  // Converting an inactive rule would make it active on the SRX.
+  if (flags.includes('inactive')) {
+    warnings.push(createWarning('warning', `nat/Manual-NAT-${ruleIndex}`,
+      `NAT rule "Manual-NAT-${ruleIndex}" is inactive — not converted`,
+      'Add it to the SRX by hand, deactivated, if you want to keep it'));
+    return null;
   }
 
   // Determine type
@@ -899,7 +914,7 @@ function parseTwiceNatCommand(rest, srcIf, dstIf, ruleIndex, warnings) {
       destinationFilter: [],
       insideZones: [srcIf],
       outsideZones: [dstIf],
-      bidirectional: !tokens.includes('unidirectional'),
+      bidirectional: !flags.includes('unidirectional'),
       services: svcMapped ? [svcMapped] : [],
       warnings,
     });
@@ -910,7 +925,7 @@ function parseTwiceNatCommand(rest, srcIf, dstIf, ruleIndex, warnings) {
     name,
     type,
     // ASA answers ARP for mapped addresses unless the rule says otherwise.
-    ...(tokens.includes('no-proxy-arp') ? { arp_reply: false } : {}),
+    ...(flags.includes('no-proxy-arp') ? { arp_reply: false } : {}),
     src_zones: [srcIf],
     dst_zones: [dstIf],
     src_addresses: [srcReal || 'any'],
@@ -940,10 +955,17 @@ function parseNatRules(blocks, lines, warnings) {
       const match = child.match(/nat\s+\(([^,]+),([^)]+)\)\s+(dynamic|static)\s+(.*)/);
       if (match) {
         const [, srcIf, dstIf, natType, rest] = match;
-        const mapped = rest.trim().split(/\s+/)[0];
+        const [mapped, ...options] = rest.trim().split(/\s+/);
+        const objectFlags = natOptionFlags(options);
+        if (objectFlags.includes('inactive')) {
+          warnings.push(createWarning('warning', `nat/Auto-NAT-${objName}`,
+            `NAT rule "Auto-NAT-${objName}" is inactive — not converted`,
+            'Add it to the SRX by hand, deactivated, if you want to keep it'));
+          continue;
+        }
         const base = {
           name: `Auto-NAT-${objName}`,
-          ...(rest.split(/\s+/).includes('no-proxy-arp') ? { arp_reply: false } : {}),
+          ...(objectFlags.includes('no-proxy-arp') ? { arp_reply: false } : {}),
           src_zones: [srcIf.trim()],
           dst_zones: [dstIf.trim()],
           src_addresses: [objName],
@@ -965,7 +987,7 @@ function parseNatRules(blocks, lines, warnings) {
           continue;
         }
         // Static to the interface or on a service is port forwarding, not a one-to-one mapping.
-        if (mapped === 'interface' || rest.split(/\s+/).includes('service')) {
+        if (mapped === 'interface' || objectFlags.includes('service')) {
           warnings.push(createWarning('warning', `nat/static/${base.name}`,
             `Static NAT rule "${base.name}" skipped — it maps to the interface or a service, which one Junos static NAT rule cannot express`,
             'Build a destination NAT rule manually'));

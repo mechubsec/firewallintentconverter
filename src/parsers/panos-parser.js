@@ -2018,6 +2018,13 @@ function parseNatRules(vsys, warnings, serviceObjects) {
 
   return ruleEntries.map((entry, index) => {
     const name = entry['@_name'] || `nat-rule-${index + 1}`;
+    // Converting a disabled rule would make it active on the SRX.
+    if (entry.disabled === 'yes' || entry.disabled === true) {
+      warnings.push(createWarning('warning', `nat-rule/${name}`,
+        `NAT rule "${name}" is disabled — not converted`,
+        'Add it to the SRX by hand, deactivated, if you want to keep it'));
+      return null;
+    }
     const srcZones = extractMembers(entry.from);
     const dstZones = extractMembers(entry.to);
     const srcAddresses = extractMembers(entry.source);
