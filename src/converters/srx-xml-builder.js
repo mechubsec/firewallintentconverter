@@ -20,7 +20,7 @@ import {
   xmlElementName,
   xmlText,
 } from '../security/junos-serialization.js';
-import { findNegationIssues } from '../security/policy-reference-integrity.js';
+import { findNegationIssues, findPolicyReferenceIssues } from '../security/policy-reference-integrity.js';
 import { validateJunosInput } from '../security/junos-input-validation.js';
 import { encodeJunosZonePair } from '../security/junos-identifier-identity.js';
 import {
@@ -84,6 +84,7 @@ export function buildSrxXml(config, interfaceMappings = {}, targetContext = null
   };
   const lines = [];
   xmlCustomfwicApps.clear();
+  xmlUnmappedApps.clear();
   xmlPredefServiceMap.clear();
   prepareXmlApplicationGroupApplications(config.application_groups, identifierNames);
 
@@ -157,7 +158,7 @@ export function buildSrxXml(config, interfaceMappings = {}, targetContext = null
   buildUtmXml(utmProfiles, lines, identifierNames);
 
   // Policies
-  buildPoliciesXml(config.security_policies, lines, warnings, { utmPolicyMap, idpPolicyMap, secIntelEnabled, secIntelPolicyName }, config.application_groups, sourceVendor, config._rule_groups, identifierNames);
+  buildPoliciesXml(config.security_policies, lines, warnings, { utmPolicyMap, idpPolicyMap, secIntelEnabled, secIntelPolicyName }, config.application_groups, sourceVendor, config._rule_groups, identifierNames, findPolicyReferenceIssues(config));
 
   // NAT
   buildNatXml(config.nat_rules, config.zones, lines, warnings, identifierNames, interfaceMappings);
@@ -417,7 +418,7 @@ function orderedZoneEntries(zones) {
     ));
 }
 
-function buildPoliciesXml(policies, lines, warnings, profileMaps = {}, appGroups = [], sourceVendor = '', ruleGroups = [], identifierNames) {
+function buildPoliciesXml(policies, lines, warnings, profileMaps = {}, appGroups = [], sourceVendor = '', ruleGroups = [], identifierNames, policyReferenceIssues = new Map()) {
   if (!policies || policies.length === 0) return;
 
   const {
@@ -525,6 +526,10 @@ function buildPoliciesXml(policies, lines, warnings, profileMaps = {}, appGroups
       if (srcAddrs.length === 0 && policy.src_addresses.length > 0) srcAddrs = [{ value: 'any', index: null }];
       if (dstAddrs.length === 0 && policy.dst_addresses.length > 0) dstAddrs = [{ value: 'any', index: null }];
 
+      const apps = resolveApps(policy.applications, policy.services, warnings, policy.name, appGroups, sourceVendor, pIdx, identifierNames);
+      const hasUnmappedApp = apps.some(app => xmlUnmappedApps.has(app));
+      const referenceIssue = policyReferenceIssues.get(pIdx);
+
       // Junos XML marks a deactivated statement with inactive="inactive"
       const negationIssues = findNegationIssues(policy);
       if (negationIssues.length > 0) {
@@ -536,7 +541,21 @@ function buildPoliciesXml(policies, lines, warnings, profileMaps = {}, appGroups
           'Rewrite the negated address match by hand before enabling this policy.',
         ));
       }
-      lines.push(negationIssues.length > 0 ? '        <policy inactive="inactive">' : '        <policy>');
+      if (referenceIssue) {
+        const undefinedItems = [
+          ...(referenceIssue.addresses || []).map(addr => `address "${addr}"`),
+          ...(referenceIssue.services || []).map(svc => `service "${svc}"`),
+        ];
+        lines.push(`        ${xmlComment(`CAVEAT: policy deactivated — undefined reference(s): ${undefinedItems.join(', ')}`, `security_policies[${pIdx}]`)}`);
+        warnings.push(createWarning(
+          'warning',
+          `security_policies[${pIdx}]`,
+          `Policy ${policy.name || pIdx} has undefined reference(s): ${undefinedItems.join(', ')}`,
+          'Define the missing objects before enabling this policy.',
+        ));
+      }
+      const deactivate = policy.disabled || hasUnmappedApp || !!referenceIssue || negationIssues.length > 0;
+      lines.push(deactivate ? '        <policy inactive="inactive">' : '        <policy>');
       lines.push(`          <name>${xmlText(name)}</name>`);
       if (policy.description) {
         lines.push(`          <description>${xmlText(policy.description, `security_policies[${pIdx}].description`)}</description>`);
@@ -555,7 +574,6 @@ function buildPoliciesXml(policies, lines, warnings, profileMaps = {}, appGroups
       }
       if (policy.negate_destination) lines.push('            <destination-address-excluded/>');
 
-      const apps = resolveApps(policy.applications, policy.services, warnings, policy.name, appGroups, sourceVendor, pIdx, identifierNames);
       for (const app of apps) {
         lines.push(`            <application>${xmlText(app)}</application>`);
       }
@@ -1496,6 +1514,9 @@ function buildSecIntelXml(externalLists, lines, identifierNames) {
 /** Tracks unmapped apps for placeholder XML generation */
 const xmlCustomfwicApps = new Map();
 
+/** Names of generated placeholder apps with no Junos equivalent (policies using them are deactivated) */
+const xmlUnmappedApps = new Set();
+
 /** Tracks service objects that map to predefined Junos apps (XML path) */
 const xmlPredefServiceMap = new Map();
 
@@ -1511,6 +1532,7 @@ function prepareXmlApplicationGroupApplications(groups, identifierNames) {
         const role = entry.definitionPath.slice(entry.definitionPath.lastIndexOf('#generated:') + 11);
         const generatedName = identifierNames.generated(path, role);
         xmlCustomfwicApps.set(generatedName, { originalName: member, kind: entry.kind });
+        if (role === 'unmapped-application') xmlUnmappedApps.add(generatedName);
       }
     }
   }
@@ -1530,6 +1552,7 @@ function resolveApps(applications, services, warnings, policyName, appGroups = [
       const role = entry.definitionPath.slice(entry.definitionPath.lastIndexOf('#generated:') + 11);
       const generatedName = identifierNames.generated(path, role);
       xmlCustomfwicApps.set(generatedName, { originalName: appName, kind: entry.kind });
+      if (role === 'unmapped-application') xmlUnmappedApps.add(outputName);
     }
     if (!junos && !isSrxSource) {
       if (warnings) {
