@@ -848,6 +848,10 @@ function parseTwiceNatCommand(rest, srcIf, dstIf, ruleIndex, warnings) {
   let dstNatType = null, dstReal = null, dstMapped = null;
   let svcMapped = null;
 
+  // Optional section and line-number prefixes: nat (in,out) [after-auto] [<line>] source ...
+  if (tokens[i] === 'after-auto') i += 1;
+  if (/^\d+$/.test(tokens[i] || '')) i += 1;
+
   // Parse "source (static|dynamic) <real> <mapped>"
   if (i < tokens.length && tokens[i] === 'source' && i + 3 < tokens.length) {
     srcNatType = tokens[i + 1];
@@ -868,6 +872,14 @@ function parseTwiceNatCommand(rest, srcIf, dstIf, ruleIndex, warnings) {
   if (i < tokens.length && tokens[i] === 'service' && i + 2 < tokens.length) {
     svcMapped = tokens[i + 2];
     i += 3;
+  }
+
+  // An unrecognized shape would otherwise become an any-to-any interface NAT rule.
+  if (!srcNatType && !dstNatType) {
+    warnings.push(createWarning('warning', `nat/Manual-NAT-${ruleIndex}`,
+      `NAT rule "Manual-NAT-${ruleIndex}" (nat ${rest}) could not be parsed — not converted`,
+      'Convert this NAT rule manually'));
+    return null;
   }
 
   const flags = natOptionFlags(tokens.slice(i));
@@ -1011,7 +1023,7 @@ function parseNatRules(blocks, lines, warnings) {
   // Manual/Twice NAT — top-level nat statements
   for (const line of lines) {
     const trimmed = line.trim();
-    if (!trimmed.startsWith('nat ') || trimmed.includes('description')) continue;
+    if (!trimmed.startsWith('nat ')) continue;
     // Skip indented nat lines (those are inside object blocks)
     if (line[0] === ' ' || line[0] === '\t') continue;
 
