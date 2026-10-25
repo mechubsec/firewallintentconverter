@@ -2048,6 +2048,13 @@ function parseNatRules(tree, warnings) {
     const extPort = getString(entry['extport']) || '';
     const mappedPort = getString(entry['mappedport']) || '';
     const vipProtocol = getString(entry['protocol']) || '';
+    // SRX static/destination NAT port match supports only tcp and udp.
+    if (portForward && vipProtocol && vipProtocol !== 'tcp' && vipProtocol !== 'udp') {
+      warnings.push(createWarning('warning', `nat/${name}`,
+        `VIP "${name}" port-forwards protocol ${vipProtocol} — destination NAT not converted`,
+        'Only tcp and udp port forwards convert; build this destination NAT rule manually'));
+      continue;
+    }
     // The VIP's external interface is where the traffic arrives: it is the
     // rule-set's from-zone, not a destination zone.
     const extIntf = getString(entry['extintf']);
