@@ -13,6 +13,8 @@ import { encodeJunosZonePair } from '../security/junos-identifier-identity.js';
 const IPV4_ADDRESS = /^\d+\.\d+\.\d+\.\d+(\/\d+)?$/;
 // njsscan regex_dos: false positive. \d excludes the literal dot and hyphen, so no token backtracks.
 const IPV4_RANGE = /^(\d+\.\d+\.\d+\.\d+)-(\d+\.\d+\.\d+\.\d+)$/;  // njsscan-ignore: regex_dos
+// Junos accepts at most eight source and eight destination addresses in one source NAT rule.
+const NAT_MATCH_ADDRESS_LIMIT = 8;
 
 /** True for a full or "::"-compressed IPv6 address, so names like "dead:beef" are not literals. */
 function isIpv6Address(text) {
@@ -109,6 +111,33 @@ function prefixBounds({ address, length }) {
   const size = 2 ** (32 - length);
   const first = Math.floor(address / size) * size;
   return { first, last: first + size - 1 };
+}
+
+const ipv4ToInteger = text => text.split('.').reduce((total, octet) => total * 256 + Number(octet), 0);
+const isIpv4Address = text => /^\d{1,3}(\.\d{1,3}){3}$/.test(text) && text.split('.').every(octet => Number(octet) <= 255);
+
+/**
+ * Expands an IPv4 range into the minimal CIDR prefixes that cover it exactly.
+ *
+ * @param {string} start - First address, dotted quad
+ * @param {string} end - Last address, dotted quad
+ * @returns {string[]|null} Prefixes ("A.B.C.D/len"), or null when an address is invalid or start > end
+ */
+export function ipv4RangeToPrefixes(start, end) {
+  if (!isIpv4Address(start) || !isIpv4Address(end)) return null;
+  let next = ipv4ToInteger(start);
+  const last = ipv4ToInteger(end);
+  if (next > last) return null;
+  const prefixes = [];
+  while (next <= last) {
+    // Largest power-of-two block that is aligned at `next` and still ends by `last`.
+    let size = next === 0 ? 2 ** 32 : Math.abs(next & -next);
+    while (next + size - 1 > last) size /= 2;
+    const dotted = [24, 16, 8, 0].map(shift => Math.floor(next / 2 ** shift) % 256).join('.');
+    prefixes.push(`${dotted}/${32 - Math.log2(size)}`);
+    next += size;
+  }
+  return prefixes;
 }
 
 const oneLine = value => String(value).replace(/[\r\n]+/g, ' ');
@@ -298,7 +327,7 @@ export function planNat({
    * Plans one match field. A field that listed addresses but resolved none
    * must not become "match anything", so it reports `unresolved`.
    */
-  const planMatchField = (ruleIndex, rule, field, { anyAddress, allowGroups, keepAny }) => {
+  const planMatchField = (ruleIndex, rule, field, { anyAddress, allowGroups, keepAny, limit = Infinity }) => {
     const addresses = rule[field];
     if (!Array.isArray(addresses)) return { entries: keepAny ? [{ kind: 'prefix', value: anyAddress }] : [], unresolved: false };
     const entries = [];
@@ -316,15 +345,38 @@ export function planNat({
       } else {
         const resolved = matchAddress(ruleIndex, field, addressIndex, addr);
         if (!resolved) continue;
-        entries.push({ kind: 'prefix', value: resolved });
+        // Junos NAT match fields take prefixes, not "start-end", so a range becomes its covering prefixes.
+        const range = resolved.match(IPV4_RANGE);
+        const prefixes = range ? ipv4RangeToPrefixes(range[1], range[2]) : [resolved];
+        if (!prefixes || (!range && /^[0-9a-fA-F:]+-[0-9a-fA-F:]+$/.test(resolved))) {
+          warnings.push(createWarning(
+            'warning',
+            `nat/${rule.type || 'source'}/${rule.name || ruleIndex}`,
+            `NAT match address "${oneLine(addr)}" is a range (${oneLine(resolved)}) that cannot be expressed as IPv4 prefixes — skipped`,
+            'Replace the range with IPv4 prefixes, then add the NAT rule manually',
+          ));
+          continue;
+        }
+        entries.push(...prefixes.map(prefix => ({ kind: 'prefix', value: prefix })));
         succeeded += 1;
       }
     }
+    // Over the limit the rule can't commit, and dropping addresses would change what it matches.
+    if (entries.length > limit) return { entries: [], unresolved: true, overLimit: entries.length };
     return { entries, unresolved: addresses.length > 0 && succeeded === 0 };
   };
-  const skipUnresolved = (type, ruleName, field, rule) => {
+  const skipUnresolved = (type, ruleName, field, rule, fieldPlan = {}) => {
     const label = field === 'src_addresses' ? 'source' : 'destination';
     const listed = oneLine(rule[field].join(', '));
+    if (fieldPlan.overLimit) {
+      warnings.push(createWarning(
+        'warning',
+        `nat/${type}/${ruleName}`,
+        `NAT rule "${ruleName}" skipped — its ${label} addresses (${listed}) need ${fieldPlan.overLimit} prefixes, and Junos allows ${NAT_MATCH_ADDRESS_LIMIT} per rule`,
+        `Split the rule so each part matches at most ${NAT_MATCH_ADDRESS_LIMIT} ${label} addresses, then add it manually`,
+      ));
+      return `NAT: ${type} rule "${ruleName}" skipped — ${fieldPlan.overLimit} ${label} prefixes exceed the Junos limit of ${NAT_MATCH_ADDRESS_LIMIT}`;
+    }
     warnings.push(createWarning(
       'warning',
       `nat/${type}/${ruleName}`,
@@ -460,13 +512,13 @@ export function planNat({
         ruleSet.rules.push(planned);
 
         const anyAddress = natAnyAddress(rule);
-        const options = { anyAddress, allowGroups: true, keepAny: true };
+        const options = { anyAddress, allowGroups: true, keepAny: true, limit: NAT_MATCH_ADDRESS_LIMIT };
         const source = planMatchField(ruleIndex, rule, 'src_addresses', options);
         const destination = planMatchField(ruleIndex, rule, 'dst_addresses', options);
         const unresolvedField = source.unresolved ? 'src_addresses' : (destination.unresolved ? 'dst_addresses' : null);
         if (unresolvedField) {
           planned.skipped = true;
-          comments.push(skipUnresolved('source', name, unresolvedField, rule));
+          comments.push(skipUnresolved('source', name, unresolvedField, rule, source.unresolved ? source : destination));
           continue;
         }
         planned.match = {
