@@ -155,6 +155,10 @@ export const AnalysisEngine = {
     for (const r of (config.nat_rules || [])) {
       (r.src_addresses || []).forEach(markAddr);
       (r.dst_addresses || []).forEach(markAddr);
+      // Translated addresses (pools, DNAT targets, the private side of static NAT) are references too.
+      markAddr(r.translated_src?.address);
+      (r.translated_src?.addresses || []).forEach(markAddr);
+      markAddr(typeof r.translated_dst === 'string' ? r.translated_dst : r.translated_dst?.address);
     }
 
     // Cascade: members of used groups are also "used"
