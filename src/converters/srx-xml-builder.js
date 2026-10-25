@@ -20,6 +20,7 @@ import {
   xmlElementName,
   xmlText,
 } from '../security/junos-serialization.js';
+import { findNegationIssues } from '../security/policy-reference-integrity.js';
 import { validateJunosInput } from '../security/junos-input-validation.js';
 import { encodeJunosZonePair } from '../security/junos-identifier-identity.js';
 import {
@@ -524,7 +525,18 @@ function buildPoliciesXml(policies, lines, warnings, profileMaps = {}, appGroups
       if (srcAddrs.length === 0 && policy.src_addresses.length > 0) srcAddrs = [{ value: 'any', index: null }];
       if (dstAddrs.length === 0 && policy.dst_addresses.length > 0) dstAddrs = [{ value: 'any', index: null }];
 
-      lines.push('        <policy>');
+      // Junos XML marks a deactivated statement with inactive="inactive"
+      const negationIssues = findNegationIssues(policy);
+      if (negationIssues.length > 0) {
+        lines.push(`        ${xmlComment(`CAVEAT: policy deactivated — negated address match not representable: ${negationIssues.join('; ')}`, `security_policies[${pIdx}]`)}`);
+        warnings.push(createWarning(
+          'warning',
+          `security_policies[${pIdx}]`,
+          `Policy ${policy.name || pIdx} deactivated: ${negationIssues.join('; ')}`,
+          'Rewrite the negated address match by hand before enabling this policy.',
+        ));
+      }
+      lines.push(negationIssues.length > 0 ? '        <policy inactive="inactive">' : '        <policy>');
       lines.push(`          <name>${xmlText(name)}</name>`);
       if (policy.description) {
         lines.push(`          <description>${xmlText(policy.description, `security_policies[${pIdx}].description`)}</description>`);
@@ -536,10 +548,12 @@ function buildPoliciesXml(policies, lines, warnings, profileMaps = {}, appGroups
         const output = addressIndex === null ? 'any' : identifierNames.reference(`security_policies[${pIdx}].src_addresses[${addressIndex}]`);
         lines.push(`            <source-address>${xmlText(output)}</source-address>`);
       }
+      if (policy.negate_source) lines.push('            <source-address-excluded/>');
       for (const { index: addressIndex } of (dstAddrs.length > 0 ? dstAddrs : [{ value: 'any', index: null }])) {
         const output = addressIndex === null ? 'any' : identifierNames.reference(`security_policies[${pIdx}].dst_addresses[${addressIndex}]`);
         lines.push(`            <destination-address>${xmlText(output)}</destination-address>`);
       }
+      if (policy.negate_destination) lines.push('            <destination-address-excluded/>');
 
       const apps = resolveApps(policy.applications, policy.services, warnings, policy.name, appGroups, sourceVendor, pIdx, identifierNames);
       for (const app of apps) {

@@ -46,11 +46,13 @@ export function parseFortigateConfig(configText) {
   const interfaces = parseInterfaces(tree, warnings);
   const addressObjects = parseAddressObjects(tree, warnings);
   const addressGroups = parseAddressGroups(tree, warnings);
-  const serviceObjects = parseServiceObjects(tree, warnings);
-  const serviceGroups = parseServiceGroups(tree, warnings);
+  const splitServiceGroups = [];
+  const serviceObjects = parseServiceObjects(tree, warnings, splitServiceGroups);
+  const serviceGroups = [...parseServiceGroups(tree, warnings), ...splitServiceGroups];
   const securityPolicies = parseSecurityPolicies(tree, warnings);
   const natRules = parseNatRules(tree, warnings);
   const vipObjects = parseVipObjects(tree, warnings);
+  synthesizeVipAddresses(tree, securityPolicies, addressObjects, addressGroups);
   const schedules = parseSchedules(tree, warnings);
   const profileGroups = parseProfileGroups(tree, warnings);
   const securityProfileDefinitions = parseSecurityProfileDefinitions(tree, warnings);
@@ -1623,9 +1625,19 @@ function parseAddressGroups(tree, warnings) {
 
 
 // --- Service Objects ---
-function parseServiceObjects(tree, warnings) {
+// Multi-protocol services are split per protocol; a group under the original
+// name (pushed to splitGroups) keeps policy references resolvable.
+function parseServiceObjects(tree, warnings, splitGroups = []) {
   const svcSection = tree['firewall service custom'] || {};
   const services = [];
+  // Generated split names must not shadow a service or group the config already defines.
+  const takenNames = new Set([...Object.keys(svcSection), ...Object.keys(tree['firewall service group'] || {})]);
+  const uniqueName = (baseName) => {
+    let candidate = baseName;
+    for (let suffix = 2; takenNames.has(candidate); suffix += 1) candidate = `${baseName}_${suffix}`;
+    takenNames.add(candidate);
+    return candidate;
+  };
 
   for (const [name, entry] of Object.entries(svcSection)) {
     if (typeof entry !== 'object') continue;
@@ -1652,39 +1664,38 @@ function parseServiceObjects(tree, warnings) {
       });
     } else {
       // TCP/UDP/SCTP
-      const tcpPorts = getString(entry['tcp-portrange']) || '';
-      const udpPorts = getString(entry['udp-portrange']) || '';
-      const sctpPorts = getString(entry['sctp-portrange']) || '';
+      // "set tcp-portrange 80 443" lists several ranges; each becomes its own service.
+      const rangesByProtocol = {
+        tcp: ensureArray(entry['tcp-portrange']),
+        udp: ensureArray(entry['udp-portrange']),
+        sctp: ensureArray(entry['sctp-portrange']),
+      };
+      const portParts = Object.entries(rangesByProtocol)
+        .flatMap(([proto, ranges]) => ranges.map((range, index) => ({
+          proto,
+          range,
+          baseName: ranges.length > 1 ? `${name}_${proto}_${index + 1}` : `${name}_${proto}`,
+        })));
+      const isSplit = portParts.length > 1;
+      const description = getString(entry['comment']) || '';
 
-      if (tcpPorts) {
+      const members = [];
+      for (const { proto, range, baseName } of portParts) {
+        const serviceName = isSplit ? uniqueName(baseName) : name;
+        members.push(serviceName);
         services.push({
-          name: udpPorts ? `${name}_tcp` : name,
-          protocol: 'tcp',
-          port_range: normalizePortRange(tcpPorts),
+          name: serviceName,
+          protocol: proto,
+          port_range: normalizePortRange(range),
           source_port: '',
-          description: getString(entry['comment']) || '',
+          description,
         });
       }
-      if (udpPorts) {
-        services.push({
-          name: tcpPorts ? `${name}_udp` : name,
-          protocol: 'udp',
-          port_range: normalizePortRange(udpPorts),
-          source_port: '',
-          description: getString(entry['comment']) || '',
-        });
-      }
-      if (sctpPorts) {
-        services.push({
-          name,
-          protocol: 'sctp',
-          port_range: normalizePortRange(sctpPorts),
-          source_port: '',
-          description: getString(entry['comment']) || '',
-        });
+      if (isSplit) {
+        splitGroups.push({ name, members, description });
       }
       // If no ports specified, it's a protocol-level match
-      if (!tcpPorts && !udpPorts && !sctpPorts) {
+      if (portParts.length === 0) {
         services.push({
           name,
           protocol: 'tcp',
@@ -1978,6 +1989,14 @@ function parseNatRules(tree, warnings) {
   for (const [name, entry] of Object.entries(vipSection)) {
     if (typeof entry !== 'object') continue;
     const extIp = getString(entry['extip']) || '';
+    // Without an external IP there is nothing to match; 'any' would DNAT the whole zone.
+    // extip 0.0.0.0 means "the extintf's own address", which a static match cannot express.
+    if (!extIp || extIp === '0.0.0.0') {
+      warnings.push(createWarning('warning', `nat/${name}`,
+        `VIP "${name}" has no static extip — destination NAT not converted`,
+        'Add the external IP to the SRX destination NAT rule manually'));
+      continue;
+    }
     const mappedIp = getString(entry['mappedip']);
     const mappedIpArr = ensureArray(entry['mappedip']);
     const portForward = getString(entry['portforward']) === 'enable';
@@ -1998,18 +2017,95 @@ function parseNatRules(tree, warnings) {
       // flag a VIP that the zone-scoped SRX rule-set matches more widely.
       ingress_interface: extIntf && extIntf !== 'any' ? extIntf : null,
       src_addresses: ['any'],
-      dst_addresses: [extIp || name],
+      dst_addresses: [extIp],
       translated_src: null,
       translated_dst: mappedIpArr[0] || mappedIp || '',
       translated_port: portForward ? mappedPort : null,
       match_port: portForward ? extPort : null,
-      match_protocol: vipProtocol || null,
+      // FortiOS applies protocol only to port forwarding, and defaults it to tcp.
+      match_protocol: portForward ? (vipProtocol || 'tcp') : null,
       description: getString(entry['comment']) || getString(entry['comments']) || '',
       _rule_index: ruleIndex++,
     });
   }
 
   return natRules;
+}
+
+
+/**
+ * A FortiGate policy may name a VIP (or VIP group) as its dstaddr. SRX matches
+ * policy after destination NAT, so the VIP stands for its mapped address.
+ * Adds an address object per referenced VIP, plus an address group per
+ * referenced vipgrp. Never overwrites an existing object or group.
+ */
+function synthesizeVipAddresses(tree, securityPolicies, addressObjects, addressGroups) {
+  const vipSection = tree['firewall vip'] || {};
+  const vipGroupSection = tree['firewall vipgrp'] || {};
+  const knownNames = new Set([...addressObjects, ...addressGroups].map(entry => entry.name));
+
+  // The generated DNAT rule models only a plain static-nat VIP: one static
+  // extip, one mapped address, optional tcp/udp port forward. Leave any other
+  // VIP unresolved so its policy stays deactivated instead of permitting
+  // traffic the conversion does not translate as the FortiGate would.
+  const unmodeledVipFields = ['src-filter', 'srcintf-filter', 'service'];
+  const mappedAddressOf = (vipName) => {
+    const vipEntry = vipSection[vipName];
+    if (typeof vipEntry !== 'object') return null;
+    if ((getString(vipEntry['type']) || 'static-nat') !== 'static-nat') return null;
+    if (unmodeledVipFields.some((field) => vipEntry[field])) return null;
+    if (getString(vipEntry['portforward']) === 'enable') {
+      const protocol = getString(vipEntry['protocol']) || 'tcp';
+      if (protocol !== 'tcp' && protocol !== 'udp') return null;
+      // The DNAT rule maps one port to one port; range and m-to-n forwarding are not modeled.
+      const extPort = getString(vipEntry['extport']) || '';
+      const mappedPort = getString(vipEntry['mappedport']) || extPort;
+      if (extPort.includes('-') || mappedPort.includes('-') || getString(vipEntry['portmapping-type']) === 'm-to-n') return null;
+      // SRX matches policy after DNAT, so a translated port no longer matches the policy's service.
+      if (mappedPort !== extPort) return null;
+    }
+    const extIp = getString(vipEntry['extip']) || '';
+    const mappedIps = ensureArray(vipEntry['mappedip']);
+    const mappedIp = mappedIps.length === 1 ? mappedIps[0] : '';
+    if (!extIp || extIp === '0.0.0.0' || !mappedIp || extIp.includes('-') || mappedIp.includes('-')) return null;
+    return mappedIp.includes('/') ? mappedIp : `${mappedIp}/32`;
+  };
+
+  const addVipAddress = (vipName, value) => {
+    if (knownNames.has(vipName)) return;
+    knownNames.add(vipName);
+    addressObjects.push({
+      name: vipName,
+      type: value.endsWith('/32') ? 'host' : 'subnet',
+      value,
+      description: `VIP ${vipName} mapped (post-DNAT) address`,
+      tags: [],
+      ip_version: detectIpVersion(value),
+    });
+  };
+
+  const referencedNames = new Set(securityPolicies.flatMap(policy => policy.dst_addresses));
+  for (const referencedName of referencedNames) {
+    if (knownNames.has(referencedName)) continue;
+    const groupEntry = vipGroupSection[referencedName];
+    if (typeof groupEntry !== 'object') {
+      const value = mappedAddressOf(referencedName);
+      if (value) addVipAddress(referencedName, value);
+      continue;
+    }
+    const members = ensureArray(groupEntry['member']);
+    const memberValues = members.map(mappedAddressOf);
+    // One unconvertible member would leave the address-set naming a missing address.
+    if (members.length === 0 || memberValues.some(value => !value)) continue;
+    members.forEach((member, index) => addVipAddress(member, memberValues[index]));
+    knownNames.add(referencedName);
+    addressGroups.push({
+      name: referencedName,
+      members,
+      description: getString(groupEntry['comment']) || getString(groupEntry['comments']) || '',
+      tags: [],
+    });
+  }
 }
 
 

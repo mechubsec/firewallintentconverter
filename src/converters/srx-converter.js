@@ -37,7 +37,7 @@ import {
 } from '../security/junos-identifiers.js';
 import { canonicalizeJunosSecurityFeatures } from '../security/junos-identifier-catalog.js';
 import { validateSetOutput } from '../security/junos-output-validation.js';
-import { findPolicyReferenceIssues } from '../security/policy-reference-integrity.js';
+import { findPolicyReferenceIssues, findNegationIssues } from '../security/policy-reference-integrity.js';
 
 /**
  * Returns the correct ANY address for NAT rules based on whether the rule
@@ -1753,6 +1753,7 @@ function emitPolicyBody(commands, policyPath, policyName, ctx) {
       : identifiers.nameForReference(identifierPath(`security_policies[${pIdx}].src_addresses[${addressIndex}]`));
     commands.push(`set ${policyPath} match source-address ${addressName}`);
   }
+  if (policy.negate_source) commands.push(`set ${policyPath} match source-address-excluded`);
 
   const effectiveDstAddrs = dstAddrs.length > 0 ? dstAddrs : [{ value: 'any', index: null }];
   for (const { index: addressIndex } of effectiveDstAddrs) {
@@ -1761,6 +1762,7 @@ function emitPolicyBody(commands, policyPath, policyName, ctx) {
       : identifiers.nameForReference(identifierPath(`security_policies[${pIdx}].dst_addresses[${addressIndex}]`));
     commands.push(`set ${policyPath} match destination-address ${addressName}`);
   }
+  if (policy.negate_destination) commands.push(`set ${policyPath} match destination-address-excluded`);
 
   let apps = resolveApplications(policy.applications, policy.services, warnings, policyName, appGroups, sourceVendor, pIdx, identifiers, identifierPath);
   if (apps.includes('any')) apps = ['any'];
@@ -1819,7 +1821,18 @@ function emitPolicyBody(commands, policyPath, policyName, ctx) {
   // Check for undefined references (addresses or services)
   const hasUndefinedRef = policyReferenceIssues && policyReferenceIssues.has(pIdx);
 
-  if (policy.disabled || hasUnmappedApp || hasUndefinedRef) {
+  const negationIssues = findNegationIssues(policy);
+
+  if (policy.disabled || hasUnmappedApp || hasUndefinedRef || negationIssues.length > 0) {
+    if (negationIssues.length > 0) {
+      deactivateCaveats.push(`# CAVEAT: policy deactivated — negated address match not representable: ${negationIssues.join('; ')}`);
+      warnings.push(createWarning(
+        'warning',
+        `security_policies[${pIdx}]`,
+        `Policy ${policy.name || pIdx} deactivated: ${negationIssues.join('; ')}`,
+        'Rewrite the negated address match by hand before enabling this policy.',
+      ));
+    }
     if (hasUndefinedRef) {
       // Emit caveat comment naming the undefined reference(s)
       const issue = policyReferenceIssues.get(pIdx);
@@ -2019,11 +2032,17 @@ function convertSecurityPolicies(policies, commands, warnings, summary, profileM
     if (policies[i].disabled) disabledIndices.add(i);
   }
 
+  const negationIndices = new Set();
+  policies.forEach((policy, index) => {
+    if (!policy._implicit && findNegationIssues(policy).length > 0) negationIndices.add(index);
+  });
+
   // Compute inactive union: a policy in multiple categories counts once
   const inactiveUnion = new Set([
     ...disabledIndices,
     ...undefinedRefIndices,
     ...unmappedAppPolicyIndices,
+    ...negationIndices,
   ]);
 
   const activeCount = summary.total_source_policies - inactiveUnion.size;
@@ -2042,6 +2061,7 @@ function convertSecurityPolicies(policies, commands, warnings, summary, profileM
     commands.push(`#   inactive (disabled in source): ${disabledIndices.size}`);
     commands.push(`#   inactive (unmapped application): ${unmappedAppPolicyIndices.size}`);
     commands.push(`#   inactive (undefined reference): ${undefinedRefIndices.size}`);
+    commands.push(`#   inactive (negated address not representable): ${negationIndices.size}`);
 
     // Emit detail lines for undefined references if any
     if (policyReferenceIssues.size > 0) {
