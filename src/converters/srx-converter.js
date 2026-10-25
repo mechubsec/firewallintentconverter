@@ -18,7 +18,7 @@
  * (clean / warning / unsupported) for the warnings panel.
  */
 
-import { sanitizeJunosName, mapAppToJunos, mapProfileToSrx, createWarning, isPredefEquivalent, planIngressScopeAdvice, JUNOS_PREDEFINED_APPS } from '../parsers/parser-utils.js';
+import { sanitizeJunosName, mapAppToJunos, mapProfileToSrx, createWarning, isPredefEquivalent, JUNOS_PREDEFINED_APPS } from '../parsers/parser-utils.js';
 import { getJunosEmission } from '../utils/app-mappings.js';
 import {
   setAddressOrPrefix,
@@ -31,6 +31,7 @@ import {
 import { validateJunosInput } from '../security/junos-input-validation.js';
 import { versionStamp } from '../version.js';
 import { encodeJunosZonePair } from '../security/junos-identifier-identity.js';
+import { planNat } from './nat-plan.js';
 import {
   planJunosIdentifiers,
   planMergedJunosIdentifiers,
@@ -38,21 +39,6 @@ import {
 import { canonicalizeJunosSecurityFeatures } from '../security/junos-identifier-catalog.js';
 import { validateSetOutput } from '../security/junos-output-validation.js';
 import { findPolicyReferenceIssues, findNegationIssues } from '../security/policy-reference-integrity.js';
-
-/**
- * Returns the correct ANY address for NAT rules based on whether the rule
- * contains IPv6 addresses. Uses '::/0' for IPv6, '0.0.0.0/0' for IPv4.
- */
-function natAnyAddress(rule) {
-  const allAddrs = [
-    ...(rule.src_addresses || []),
-    ...(rule.dst_addresses || []),
-    ...(rule.translated_src?.addresses || []),
-    ...(rule.translated_src?.address ? [rule.translated_src.address] : []),
-    ...(rule.translated_dst?.address ? [rule.translated_dst.address] : []),
-  ];
-  return allAddrs.some(a => a && typeof a === 'string' && a.includes(':')) ? '::/0' : '0.0.0.0/0';
-}
 
 function serializeSetComments(commands) {
   for (let index = 0; index < commands.length; index += 1) {
@@ -2317,39 +2303,8 @@ function mapAction(panosAction) {
 // ---------------------------------------------------------------------------
 
 /**
- * Resolves a NAT match address to a raw IP/subnet. Junos NAT match commands
- * require literal IPs, not address-book object names.
- * @param {string} addr - Address string (IP, subnet, or object name)
- * @param {Object} addrLookup - Map of address-object names to IP values
- * @param {string[]} warnings - Collector for warning messages
- * @returns {string|null} Resolved IP/subnet, or null if unresolvable
+ * Emits NAT as set commands, rendering the plan shared with the XML builder.
  */
-function resolveNatAddress(addr, addrLookup, warnings) {
-  if (!addr || addr === 'any') return null;
-  // Already an IP or subnet (contains a dot and looks numeric)
-  // njsscan regex_dos: false positive. Adjacent tokens are disjoint (\d excludes the literal dot and slash), so neither pattern backtracks.
-  if (/^\d+\.\d+\.\d+\.\d+(\/\d+)?$/.test(addr) || /^[0-9a-fA-F:]+\/\d+$/.test(addr)) {  // njsscan-ignore: regex_dos
-    return addr;
-  }
-  const resolved = addrLookup[addr];
-  if (!resolved) {
-    warnings.push(createWarning('nat', `NAT match address "${addr}" is not a known address object — skipped`));
-    return null;
-  }
-  // Skip FQDN / dns-name values (not usable in NAT match)
-  if (!/^\d+\.\d+\.\d+\.\d+/.test(resolved) && !/^[0-9a-fA-F:]+/.test(resolved)) {
-    warnings.push(createWarning('nat', `NAT match address "${addr}" resolves to FQDN "${resolved}" — skipped (Junos NAT requires IP)`));
-    return null;
-  }
-  return resolved;
-}
-
-function effectiveNatTypes(rule) {
-  return rule.type === 'source-and-destination'
-    ? ['source', 'destination']
-    : [rule.type || 'source'];
-}
-
 function convertNatRules(
   natRules,
   commands,
@@ -2363,508 +2318,100 @@ function convertNatRules(
   interfaces,
   interfaceMappings,
 ) {
-  if (!natRules || natRules.length === 0) return;
+  const plan = planNat({
+    natRules,
+    addressObjects,
+    addressGroups,
+    zones: configuredZones,
+    interfaces,
+    mapInterface: name => mapInterfaceName(name, interfaceMappings),
+    naming: {
+      reference: path => identifiers.nameForReference(identifierPath(path)),
+      definition: path => identifiers.nameForDefinition(identifierPath(path)),
+      generated: (path, role) => identifiers.nameForGenerated(identifierPath(path), role),
+    },
+  });
+  if (!plan) return;
+  warnings.push(...plan.warnings);
 
-  // Build lookup map: address-object name → IP/subnet value
-  const addrLookup = {};
-  const rawAddressNames = new Map();
-  for (let objectIndex = 0; objectIndex < (addressObjects || []).length; objectIndex += 1) {
-    const obj = addressObjects[objectIndex];
-    const plannedName = identifiers.nameForDefinition(identifierPath(`address_objects[${objectIndex}].name`));
-    rawAddressNames.set(obj.name, plannedName);
-    if (obj.value) addrLookup[plannedName] = obj.value;
-    else if (obj.ip) addrLookup[plannedName] = obj.ip;
-    else if (obj.network) addrLookup[plannedName] = obj.network;
-    else if (obj.subnet) addrLookup[plannedName] = obj.subnet;
-    else if (obj.address) addrLookup[plannedName] = obj.address;
-  }
-
-  // Build set of address-group names for NAT match name-refs
-  const groupNames = new Set((addressGroups || []).map(g => g.name));
-
-  // Helper: Extract provider interface's host IP as a /32 or /128 for provider source NAT pools
-  const providerInterfaceIp = (panIfaceName) => {
-    if (!panIfaceName) return null;
-    const iface = (interfaces || []).find(i => i.name === panIfaceName && (i.ip || i.ipv6));
-    const raw = iface ? (iface.ip || iface.ipv6) : '';
-    if (!raw) return null;
-    const host = String(raw).split('/')[0];
-    if (/^\d+\.\d+\.\d+\.\d+$/.test(host)) return `${host}/32`;
-    if (host.includes(':')) return `${host}/128`;
-    return null;
-  };
-
-  const natRuleIndex = new Map(natRules.map((rule, index) => [rule, index]));
-  const sourceZonesFor = natSourceZones;
-  const destinationZonesFor = natDestinationZones;
-  const typesFor = effectiveNatTypes;
-  const zoneReference = (ruleIndex, rule, direction, zone) => {
-    const field = direction === 'source'
-      ? natSourceZoneField(rule) : natDestinationZoneField(rule);
-    const values = direction === 'source' ? sourceZonesFor(rule) : destinationZonesFor(rule);
-    const index = values.indexOf(zone);
-    const localPath = rule[field]?.length > 0
-      ? `nat_rules[${ruleIndex}].${field}[${index}]`
-      : `nat_rules[${ruleIndex}]#effective-${direction}-zone`;
-    return identifiers.nameForReference(identifierPath(localPath));
-  };
-  const ruleSetInfo = (type, fromZone, toZone) => {
-    const ownerIndex = natRules.findIndex(rule => (
-      typesFor(rule).includes(type)
-      && sourceZonesFor(rule).includes(fromZone)
-      && destinationZonesFor(rule).includes(toZone)
-    ));
-    const role = type === 'static'
-      ? 'static-nat-rule-set'
-      : `${type}-nat-rule-set:${encodeJunosZonePair(fromZone, toZone)}`;
-    return {
-      ownerIndex,
-      name: identifiers.nameForGenerated(identifierPath(`nat_rules[${ownerIndex}]`), role),
-    };
-  };
-  const ruleNameFor = (ruleIndex, rule, type, fromZone, toZone) => {
-    let occurrence = 0;
-    for (const candidateType of typesFor(rule)) {
-      const pairs = candidateType === 'static'
-        ? [['STATIC-NAT', '*']]
-        : sourceZonesFor(rule).flatMap(source => (
-          destinationZonesFor(rule).map(destination => [source, destination])
-        ));
-      for (const [candidateFrom, candidateTo] of pairs) {
-        occurrence += 1;
-        if (candidateType === type && candidateFrom === fromZone && candidateTo === toZone) {
-          const suffix = occurrence === 1
-            ? '' : `#${type}:${encodeJunosZonePair(fromZone, toZone)}`;
-          return identifiers.nameForDefinition(
-            identifierPath(`nat_rules[${ruleIndex}].name${suffix}`),
-          );
-        }
-      }
-    }
-    return identifiers.nameForDefinition(identifierPath(`nat_rules[${ruleIndex}].name`));
-  };
-  const matchAddress = (ruleIndex, field, addressIndex, rawAddress) => {
-    const plannedName = identifiers.nameForReference(
-      identifierPath(`nat_rules[${ruleIndex}].${field}[${addressIndex}]`),
-    );
-    const value = /^\d+\.\d+\.\d+\.\d+(\/\d+)?$/.test(rawAddress)
-      || /^[0-9a-fA-F:]+\/\d+$/.test(rawAddress)
-      ? rawAddress : plannedName;
-    return resolveNatAddress(value, addrLookup, warnings);
-  };
-  const translatedAddress = rawAddress => {
-    const plannedName = rawAddressNames.get(rawAddress);
-    return resolveNatAddress(plannedName || rawAddress, addrLookup, warnings);
-  };
-  // A "start-end" source pool range (FortiGate ippool) is Junos "A/32 to B/32".
-  // Source pools only: a match address takes a prefix, and a destination pool
-  // range would leave a range VIP's rule with nothing to match.
-  const sourcePoolAddress = rawAddress => {
-    // njsscan regex_dos: false positive. \d excludes the literal dot and hyphen, so no token backtracks.
-    const range = String(rawAddress || '').match(/^(\d+\.\d+\.\d+\.\d+)-(\d+\.\d+\.\d+\.\d+)$/);  // njsscan-ignore: regex_dos
-    return range ? `${range[1]}/32 to ${range[2]}/32` : translatedAddress(rawAddress);
-  };
+  const comment = text => commands.push(`# ${text}`);
+  const matchLines = (rulePath, field, entries) => entries.map(entry => (
+    `set ${rulePath} match ${field}${entry.kind === 'address-name' ? '-name' : ''} ${entry.value}`
+  ));
 
   commands.push('# =============================================');
   commands.push('# NAT Rules');
   commands.push('# =============================================');
+  for (const zoneName of plan.missingZones) {
+    commands.push(`set security zones security-zone ${zoneName}`);
+  }
 
-  const configuredZoneNames = new Set((configuredZones || []).map(zone => zone.name));
-  const missingZoneNames = new Set();
-  for (const rule of natRules) {
-    for (const zone of [...sourceZonesFor(rule), ...destinationZonesFor(rule)]) {
-      if (zone !== 'any' && !configuredZoneNames.has(zone)) missingZoneNames.add(zone);
+  for (const ruleSet of plan.source || []) {
+    if (ruleSet.skipped) {
+      ruleSet.comments.forEach(comment);
+      continue;
     }
-  }
-  const missingZoneOutputs = new Map([...missingZoneNames].sort().map(sourceName => [
-    sourceName,
-    identifiers.nameForGenerated(
-      identifierPath('nat_rules'),
-      natMissingZoneRole(sourceName),
-    ),
-  ]));
-
-  // Bug 8 fix: Ensure all zones referenced in NAT rules are defined.
-  // Collect already-defined zones from prior commands, then create any missing ones.
-  const definedZones = new Set();
-  for (const cmd of commands) {
-    const zoneMatch = cmd.match(/^set security zones security-zone (\S+)/);
-    if (zoneMatch) definedZones.add(zoneMatch[1]);
-  }
-  for (const zoneName of missingZoneOutputs.values()) {
-    if (!definedZones.has(zoneName)) {
-      commands.push(`set security zones security-zone ${zoneName}`);
-      definedZones.add(zoneName);
-    }
-  }
-  for (let ruleIndex = 0; ruleIndex < natRules.length; ruleIndex += 1) {
-    const rule = natRules[ruleIndex];
-    for (const [direction, zones] of [
-      ['source', sourceZonesFor(rule)],
-      ['destination', destinationZonesFor(rule)],
-    ]) {
-      for (const zone of zones) {
-        zoneReference(ruleIndex, rule, direction, zone);
-      }
-    }
-  }
-
-  // Group NAT rules by type for SRX rule-set organization
-  const sourceNatRules = natRules.filter(rule => effectiveNatTypes(rule).includes('source'));
-  const destNatRules = natRules.filter(rule => effectiveNatTypes(rule).includes('destination'));
-  const staticNatRules = natRules.filter(rule => effectiveNatTypes(rule).includes('static'));
-
-  // --- Source NAT ---
-  if (sourceNatRules.length > 0) {
-    // Group by zone pair for SRX rule-sets
-    const ruleSetGroups = groupByZonePair(sourceNatRules);
-
-    for (const { fromZone, toZone, rules } of ruleSetGroups) {
-      // Fix 5: NAT rule-sets cannot use 'any' as zone — replace with actual zones
-      const { name: ruleSetName } = ruleSetInfo('source', fromZone, toZone);
-      const ruleSetPath = `security nat source rule-set ${ruleSetName}`;
-      const zoneRule = rules[0];
-      const zoneRuleIndex = natRuleIndex.get(zoneRule);
-      if (fromZone === 'any' || toZone === 'any') {
-        const actualZones = [...definedZones].filter(z => z !== 'any');
-        if (actualZones.length === 0) {
-          commands.push(`# WARNING: NAT rule-set ${fromZone}-to-${toZone} skipped — no defined zones to replace 'any'`);
-          warnings.push(createWarning('warning', `nat/source/${fromZone}-to-${toZone}`,
-            `NAT rule-set from ${fromZone} to ${toZone} skipped — 'any' is not valid and no zones defined`,
-            'Define security zones before NAT rules'));
-          continue;
+    const ruleSetPath = `security nat source rule-set ${ruleSet.name}`;
+    for (const zone of ruleSet.fromZones) commands.push(`set ${ruleSetPath} from zone ${zone}`);
+    for (const zone of ruleSet.toZones) commands.push(`set ${ruleSetPath} to zone ${zone}`);
+    for (const rule of ruleSet.rules) {
+      rule.comments.forEach(comment);
+      if (rule.skipped) continue;
+      const rulePath = `${ruleSetPath} rule ${rule.name}`;
+      commands.push(...matchLines(rulePath, 'source-address', rule.match.source));
+      commands.push(...matchLines(rulePath, 'destination-address', rule.match.destination));
+      if (rule.match.protocol) commands.push(`set ${rulePath} match protocol ${rule.match.protocol}`);
+      if (rule.match.destinationPort) commands.push(`set ${rulePath} match destination-port ${rule.match.destinationPort}`);
+      rule.thenComments.forEach(comment);
+      if (rule.then.kind === 'pool') {
+        for (const address of rule.then.pool.addresses) {
+          commands.push(`set security nat source pool ${rule.then.pool.name} address ${address.prefix}${address.to ? ` to ${address.to}` : ''}`);
         }
-        const resolvedFromZones = fromZone === 'any'
-          ? actualZones : [zoneReference(zoneRuleIndex, zoneRule, 'source', fromZone)];
-        const resolvedToZones = toZone === 'any'
-          ? actualZones : [zoneReference(zoneRuleIndex, zoneRule, 'destination', toZone)];
-        for (const fz of resolvedFromZones) {
-          commands.push(`set ${ruleSetPath} from zone ${fz}`);
-        }
-        for (const tz of resolvedToZones) {
-          commands.push(`set ${ruleSetPath} to zone ${tz}`);
-        }
+        commands.push(`set ${rulePath} then source-nat pool ${rule.then.pool.name}`);
       } else {
-        commands.push(`set ${ruleSetPath} from zone ${zoneReference(zoneRuleIndex, zoneRule, 'source', fromZone)}`);
-        commands.push(`set ${ruleSetPath} to zone ${zoneReference(zoneRuleIndex, zoneRule, 'destination', toZone)}`);
+        commands.push(`set ${rulePath} then source-nat interface`);
       }
-
-      for (const rule of rules) {
-        // Single-lined so a hostile policy name cannot start a new command line.
-        if (rule.caveat) commands.push(`# CAVEAT: ${String(rule.caveat).replace(/[\r\n]+/g, ' ')}`);
-        const ruleIndex = natRuleIndex.get(rule);
-        const ruleName = ruleNameFor(ruleIndex, rule, 'source', fromZone, toZone);
-        const rulePath = `${ruleSetPath} rule ${ruleName}`;
-
-        // Match criteria
-        const anyAddr = natAnyAddress(rule);
-        const hasSourceAddresses = Array.isArray(rule.src_addresses);
-        const sourceAddresses = hasSourceAddresses ? rule.src_addresses : [anyAddr];
-        for (let addressIndex = 0; addressIndex < sourceAddresses.length; addressIndex += 1) {
-          const addr = sourceAddresses[addressIndex];
-          if (addr === 'any') {
-            if (hasSourceAddresses) {
-              identifiers.nameForReference(
-                identifierPath(`nat_rules[${ruleIndex}].src_addresses[${addressIndex}]`),
-              );
-            }
-            commands.push(`set ${rulePath} match source-address ${anyAddr}`);
-          } else {
-            // Check if addr is a literal IP/prefix
-            const isLiteral = /^\d+\.\d+\.\d+\.\d+(\/\d+)?$/.test(addr) || /^[0-9a-fA-F:]+\/\d+$/.test(addr);
-            if (isLiteral) {
-              commands.push(`set ${rulePath} match source-address ${addr}`);
-            } else if (groupNames.has(addr)) {
-              // Address group → emit name-ref
-              const groupNameRef = identifiers.nameForReference(
-                identifierPath(`nat_rules[${ruleIndex}].src_addresses[${addressIndex}]`),
-              );
-              commands.push(`set ${rulePath} match source-address-name ${groupNameRef}`);
-            } else {
-              // Address object or unknown → resolve to IP
-              const resolved = hasSourceAddresses
-                ? matchAddress(ruleIndex, 'src_addresses', addressIndex, addr)
-                : addr;
-              if (resolved) {
-                commands.push(`set ${rulePath} match source-address ${resolved}`);
-              }
-            }
-          }
-        }
-        const hasDestinationAddresses = Array.isArray(rule.dst_addresses);
-        const destinationAddresses = hasDestinationAddresses ? rule.dst_addresses : [anyAddr];
-        for (let addressIndex = 0; addressIndex < destinationAddresses.length; addressIndex += 1) {
-          const addr = destinationAddresses[addressIndex];
-          if (addr === 'any') {
-            if (hasDestinationAddresses) {
-              identifiers.nameForReference(
-                identifierPath(`nat_rules[${ruleIndex}].dst_addresses[${addressIndex}]`),
-              );
-            }
-            commands.push(`set ${rulePath} match destination-address ${anyAddr}`);
-          } else {
-            // Check if addr is a literal IP/prefix
-            const isLiteral = /^\d+\.\d+\.\d+\.\d+(\/\d+)?$/.test(addr) || /^[0-9a-fA-F:]+\/\d+$/.test(addr);
-            if (isLiteral) {
-              commands.push(`set ${rulePath} match destination-address ${addr}`);
-            } else if (groupNames.has(addr)) {
-              // Address group → emit name-ref
-              const groupNameRef = identifiers.nameForReference(
-                identifierPath(`nat_rules[${ruleIndex}].dst_addresses[${addressIndex}]`),
-              );
-              commands.push(`set ${rulePath} match destination-address-name ${groupNameRef}`);
-            } else {
-              // Address object or unknown → resolve to IP
-              const resolved = hasDestinationAddresses
-                ? matchAddress(ruleIndex, 'dst_addresses', addressIndex, addr)
-                : addr;
-              if (resolved) {
-                commands.push(`set ${rulePath} match destination-address ${resolved}`);
-              }
-            }
-          }
-        }
-
-        // Protocol and port matching (from service)
-        if (rule.match_protocol) {
-          const proto = String(rule.match_protocol).toLowerCase();
-          if (proto === 'tcp' || proto === 'udp') {
-            commands.push(`set ${rulePath} match protocol ${proto}`);
-          }
-        }
-        if (rule.match_port) {
-          commands.push(`set ${rulePath} match destination-port ${rule.match_port}`);
-        }
-
-        // Translation action
-        if (rule.translated_src) {
-          if (rule.translated_src.type === 'interface') {
-            const panIf = rule.translated_src.interface || '';
-            const providerIp = providerInterfaceIp(panIf);
-            if (providerIp) {
-              const srxIf = mapInterfaceName(panIf, interfaceMappings);
-              const providerPool = identifiers.nameForGenerated(identifierPath(`nat_rules[${ruleIndex}]`), 'provider-source-nat-pool');
-              commands.push(`# NAT: source translated to provider interface ${srxIf} (${providerIp})`);
-              commands.push(`set security nat source pool ${providerPool} address ${providerIp}`);
-              commands.push(`set ${rulePath} then source-nat pool ${providerPool}`);
-            } else {
-              if (panIf) {
-                const srxIf = mapInterfaceName(panIf, interfaceMappings);
-                commands.push(`# NAT: source translated to interface ${srxIf} — no static IP found; using egress interface NAT (verify routing sends this traffic out ${srxIf})`);
-              }
-              commands.push(`set ${rulePath} then source-nat interface`);
-            }
-          } else if (rule.translated_src.type === 'dynamic-ip-pool') {
-            // Create a source NAT pool
-            const poolName = identifiers.nameForGenerated(
-              identifierPath(`nat_rules[${ruleIndex}]`),
-              'source-nat-pool',
-            );
-            let allResolved = true;
-            const poolCmds = [];
-            for (const addr of rule.translated_src.addresses) {
-              const resolvedPoolAddr = sourcePoolAddress(addr);
-              if (resolvedPoolAddr) {
-                poolCmds.push(`set security nat source pool ${poolName} address ${resolvedPoolAddr}`);
-              } else {
-                allResolved = false;
-              }
-            }
-            if (allResolved && poolCmds.length > 0) {
-              commands.push(...poolCmds);
-              commands.push(`set ${rulePath} then source-nat pool ${poolName}`);
-            } else {
-              // Can't resolve pool addresses (e.g., Check Point hide NAT using gateway name)
-              // Fall back to interface NAT
-              commands.push(`# NAT pool address could not be resolved — using interface NAT`);
-              commands.push(`set ${rulePath} then source-nat interface`);
-            }
-          } else if (rule.translated_src.type === 'static') {
-            const staticPoolName = identifiers.nameForGenerated(
-              identifierPath(`nat_rules[${ruleIndex}]`),
-              'static-source-nat-pool',
-            );
-            // NAT pool address must be an IP, not a named object — resolve it
-            const resolvedStaticAddr = translatedAddress(rule.translated_src.address);
-            if (resolvedStaticAddr) {
-              // Fix 3: Normalize bare IPs (both IPv4 and IPv6) with prefix
-              const withPrefix = (ip) => {
-                if (/^\d+\.\d+\.\d+\.\d+$/.test(ip)) return `${ip}/32`;
-                if (ip.includes(':') && !ip.includes('/')) return `${ip}/128`;
-                return ip;
-              };
-              const staticAddr = withPrefix(resolvedStaticAddr);
-              commands.push(`set security nat source pool ${staticPoolName} address ${staticAddr}`);
-              commands.push(`set ${rulePath} then source-nat pool ${staticPoolName}`);
-            } else {
-              commands.push(`# NAT: translated source "${rule.translated_src.address}" is not a resolvable IP/prefix — using interface NAT`);
-              warnings.push(createWarning('nat', `Source NAT translated address "${rule.translated_src.address}" could not be resolved to an IP/prefix — fell back to interface NAT`));
-              commands.push(`set ${rulePath} then source-nat interface`);
-            }
-          } else {
-            // Unknown translation type — default to interface NAT (e.g., Check Point hide NAT)
-            commands.push(`set ${rulePath} then source-nat interface`);
-          }
-        } else {
-          // No translated_src specified — default to interface NAT (hide/masquerade)
-          commands.push(`set ${rulePath} then source-nat interface`);
-        }
-
-        // U-turn/hairpin NAT: add persistent-nat for return traffic
-        if (rule._uturn) {
-          commands.push(`set ${rulePath} then persistent-nat permit target-host`);
-        }
-
-        summary.nat_rules_converted++;
-      }
-    }
-  }
-
-  // --- Destination NAT ---
-  if (destNatRules.length > 0) {
-    const ruleSetGroups = groupByZonePair(destNatRules);
-
-    for (const { fromZone, toZone, rules } of ruleSetGroups) {
-      const { name: ruleSetName } = ruleSetInfo('destination', fromZone, toZone);
-      const ruleSetPath = `security nat destination rule-set ${ruleSetName}`;
-      const zoneRule = rules[0];
-      const zoneRuleIndex = natRuleIndex.get(zoneRule);
-
-      // Fix 5: NAT rule-sets cannot use 'any' as zone — replace with actual zones
-      if (fromZone === 'any') {
-        const actualZones = [...definedZones].filter(z => z !== 'any');
-        if (actualZones.length === 0) {
-          commands.push(`# WARNING: Destination NAT rule-set ${fromZone}-to-${toZone} skipped — no defined zones`);
-          warnings.push(createWarning('warning', `nat/destination/${fromZone}-to-${toZone}`,
-            `Destination NAT rule-set from ${fromZone} skipped — 'any' is not valid and no zones defined`,
-            'Define security zones before NAT rules'));
-          continue;
-        }
-        for (const fz of actualZones) {
-          commands.push(`set ${ruleSetPath} from zone ${fz}`);
-        }
-      } else {
-        commands.push(`set ${ruleSetPath} from zone ${zoneReference(zoneRuleIndex, zoneRule, 'source', fromZone)}`);
-      }
-
-      // Names are single-lined so a hostile value cannot start a new command line.
-      const oneLine = (value) => String(value).replace(/[\r\n]+/g, ' ');
-      for (const advice of planIngressScopeAdvice(rules, configuredZones, (name) => mapInterfaceName(name, interfaceMappings))) {
-        commands.push(`# CAVEAT: ${oneLine(advice.caveat)}`);
-        const adviceTarget = advice.grouped
-          ? ruleSetName
-          : ruleNameFor(natRuleIndex.get(advice.rules[0]), advice.rules[0], 'destination', fromZone, toZone);
-        warnings.push(createWarning('warning', `nat/destination/${adviceTarget}`, advice.message, advice.suggestion));
-      }
-
-      for (const rule of rules) {
-        const ruleIndex = natRuleIndex.get(rule);
-        const ruleName = ruleNameFor(ruleIndex, rule, 'destination', fromZone, toZone);
-        const rulePath = `${ruleSetPath} rule ${ruleName}`;
-
-        // Fix 1: Pre-validate translated destination address BEFORE emitting any match lines
-        let resolvedDstAddr = null;
-        if (rule.translated_dst) {
-          const rawDst = typeof rule.translated_dst === 'string' ? rule.translated_dst : rule.translated_dst.address || '';
-          if (rawDst) {
-            resolvedDstAddr = translatedAddress(rawDst);
-            if (!resolvedDstAddr) {
-              commands.push(`# NAT: destination rule "${ruleName}" skipped — translated destination "${rawDst}" is not a resolvable IP/prefix`);
-              warnings.push(createWarning('nat', `Destination NAT rule "${ruleName}" skipped — translated address "${rawDst}" could not be resolved to an IP/prefix`));
-              continue; // skip the whole rule: no match, no then
-            }
-          }
-        }
-
-        // Match
-        const dnatAny = natAnyAddress(rule);
-        const hasDestinationAddresses = Array.isArray(rule.dst_addresses);
-        const destinationAddresses = hasDestinationAddresses ? rule.dst_addresses : [dnatAny];
-        for (let addressIndex = 0; addressIndex < destinationAddresses.length; addressIndex += 1) {
-          const addr = destinationAddresses[addressIndex];
-          if (addr === 'any') {
-            if (hasDestinationAddresses) {
-              identifiers.nameForReference(
-                identifierPath(`nat_rules[${ruleIndex}].dst_addresses[${addressIndex}]`),
-              );
-            }
-            commands.push(`set ${rulePath} match destination-address ${dnatAny}`);
-          } else {
-            const resolved = hasDestinationAddresses
-              ? matchAddress(ruleIndex, 'dst_addresses', addressIndex, addr)
-              : addr;
-            if (resolved) {
-              commands.push(`set ${rulePath} match destination-address ${resolved}`);
-            }
-          }
-        }
-        // Port-forward matching (FortiGate VIP extport)
-        if (rule.match_port) {
-          commands.push(`set ${rulePath} match destination-port ${rule.match_port}`);
-        }
-        if (rule.match_protocol) {
-          const proto = rule.match_protocol.toLowerCase();
-          if (proto === 'tcp' || proto === 'udp') {
-            commands.push(`set ${rulePath} match protocol ${proto}`);
-          }
-        }
-
-        // Translation — reuse resolvedDstAddr (already validated above)
-        if (resolvedDstAddr) {
-          // Fix 3: Normalize bare IPv6 addresses to /128
-          const withPrefix = (ip) => {
-            if (/^\d+\.\d+\.\d+\.\d+$/.test(ip)) return `${ip}/32`;
-            if (ip.includes(':') && !ip.includes('/')) return `${ip}/128`;
-            return ip;
-          };
-          const dstAddr = withPrefix(resolvedDstAddr);
-          const poolName = identifiers.nameForGenerated(
-            identifierPath(`nat_rules[${ruleIndex}]`),
-            'destination-nat-pool',
-          );
-          commands.push(`set security nat destination pool ${poolName} address ${dstAddr}`);
-          if (rule.translated_port) {
-            commands.push(`set security nat destination pool ${poolName} address port ${rule.translated_port}`);
-          }
-          commands.push(`set ${rulePath} then destination-nat pool ${poolName}`);
-        }
-
-        summary.nat_rules_converted++;
-      }
-    }
-  }
-
-  // --- Static NAT ---
-  if (staticNatRules.length > 0) {
-    commands.push('# Static NAT Rules');
-    for (const rule of staticNatRules) {
-      const ruleIndex = natRuleIndex.get(rule);
-      const ruleSetName = identifiers.nameForGenerated(
-        identifierPath(`nat_rules[${natRuleIndex.get(staticNatRules[0])}]`),
-        'static-nat-rule-set',
-      );
-      const ruleName = ruleNameFor(ruleIndex, rule, 'static', 'STATIC-NAT', '*');
-      const ruleSetPath = `security nat static rule-set ${ruleSetName} rule ${ruleName}`;
-
-      for (let addressIndex = 0; addressIndex < (rule.dst_addresses || []).length; addressIndex += 1) {
-        const addr = rule.dst_addresses[addressIndex];
-        if (addr !== 'any') {
-          const resolved = matchAddress(ruleIndex, 'dst_addresses', addressIndex, addr);
-          if (resolved) {
-            commands.push(`set ${ruleSetPath} match destination-address ${resolved}`);
-          }
-        } else {
-          identifiers.nameForReference(
-            identifierPath(`nat_rules[${ruleIndex}].dst_addresses[${addressIndex}]`),
-          );
-        }
-      }
-
-      if (rule.translated_src && rule.translated_src.address) {
-        commands.push(`set ${ruleSetPath} then static-nat prefix ${rule.translated_src.address}`);
-      }
-
+      if (rule.persistent) commands.push(`set ${rulePath} then persistent-nat permit target-host`);
       summary.nat_rules_converted++;
+    }
+  }
+
+  for (const ruleSet of plan.destination || []) {
+    if (ruleSet.skipped) {
+      ruleSet.comments.forEach(comment);
+      continue;
+    }
+    const ruleSetPath = `security nat destination rule-set ${ruleSet.name}`;
+    for (const zone of ruleSet.fromZones) commands.push(`set ${ruleSetPath} from zone ${zone}`);
+    ruleSet.comments.forEach(comment);
+    for (const rule of ruleSet.rules) {
+      rule.comments.forEach(comment);
+      if (rule.skipped) continue;
+      const rulePath = `${ruleSetPath} rule ${rule.name}`;
+      commands.push(...matchLines(rulePath, 'destination-address', rule.match.destination));
+      if (rule.match.destinationPort) commands.push(`set ${rulePath} match destination-port ${rule.match.destinationPort}`);
+      if (rule.match.protocol) commands.push(`set ${rulePath} match protocol ${rule.match.protocol}`);
+      if (rule.then) {
+        const { pool } = rule.then;
+        commands.push(`set security nat destination pool ${pool.name} address ${pool.prefix}`);
+        if (pool.port) commands.push(`set security nat destination pool ${pool.name} address port ${pool.port}`);
+        commands.push(`set ${rulePath} then destination-nat pool ${pool.name}`);
+      }
+      summary.nat_rules_converted++;
+    }
+  }
+
+  if (plan.static) {
+    commands.push('# Static NAT Rules');
+    for (const ruleSet of plan.static) {
+      for (const rule of ruleSet.rules) {
+        rule.comments.forEach(comment);
+        if (rule.skipped) continue;
+        const rulePath = `security nat static rule-set ${ruleSet.name} rule ${rule.name}`;
+        commands.push(...matchLines(rulePath, 'destination-address', rule.match.destination));
+        if (rule.then) commands.push(`set ${rulePath} then static-nat prefix ${rule.then.prefix}`);
+        summary.nat_rules_converted++;
+      }
     }
   }
 
@@ -5380,54 +4927,6 @@ function convertFlowMonitoringConfig(flowConfig, commands, warnings, summary, in
     'Verify flow-server addresses and template parameters after deployment'));
 }
 
-
-/**
- * Groups NAT rules by source-zone → destination-zone pair.
- * SRX organizes NAT rules into rule-sets per zone pair.
- */
-function natSourceZoneField(rule) {
-  return rule.src_zones !== undefined ? 'src_zones' : 'source_zones';
-}
-
-function natDestinationZoneField(rule) {
-  return rule.dst_zones !== undefined ? 'dst_zones' : 'destination_zones';
-}
-
-function natSourceZones(rule) {
-  const zones = rule.src_zones ?? rule.source_zones;
-  return Array.isArray(zones) && zones.length > 0 ? zones : ['any'];
-}
-
-function natDestinationZones(rule) {
-  const zones = rule.dst_zones ?? rule.destination_zones;
-  return Array.isArray(zones) && zones.length > 0 ? zones : ['any'];
-}
-
-function natMissingZoneRole(sourceName) {
-  return `nat-missing-zone:${sourceName}`;
-}
-
-function groupByZonePair(rules) {
-  const groups = [];
-  for (const rule of rules) {
-    const fromZones = natSourceZones(rule);
-    const toZones = natDestinationZones(rule);
-
-    for (const fromZone of fromZones) {
-      for (const toZone of toZones) {
-        let group = groups.find(item => (
-          item.fromZone === fromZone && item.toZone === toZone
-        ));
-        if (!group) {
-          group = { fromZone, toZone, rules: [] };
-          groups.push(group);
-        }
-        group.rules.push(rule);
-      }
-    }
-  }
-  return groups;
-}
 
 // ---------------------------------------------------------------------------
 // Multi-Firewall Merge Converter

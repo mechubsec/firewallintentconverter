@@ -1873,6 +1873,9 @@ function parseNatRules(tree, warnings) {
     return ranges.length > 0 ? { type: 'dynamic-ip-pool', addresses: ranges } : { type: 'interface' };
   };
 
+  // FortiGate's built-in "all" is any address.
+  const natAddresses = (value) => ensureArray(value).map((address) => (address === 'all' ? 'any' : address));
+
   // Central SNAT map
   const csnatSection = tree['firewall central-snat-map'] || {};
   for (const [id, entry] of entriesInConfigOrder(csnatSection)) {
@@ -1890,8 +1893,8 @@ function parseNatRules(tree, warnings) {
       type: 'source',
       src_zones: ensureArray(entry['srcintf']).map(zoneOf),
       dst_zones: ensureArray(entry['dstintf']).map(zoneOf),
-      src_addresses: ensureArray(entry['orig-addr']),
-      dst_addresses: ensureArray(entry['dst-addr']),
+      src_addresses: natAddresses(entry['orig-addr']),
+      dst_addresses: natAddresses(entry['dst-addr']),
       translated_src: poolTranslation(ensureArray(entry['nat-ippool'])),
       translated_dst: null,
       translated_port: getString(entry['nat-port']) || null,
@@ -1928,8 +1931,6 @@ function parseNatRules(tree, warnings) {
     || zones.some((zone) => otherZones.includes(zone));
   const sharesZonePair = (policy, other) => zonesOverlap(policy.srcZones, other.srcZones)
     && zonesOverlap(policy.dstZones, other.dstZones);
-  // FortiGate's built-in "all" is any address.
-  const natAddresses = (value) => ensureArray(value).map((address) => (address === 'all' ? 'any' : address));
   // Conflicts depend only on a policy's zones and translation, so scan once per distinct combination.
   // shortcut: still quadratic if nearly every policy has its own zone set; upgrade to per-zone-pair counts if that shows up.
   const conflictCache = new Map();
