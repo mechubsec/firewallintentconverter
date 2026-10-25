@@ -824,12 +824,13 @@ function buildNatPolicyRule(ruleName, lines, ruleIndex, warnings) {
   const dstZones = [];
   const srcAddrs = [];
   const dstAddrs = [];
-  let natType = 'source';
   let translatedSrc = null;
   let description = '';
+  const unparsedClauses = [];
 
   for (const line of lines) {
     const trimmed = line.trim();
+    if (!trimmed) continue;
 
     const srcZoneMatch = trimmed.match(/^source-zone\s+(\S+)/i);
     if (srcZoneMatch) { srcZones.push(srcZoneMatch[1]); continue; }
@@ -845,29 +846,46 @@ function buildNatPolicyRule(ruleName, lines, ruleIndex, warnings) {
     if (dstAddrSet) { dstAddrs.push(dstAddrSet[1]); continue; }
     if (/^destination-address\s+any$/i.test(trimmed)) continue;
 
+    // <ip> mask <mask|length> or <ip> <length>; a bare dotted value after the IP is a wildcard, left unparsed.
+    const inlineAddr = trimmed.match(/^(source|destination)-address\s+(\d+\.\d+\.\d+\.\d+)\s+(?:mask\s+(\S+)|(\d+))$/i);
+    if (inlineAddr) {
+      const prefix = `${inlineAddr[2]}/${huaweiMaskToCidr(inlineAddr[3] || inlineAddr[4])}`;
+      (inlineAddr[1].toLowerCase() === 'source' ? srcAddrs : dstAddrs).push(prefix);
+      continue;
+    }
+
     // action source-nat address-group <name>
     const snatPoolMatch = trimmed.match(/^action\s+source-nat\s+address-group\s+(\S+)/i);
     if (snatPoolMatch) {
-      natType = 'source';
       translatedSrc = { type: 'dynamic-ip-pool', addresses: [snatPoolMatch[1]] };
       continue;
     }
 
     // action source-nat easy-ip
     if (/^action\s+source-nat\s+easy-ip$/i.test(trimmed)) {
-      natType = 'source';
       translatedSrc = { type: 'interface', addresses: [] };
       continue;
     }
 
     // action no-nat
     if (/^action\s+no-nat$/i.test(trimmed)) {
-      natType = 'none';
+      translatedSrc = { type: 'no-nat' };
       continue;
     }
 
     const descMatch = trimmed.match(/^description\s+(.+)/i);
     if (descMatch) { description = descMatch[1].trim(); continue; }
+    if (/^service\s+any$/i.test(trimmed)) continue;
+
+    unparsedClauses.push(trimmed);
+  }
+
+  // An exemption with a clause we can't read would widen to the whole zone pair; drop it instead.
+  if (translatedSrc?.type === 'no-nat' && unparsedClauses.length > 0) {
+    warnings.push(createWarning('warning', `nat/source/${ruleName}`,
+      `NAT rule "${ruleName}" (action no-nat) skipped — unsupported match clause: ${unparsedClauses.join('; ')}`,
+      'Build this NAT exemption manually, ahead of the source NAT rule it exempts traffic from'));
+    return null;
   }
 
   if (srcAddrs.length === 0) srcAddrs.push('any');
@@ -875,7 +893,7 @@ function buildNatPolicyRule(ruleName, lines, ruleIndex, warnings) {
 
   return {
     name: ruleName,
-    type: natType === 'none' ? 'none' : 'source',
+    type: 'source',
     src_zones: srcZones.length > 0 ? srcZones : ['any'],
     dst_zones: dstZones.length > 0 ? dstZones : ['any'],
     src_addresses: srcAddrs,
