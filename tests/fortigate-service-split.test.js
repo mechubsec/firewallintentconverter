@@ -65,6 +65,33 @@ describe('FortiGate multi-protocol custom services', () => {
     expect(commands.join('\n')).toContain('inactive (undefined reference): 0');
   });
 
+  it('keeps every port range of a multi-range service', () => {
+    const { config, commands } = convert(
+      '    edit "WEB"\n        set tcp-portrange 80 443\n        set udp-portrange 53\n    next', 'WEB');
+
+    expect(config.service_objects.map((service) => [service.name, service.protocol, service.port_range]))
+      .toEqual([['WEB_tcp_1', 'tcp', '80'], ['WEB_tcp_2', 'tcp', '443'], ['WEB_udp', 'udp', '53']]);
+    expect(config.service_groups.find((group) => group.name === 'WEB').members).toEqual(['WEB_tcp_1', 'WEB_tcp_2', 'WEB_udp']);
+    expect(commands).toContain('set applications application-set WEB application junos-http');
+    expect(commands).toContain('set applications application-set WEB application junos-https');
+  });
+
+  it('resolves a single-protocol service with several ranges to an application-set', () => {
+    const { config } = convert('    edit "WEB"\n        set tcp-portrange 80 443\n    next', 'WEB');
+    expect(config.service_groups.find((group) => group.name === 'WEB').members).toEqual(['WEB_tcp_1', 'WEB_tcp_2']);
+  });
+
+  it('does not reuse the name of a service the config already defines', () => {
+    const { config } = convert(
+      '    edit "DNS"\n        set tcp-portrange 53\n        set udp-portrange 53\n    next\n'
+      + '    edit "DNS_tcp"\n        set tcp-portrange 1053\n    next', 'DNS');
+    const dnsMembers = config.service_groups.find((group) => group.name === 'DNS').members;
+
+    expect(dnsMembers).toEqual(['DNS_tcp_2', 'DNS_udp']);
+    expect(config.service_objects.find((service) => service.name === 'DNS_tcp_2').port_range).toBe('53');
+    expect(config.service_objects.find((service) => service.name === 'DNS_tcp').port_range).toBe('1053');
+  });
+
   it('leaves single-protocol services unchanged', () => {
     const { config } = convert('    edit "WEB"\n        set tcp-portrange 80\n    next', 'WEB');
     expect(config.service_objects.map((service) => service.name)).toEqual(['WEB']);

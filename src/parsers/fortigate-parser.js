@@ -1629,6 +1629,14 @@ function parseAddressGroups(tree, warnings) {
 function parseServiceObjects(tree, warnings, splitGroups = []) {
   const svcSection = tree['firewall service custom'] || {};
   const services = [];
+  // Generated split names must not shadow a service or group the config already defines.
+  const takenNames = new Set([...Object.keys(svcSection), ...Object.keys(tree['firewall service group'] || {})]);
+  const uniqueName = (baseName) => {
+    let candidate = baseName;
+    for (let suffix = 2; takenNames.has(candidate); suffix += 1) candidate = `${baseName}_${suffix}`;
+    takenNames.add(candidate);
+    return candidate;
+  };
 
   for (const [name, entry] of Object.entries(svcSection)) {
     if (typeof entry !== 'object') continue;
@@ -1655,29 +1663,38 @@ function parseServiceObjects(tree, warnings, splitGroups = []) {
       });
     } else {
       // TCP/UDP/SCTP
-      const tcpPorts = getString(entry['tcp-portrange']) || '';
-      const udpPorts = getString(entry['udp-portrange']) || '';
-      const sctpPorts = getString(entry['sctp-portrange']) || '';
-
-      const portsByProtocol = { tcp: tcpPorts, udp: udpPorts, sctp: sctpPorts };
-      const usedProtocols = Object.keys(portsByProtocol).filter((proto) => portsByProtocol[proto]);
-      const isSplit = usedProtocols.length > 1;
+      // "set tcp-portrange 80 443" lists several ranges; each becomes its own service.
+      const rangesByProtocol = {
+        tcp: ensureArray(entry['tcp-portrange']),
+        udp: ensureArray(entry['udp-portrange']),
+        sctp: ensureArray(entry['sctp-portrange']),
+      };
+      const portParts = Object.entries(rangesByProtocol)
+        .flatMap(([proto, ranges]) => ranges.map((range, index) => ({
+          proto,
+          range,
+          baseName: ranges.length > 1 ? `${name}_${proto}_${index + 1}` : `${name}_${proto}`,
+        })));
+      const isSplit = portParts.length > 1;
       const description = getString(entry['comment']) || '';
 
-      for (const proto of usedProtocols) {
+      const members = [];
+      for (const { proto, range, baseName } of portParts) {
+        const serviceName = isSplit ? uniqueName(baseName) : name;
+        members.push(serviceName);
         services.push({
-          name: isSplit ? `${name}_${proto}` : name,
+          name: serviceName,
           protocol: proto,
-          port_range: normalizePortRange(portsByProtocol[proto]),
+          port_range: normalizePortRange(range),
           source_port: '',
           description,
         });
       }
       if (isSplit) {
-        splitGroups.push({ name, members: usedProtocols.map((proto) => `${name}_${proto}`), description });
+        splitGroups.push({ name, members, description });
       }
       // If no ports specified, it's a protocol-level match
-      if (!tcpPorts && !udpPorts && !sctpPorts) {
+      if (portParts.length === 0) {
         services.push({
           name,
           protocol: 'tcp',
