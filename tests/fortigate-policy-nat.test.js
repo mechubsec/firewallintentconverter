@@ -111,6 +111,24 @@ end`);
     expect(commands.some((l) => l.includes('"guest-out-no-nat"') && l.startsWith('# CAVEAT:'))).toBe(true);
   });
 
+  it('flags every policy that shares a zone pair and translation', () => {
+    const twin = CONFIG.replace(/end$/, `    edit 4
+        set name "lan-out-twin"
+        set srcintf "port2"
+        set dstintf "port1"
+        set srcaddr "lan-net"
+        set dstaddr "all"
+        set action accept
+        set service "ALL"
+        set nat enable
+    next
+end`);
+    const lines = convertToSrxSetCommands(parseFortigateConfig(twin).intermediateConfig, {}, null, {}).commands;
+    for (const name of ['lan-out', 'lan-out-twin']) {
+      expect(lines.some((l) => l.startsWith(`# CAVEAT: source NAT for policy "${name}"`) && l.includes('"guest-out-no-nat"'))).toBe(true);
+    }
+  });
+
   it('adds no caveat when one policy NATs its zone pair', () => {
     const single = CONFIG.replace(/    edit 2\n[\s\S]*    next\n(?=end$)/, '');
     const singleLines = convertToSrxSetCommands(parseFortigateConfig(single).intermediateConfig, {}, null, {}).commands;
@@ -170,6 +188,13 @@ end`;
     const many = CONFIG.replace(/end$/, `${extraPolicies}end`);
     const lines = convertToSrxSetCommands(parseFortigateConfig(many).intermediateConfig, {}, null, {}).commands;
     expect(lines.some((l) => l.startsWith('# CAVEAT: source NAT for policy "lan-out"') && / and \d+ more in the same zone pair/.test(l))).toBe(true);
+  });
+
+  it('warns when a policy names an undefined ippool', () => {
+    const missingPool = CONFIG.replace('set poolname "pool-1"', 'set poolname "pool-missing"');
+    const { intermediateConfig, warnings } = parseFortigateConfig(missingPool);
+    expect(intermediateConfig.nat_rules.find((rule) => rule.name === 'dmz-out-pool').translated_src).toEqual({ type: 'interface' });
+    expect(warnings.filter((warning) => /IP pool "pool-missing" is not defined/.test(warning.message))).toHaveLength(1);
   });
 
   it('does not convert NAT on a negated address', () => {

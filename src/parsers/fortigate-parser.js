@@ -1834,6 +1834,13 @@ function parseNatRules(tree, warnings) {
   const warnedPools = new Set();
   const poolTranslation = (poolNames) => {
     const pools = poolNames.filter((poolName) => typeof ippoolSection[poolName] === 'object');
+    for (const poolName of poolNames) {
+      if (pools.includes(poolName) || warnedPools.has(poolName)) continue;
+      warnedPools.add(poolName);
+      warnings.push(createWarning('warning', `nat/ippool/${poolName}`,
+        `IP pool "${poolName}" is not defined — source NAT falls back to the egress interface address`,
+        'Define the pool or correct the pool name, then review the SRX source NAT translation'));
+    }
     // Only the default overload pool maps to a Junos PAT pool; make other modes loud.
     for (const poolName of pools) {
       const poolType = getString(ippoolSection[poolName]['type']) || 'overload';
@@ -1895,6 +1902,17 @@ function parseNatRules(tree, warnings) {
     && policy.dstZones.some((zone) => other.dstZones.includes(zone));
   // FortiGate's built-in "all" is any address.
   const natAddresses = (value) => ensureArray(value).map((address) => (address === 'all' ? 'any' : address));
+  // Conflicts depend only on a policy's zones and translation, so scan once per distinct combination.
+  // shortcut: still quadratic if nearly every policy has its own zone set; upgrade to per-zone-pair counts if that shows up.
+  const conflictCache = new Map();
+  const conflictsOf = (policy) => {
+    const cacheKey = JSON.stringify([policy.srcZones, policy.dstZones, policy.translationKey]);
+    if (!conflictCache.has(cacheKey)) {
+      conflictCache.set(cacheKey, acceptPolicies.filter((other) => other.translationKey !== policy.translationKey
+        && sharesZonePair(policy, other)));
+    }
+    return conflictCache.get(cacheKey);
+  };
   for (const policy of acceptPolicies) {
     if (!policy.translation) continue;
     // SRX source NAT cannot match a negated list; the plain list would NAT exactly the excluded traffic.
@@ -1907,8 +1925,7 @@ function parseNatRules(tree, warnings) {
     // shortcut: SRX source NAT matches neither policy order nor service, so a zone pair
     // whose policies translate differently is flagged, not converted; upgrade to ordered
     // per-policy rules with "source-nat off" and service matches.
-    const conflicting = acceptPolicies.filter((other) => other.translationKey !== policy.translationKey
-      && sharesZonePair(policy, other));
+    const conflicting = conflictsOf(policy);
     // Name a few conflicts, not all: a large mixed rulebase would repeat thousands per warning.
     const conflictNames = conflicting.slice(0, 3).map((other) => `"${other.name}"`).join(', ')
       + (conflicting.length > 3 ? ` and ${conflicting.length - 3} more` : '');
