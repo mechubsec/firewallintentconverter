@@ -308,7 +308,7 @@ export function parseFortigateConfig(configText) {
 function parseFortiPolicyRouting(tree, warnings) {
   const section = tree['router policy'] || {};
   const rules = [];
-  for (const [id, entry] of Object.entries(section)) {
+  for (const [id, entry] of entriesInConfigOrder(section)) {
     if (typeof entry !== 'object') continue;
     const inputDevice = getString(entry['input-device']) || '';
     const srcRaw = getString(entry.src) || '';
@@ -1097,6 +1097,14 @@ function parseScreenConfig(tree, warnings) {
 
 // ---------------------------------------------------------------------------
 
+// Per-section first-seen order of `edit` ids; object keys alone iterate integer ids numerically.
+const EDIT_ORDER = Symbol('editOrder');
+
+/** Returns a section's [id, entry] pairs in config order (FortiOS evaluates top-down, not by ID). */
+function entriesInConfigOrder(section) {
+  return (section[EDIT_ORDER] || Object.keys(section)).map((id) => [id, section[id]]);
+}
+
 /**
  * Parses FortiOS config text into a nested tree structure.
  *
@@ -1135,6 +1143,7 @@ function buildConfigTree(configText) {
       const entryId = unquote(rawId);
       if (!current[entryId]) {
         current[entryId] = {};
+        (current[EDIT_ORDER] ||= []).push(entryId);
       }
       stack.push({ node: current, type: 'edit' });
       current = current[entryId];
@@ -1735,15 +1744,8 @@ function parseSecurityPolicies(tree, warnings) {
   const policies = [];
   let ruleIndex = 1;
 
-  // Sort entries by policy ID (numeric order)
-  const entries = Object.entries(policySection)
-    .filter(([, v]) => typeof v === 'object')
-    .sort(([a], [b]) => {
-      const na = parseInt(a, 10);
-      const nb = parseInt(b, 10);
-      if (!isNaN(na) && !isNaN(nb)) return na - nb;
-      return a.localeCompare(b);
-    });
+  const entries = entriesInConfigOrder(policySection)
+    .filter(([, v]) => typeof v === 'object');
 
   for (const [id, entry] of entries) {
     const action = mapAction(getString(entry['action']));
@@ -1873,7 +1875,7 @@ function parseNatRules(tree, warnings) {
 
   // Central SNAT map
   const csnatSection = tree['firewall central-snat-map'] || {};
-  for (const [id, entry] of Object.entries(csnatSection)) {
+  for (const [id, entry] of entriesInConfigOrder(csnatSection)) {
     if (typeof entry !== 'object') continue;
     const ruleName = getString(entry['comments']) || `Central-SNAT-${id}`;
     const sharedIface = [...ensureArray(entry['srcintf']), ...ensureArray(entry['dstintf'])].find(sharedZoneOf);
@@ -1902,11 +1904,10 @@ function parseNatRules(tree, warnings) {
   // makes FortiOS ignore it. Disabled policies match no traffic, so they must
   // not translate any.
   const centralNat = getString((tree['system settings'] || {})['central-nat']) === 'enable';
-  const acceptPolicies = centralNat ? [] : Object.entries(tree['firewall policy'] || {})
+  const acceptPolicies = centralNat ? [] : entriesInConfigOrder(tree['firewall policy'] || {})
     .filter(([, entry]) => typeof entry === 'object'
       && getString(entry['status']) !== 'disable'
       && mapAction(getString(entry['action'])) === 'allow')
-    .sort(([a], [b]) => (parseInt(a, 10) || 0) - (parseInt(b, 10) || 0))
     .map(([id, entry]) => {
       const nat = getString(entry['nat']) === 'enable';
       const translation = nat
