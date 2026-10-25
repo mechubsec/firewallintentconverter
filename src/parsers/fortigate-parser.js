@@ -46,8 +46,9 @@ export function parseFortigateConfig(configText) {
   const interfaces = parseInterfaces(tree, warnings);
   const addressObjects = parseAddressObjects(tree, warnings);
   const addressGroups = parseAddressGroups(tree, warnings);
-  const serviceObjects = parseServiceObjects(tree, warnings);
-  const serviceGroups = parseServiceGroups(tree, warnings);
+  const splitServiceGroups = [];
+  const serviceObjects = parseServiceObjects(tree, warnings, splitServiceGroups);
+  const serviceGroups = [...parseServiceGroups(tree, warnings), ...splitServiceGroups];
   const securityPolicies = parseSecurityPolicies(tree, warnings);
   const natRules = parseNatRules(tree, warnings);
   const vipObjects = parseVipObjects(tree, warnings);
@@ -1624,9 +1625,19 @@ function parseAddressGroups(tree, warnings) {
 
 
 // --- Service Objects ---
-function parseServiceObjects(tree, warnings) {
+// Multi-protocol services are split per protocol; a group under the original
+// name (pushed to splitGroups) keeps policy references resolvable.
+function parseServiceObjects(tree, warnings, splitGroups = []) {
   const svcSection = tree['firewall service custom'] || {};
   const services = [];
+  // Generated split names must not shadow a service or group the config already defines.
+  const takenNames = new Set([...Object.keys(svcSection), ...Object.keys(tree['firewall service group'] || {})]);
+  const uniqueName = (baseName) => {
+    let candidate = baseName;
+    for (let suffix = 2; takenNames.has(candidate); suffix += 1) candidate = `${baseName}_${suffix}`;
+    takenNames.add(candidate);
+    return candidate;
+  };
 
   for (const [name, entry] of Object.entries(svcSection)) {
     if (typeof entry !== 'object') continue;
@@ -1653,39 +1664,38 @@ function parseServiceObjects(tree, warnings) {
       });
     } else {
       // TCP/UDP/SCTP
-      const tcpPorts = getString(entry['tcp-portrange']) || '';
-      const udpPorts = getString(entry['udp-portrange']) || '';
-      const sctpPorts = getString(entry['sctp-portrange']) || '';
+      // "set tcp-portrange 80 443" lists several ranges; each becomes its own service.
+      const rangesByProtocol = {
+        tcp: ensureArray(entry['tcp-portrange']),
+        udp: ensureArray(entry['udp-portrange']),
+        sctp: ensureArray(entry['sctp-portrange']),
+      };
+      const portParts = Object.entries(rangesByProtocol)
+        .flatMap(([proto, ranges]) => ranges.map((range, index) => ({
+          proto,
+          range,
+          baseName: ranges.length > 1 ? `${name}_${proto}_${index + 1}` : `${name}_${proto}`,
+        })));
+      const isSplit = portParts.length > 1;
+      const description = getString(entry['comment']) || '';
 
-      if (tcpPorts) {
+      const members = [];
+      for (const { proto, range, baseName } of portParts) {
+        const serviceName = isSplit ? uniqueName(baseName) : name;
+        members.push(serviceName);
         services.push({
-          name: udpPorts ? `${name}_tcp` : name,
-          protocol: 'tcp',
-          port_range: normalizePortRange(tcpPorts),
+          name: serviceName,
+          protocol: proto,
+          port_range: normalizePortRange(range),
           source_port: '',
-          description: getString(entry['comment']) || '',
+          description,
         });
       }
-      if (udpPorts) {
-        services.push({
-          name: tcpPorts ? `${name}_udp` : name,
-          protocol: 'udp',
-          port_range: normalizePortRange(udpPorts),
-          source_port: '',
-          description: getString(entry['comment']) || '',
-        });
-      }
-      if (sctpPorts) {
-        services.push({
-          name,
-          protocol: 'sctp',
-          port_range: normalizePortRange(sctpPorts),
-          source_port: '',
-          description: getString(entry['comment']) || '',
-        });
+      if (isSplit) {
+        splitGroups.push({ name, members, description });
       }
       // If no ports specified, it's a protocol-level match
-      if (!tcpPorts && !udpPorts && !sctpPorts) {
+      if (portParts.length === 0) {
         services.push({
           name,
           protocol: 'tcp',

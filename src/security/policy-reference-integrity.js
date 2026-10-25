@@ -147,3 +147,32 @@ export function findPolicyReferenceIssues(config) {
 
   return issues;
 }
+
+/**
+ * Lists why a policy's negated source/destination match cannot be emitted
+ * faithfully. Junos `*-address-excluded` negates the whole listed set, so the
+ * list must be emitted exactly: a wildcard in it (negation then matches
+ * nothing) or an entry dropped as an EDL block-list address (the exclusion
+ * would shrink) changes the meaning, and the policy must be deactivated.
+ *
+ * @param {Object} policy - Intermediate security policy
+ * @returns {string[]} Human-readable reasons; empty when negation is representable or absent
+ */
+export function findNegationIssues(policy) {
+  const reasons = [];
+  const droppedAddresses = new Set(policy._secIntelAddresses || []);
+  for (const [negated, field, label] of [
+    [policy.negate_source, 'src_addresses', 'source'],
+    [policy.negate_destination, 'dst_addresses', 'destination'],
+  ]) {
+    if (!negated) continue;
+    const addresses = policy[field] || [];
+    if (addresses.length === 0 || addresses.some((addr) => addr === 'any' || addr === 'all')) {
+      reasons.push(`negated ${label} matches nothing (list is or contains any)`);
+    }
+    if (addresses.some((addr) => droppedAddresses.has(addr))) {
+      reasons.push(`negated ${label} list contains block-list addresses that are emitted as SecIntel feeds`);
+    }
+  }
+  return reasons;
+}
