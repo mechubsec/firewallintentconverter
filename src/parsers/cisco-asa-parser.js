@@ -891,12 +891,31 @@ function parseTwiceNatCommand(rest, srcIf, dstIf, ruleIndex, warnings) {
     return null;
   }
 
+  const name = `Manual-NAT-${ruleIndex}`;
+  // Identity NAT (real == mapped on each side) is a NAT exemption, typically for VPN traffic: Junos "source-nat off".
+  const identitySource = srcNatType === 'static' && srcReal === srcMapped;
+  const identityDestination = !dstNatType || (dstNatType === 'static' && dstReal === dstMapped);
+  if (identitySource && identityDestination && !svcMapped) {
+    return {
+      name,
+      type: 'source',
+      src_zones: [srcIf],
+      dst_zones: [dstIf],
+      src_addresses: [srcReal],
+      dst_addresses: [dstReal || 'any'],
+      translated_src: { type: 'no-nat' },
+      translated_dst: null,
+      translated_port: null,
+      description: `Twice-NAT exemption: ${rest}`,
+      _rule_index: ruleIndex,
+    };
+  }
+
   // Determine type
   let type = 'source';
   if (srcNatType && dstNatType) type = 'source-and-destination';
   else if (!srcNatType && dstNatType) type = 'destination';
   else if (srcNatType === 'static' && !dstNatType) type = 'static';
-  const name = `Manual-NAT-${ruleIndex}`;
   // Static to the interface address is port forwarding, not a one-to-one mapping.
   if (type === 'static' && srcMapped === 'interface') {
     warnings.push(createWarning('warning', `nat/static/${name}`,
@@ -953,6 +972,9 @@ function parseTwiceNatCommand(rest, srcIf, dstIf, ruleIndex, warnings) {
 
 function parseNatRules(blocks, lines, warnings) {
   const natRules = [];
+  // ASA evaluates twice NAT, then object NAT, then twice NAT marked after-auto.
+  const manualRules = [];
+  const afterAutoRules = [];
   let ruleIndex = 1;
 
   // Object NAT (auto nat) — defined inside object network blocks
@@ -1033,12 +1055,12 @@ function parseNatRules(blocks, lines, warnings) {
     if (match) {
       const [, srcIf, dstIf, rest] = match;
       const twiceRule = parseTwiceNatCommand(rest.trim(), srcIf.trim(), dstIf.trim(), ruleIndex, warnings);
-      if (twiceRule) natRules.push(twiceRule);
+      if (twiceRule) (/^after-auto\b/.test(rest.trim()) ? afterAutoRules : manualRules).push(twiceRule);
       ruleIndex++;
     }
   }
 
-  return natRules;
+  return [...manualRules, ...natRules, ...afterAutoRules];
 }
 
 

@@ -65,3 +65,36 @@ describe('ASA twice NAT prefixes', () => {
     expect(warnings.some(item => item.element === 'nat/Manual-NAT-1' && item.message.includes('could not be parsed'))).toBe(true);
   });
 });
+
+describe('ASA identity twice NAT (NAT exemption)', () => {
+  const exemptConfig = extra => asaConfig(`object network REMOTE
+ subnet 10.20.0.0 255.255.0.0
+object network LAN-OBJ
+ subnet 192.168.1.0 255.255.255.0
+ nat (inside,outside) dynamic interface
+nat (inside,outside) source static LAN LAN destination static REMOTE REMOTE no-proxy-arp route-lookup${extra}`);
+
+  it.each([[''], [' description VPN exemption']])('becomes source-nat off ahead of object NAT (%s)', extra => {
+    const { intermediateConfig } = parseCiscoAsaConfig(exemptConfig(extra));
+    const rules = intermediateConfig.nat_rules;
+    expect(rules[0]).toMatchObject({
+      type: 'source', src_addresses: ['LAN'], dst_addresses: ['REMOTE'], translated_src: { type: 'no-nat' },
+    });
+    expect(rules[1].name).toBe('Auto-NAT-LAN-OBJ');
+    const { commands } = convertToSrxSetCommands(structuredClone(intermediateConfig), {}, null, {});
+    const nat = commands.filter(line => line.startsWith('set security nat source rule-set'));
+    const offIndex = nat.findIndex(line => line.endsWith('then source-nat off'));
+    const hideIndex = nat.findIndex(line => line.endsWith('then source-nat interface'));
+    expect(offIndex).toBeGreaterThan(-1);
+    expect(hideIndex).toBeGreaterThan(offIndex);
+    expect(commands.some(line => /source pool|destination pool/.test(line))).toBe(false);
+  });
+
+  it('keeps after-auto twice NAT behind object NAT', () => {
+    const { intermediateConfig } = parseCiscoAsaConfig(asaConfig(`object network LAN-OBJ
+ subnet 192.168.1.0 255.255.255.0
+ nat (inside,outside) dynamic interface
+nat (inside,outside) after-auto source dynamic LAN interface`));
+    expect(intermediateConfig.nat_rules.map(rule => rule.name)).toEqual(['Auto-NAT-LAN-OBJ', 'Manual-NAT-2']);
+  });
+});

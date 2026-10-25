@@ -73,12 +73,12 @@ describe('Cisco ASA static NAT', () => {
     expect(warnings.some((item) => item.element === 'nat/static/Manual-NAT-1' && item.message.includes('interface'))).toBe(true);
   });
 
-  it('twice NAT identity mapping is not turned into static NAT', () => {
+  it('twice NAT identity mapping becomes a NAT exemption, not static NAT', () => {
     const text = asaConfig('').replace('object network WEB-PUB', 'nat (inside,any) source static WEB WEB\nobject network WEB-PUB');
-    const { intermediateConfig, warnings, natLines } = convert(text);
-    expect(intermediateConfig.nat_rules).toHaveLength(0);
-    expect(natLines.some((line) => line.includes('static') || line.includes('proxy-arp'))).toBe(false);
-    expect(warnings.some((item) => item.message.includes('identity NAT'))).toBe(true);
+    const { intermediateConfig, natLines } = convert(text);
+    expect(intermediateConfig.nat_rules).toHaveLength(1);
+    expect(intermediateConfig.nat_rules[0]).toMatchObject({ type: 'source', translated_src: { type: 'no-nat' } });
+    expect(natLines.some((line) => line.startsWith('set security nat static') || line.includes('proxy-arp'))).toBe(false);
   });
 
   it('static to the interface is skipped with a warning', () => {
