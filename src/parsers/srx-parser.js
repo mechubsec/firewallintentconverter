@@ -517,8 +517,10 @@ function normalizeToSetCommands(configText) {
   const lines = configText.split('\n').map(l => l.trimEnd());
 
   // Check if already set commands
-  const setLines = lines.filter(l => l.trim().startsWith('set '));
-  if (setLines.length > lines.filter(l => l.trim().length > 0).length * 0.5) {
+  const setLines = lines.filter(l => /^(set|deactivate) /.test(l.trim()));
+  // Comment lines don't count: converter output carries many `#` banners
+  const contentLines = lines.filter(l => l.trim().length > 0 && !l.trim().startsWith('#'));
+  if (setLines.length > contentLines.length * 0.5) {
     // Mostly set commands — use them directly
     return setLines.map(l => l.trim());
   }
@@ -555,6 +557,7 @@ function hierarchicalToSet(lines) {
     if (activeLine.endsWith('{')) {
       const path = activeLine.slice(0, -1).trim();
       pathStack.push(path);
+      if (inactiveMatch) setCommands.push(`deactivate ${pathStack.join(' ')}`);
       continue;
     }
 
@@ -618,6 +621,9 @@ function buildConfigTree(setCommands) {
       if (typeof node[token] === 'string') {
         // Convert leaf to branch
         node[token] = { _value: node[token] };
+      } else if (node[token] === true) {
+        // A flag statement (e.g. `set ... security-zone trust`) that later gains children
+        node[token] = {};
       }
       node = node[token];
     }
@@ -627,9 +633,12 @@ function buildConfigTree(setCommands) {
     if (node[lastToken] === undefined) {
       node[lastToken] = true; // flag-style value
     }
-    // Mark deactivated paths
+    // Mark the deactivated statement itself (a flag leaf becomes an object)
     if (isDeactivate) {
-      node._deactivated = true;
+      if (typeof node[lastToken] !== 'object') {
+        node[lastToken] = node[lastToken] === true ? {} : { _value: node[lastToken] };
+      }
+      node[lastToken]._deactivated = true;
     }
   }
 
@@ -1083,8 +1092,8 @@ function parseSinglePolicy(name, data, srcZones, dstZones, ruleIndex, warnings) 
     dst_zones: dstZones,
     src_addresses: srcAddresses.length > 0 ? srcAddresses : ['any'],
     dst_addresses: dstAddresses.length > 0 ? dstAddresses : ['any'],
-    negate_source: false,
-    negate_destination: false,
+    negate_source: isActiveStatement(matchNode['source-address-excluded']),
+    negate_destination: isActiveStatement(matchNode['destination-address-excluded']),
     applications: applications.length > 0 ? applications : ['any'],
     services: ['application-default'],
     action: intermediateAction,
@@ -1368,6 +1377,11 @@ function extractStringValue(node) {
 /**
  * Collects all non-underscore keys from a node (used for member lists).
  */
+/** True when a statement is present and not deactivated (`deactivate` / `inactive:`). */
+function isActiveStatement(node) {
+  return node !== undefined && !node?._deactivated;
+}
+
 function collectKeys(node) {
   if (!node) return [];
   if (typeof node !== 'object') return [String(node)];
@@ -3114,8 +3128,8 @@ function parseSrxSslProxy(tree, securityPolicies, warnings) {
         src_addresses: policy.src_addresses || [],
         dst_addresses: policy.dst_addresses || [],
         src_users: [],
-        negate_source: false,
-        negate_destination: false,
+        negate_source: policy.negate_source || false,
+        negate_destination: policy.negate_destination || false,
         services: policy.services || [],
         url_categories: [],
         action: 'decrypt',

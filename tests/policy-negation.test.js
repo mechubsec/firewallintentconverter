@@ -38,7 +38,7 @@ function buildConfig(policyOverrides) {
 }
 
 const convert = (config, policyStructure) => (
-  convertToSrxSetCommands(config, policyStructure ? { policyStructure } : {}, null, {}).commands.join('\n')
+  convertToSrxSetCommands(config, {}, null, policyStructure ? { policyStructure } : {}).commands.join('\n')
 );
 const buildXml = (config) => buildSrxXml(config).xml;
 
@@ -71,6 +71,7 @@ describe('negated addresses emit Junos excluded flags', () => {
     const config = buildConfig({ negate_source: true, negate_destination: true });
     for (const structure of [undefined, 'zone-pair']) {
       const commands = convert(config, structure);
+      if (structure) expect(commands).toMatch(/from-zone lan to-zone wan policy \S+ match source-address-excluded/);
       expect(commands).toMatch(/source-address-excluded/);
       expect(commands).toMatch(/destination-address-excluded/);
       expect(commands).not.toMatch(/CAVEAT: policy deactivated/);
