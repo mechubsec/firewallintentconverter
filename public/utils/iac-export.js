@@ -9,7 +9,13 @@ import { BRAND } from './brand.js';
 
 /**
  * Generates Terraform HCL configuration using the Junos Terraform provider.
- * Groups set commands into logical Terraform resources.
+ *
+ * Zones become `junos_security_zone` resources and each from/to zone pair
+ * becomes one `junos_security_policy` (the provider keys it by zone pair, with
+ * an ordered policy list). A zone pair is structured only when every one of its
+ * lines maps to a provider attribute and none is deactivated; otherwise all its
+ * lines are loaded verbatim. Everything else goes to a `junos_null_load_config`
+ * resource in original command order.
  * @param {string[]} commands - Array of SRX set commands
  * @param {Object} [options] - Export options
  * @param {string} [options.providerHost] - SRX device hostname/IP
@@ -44,7 +50,7 @@ export function exportToTerraform(commands, options = {}) {
   lines.push('');
   lines.push('# --- Variables ---');
   lines.push('variable "srx_host" {');
-  lines.push(`  default = "${host}"`);
+  lines.push(`  default = "${escapeHcl(host)}"`);
   lines.push('}');
   lines.push('variable "srx_username" { default = "admin" }');
   lines.push('variable "srx_password" { sensitive = true }');
@@ -56,77 +62,81 @@ export function exportToTerraform(commands, options = {}) {
   const groups = groupSetCommands(commands);
 
   // Security zones
+  const zoneResources = [];
+  const takenZoneNames = new Set();
   for (const zone of groups.zones) {
-    const resourceName = sanitizeResourceName(zone.name);
+    const resourceName = uniqueResourceName(zone.name, takenZoneNames);
+    zoneResources.push(`junos_security_zone.${resourceName}`);
     lines.push(`# --- Security Zone: ${zone.name} ---`);
     lines.push(`resource "junos_security_zone" "${resourceName}" {`);
-    lines.push(`  name = "${zone.name}"`);
+    lines.push(`  name = "${escapeHcl(zone.name)}"`);
     for (const iface of zone.interfaces) {
       lines.push(`  interface {`);
-      lines.push(`    name = "${iface}"`);
+      lines.push(`    name = "${escapeHcl(iface)}"`);
       lines.push(`  }`);
     }
     lines.push('}');
     lines.push('');
   }
 
-  // Address book entries
-  for (const addr of groups.addresses) {
-    const resourceName = sanitizeResourceName(addr.name);
-    lines.push(`resource "junos_security_global_address_book" "${resourceName}" {`);
-    lines.push(`  name    = "${addr.name}"`);
-    if (addr.value) {
-      if (addr.value.includes('/')) {
-        lines.push(`  network = "${addr.value}"`);
-      } else if (addr.value.includes('-')) {
-        lines.push(`  range_from = "${addr.value.split('-')[0]}"`);
-        lines.push(`  range_to   = "${addr.value.split('-')[1]}"`);
-      } else {
-        lines.push(`  network = "${addr.value}/32"`);
-      }
-    }
-    if (addr.description) {
-      lines.push(`  description = "${escapeHcl(addr.description)}"`);
-    }
-    lines.push('}');
-    lines.push('');
-  }
-
-  // Security policies
-  for (const policy of groups.policies) {
-    const resourceName = sanitizeResourceName(`${policy.fromZone}_to_${policy.toZone}_${policy.name}`);
-    lines.push(`resource "junos_security_policy" "${resourceName}" {`);
-    lines.push(`  from_zone = "${policy.fromZone}"`);
-    lines.push(`  to_zone   = "${policy.toZone}"`);
-    lines.push('  policy {');
-    lines.push(`    name                      = "${policy.name}"`);
-    lines.push(`    match_source_address      = ${toHclList(policy.srcAddrs)}`);
-    lines.push(`    match_destination_address = ${toHclList(policy.dstAddrs)}`);
-    lines.push(`    match_application         = ${toHclList(policy.apps)}`);
-    if (policy.action === 'permit') {
-      lines.push('    then         = "permit"');
-    } else if (policy.action === 'deny') {
-      lines.push('    then         = "deny"');
-    } else {
-      lines.push(`    then         = "${policy.action}"`);
-    }
-    if (policy.logInit) lines.push('    log_init = true');
-    if (policy.logClose) lines.push('    log_close = true');
-    lines.push('  }');
-    lines.push('}');
-    lines.push('');
-  }
-
-  // Remaining set commands as junos_config
-  if (groups.remaining.length > 0) {
+  // Everything not structured, in original order. Applied after the zones and
+  // before the policies, which reference the objects defined here.
+  const hasRawBlock = groups.remaining.length > 0;
+  if (hasRawBlock) {
     lines.push('# --- Additional Configuration (set commands) ---');
-    lines.push('resource "junos_config" "additional" {');
-    lines.push('  config_lines = [');
+    for (const note of groups.rawNotes) lines.push(`# ${note}`);
+    lines.push('resource "junos_null_load_config" "additional" {');
+    lines.push('  action = "set"');
+    lines.push('  config = join("\\n", [');
     for (const cmd of groups.remaining) {
       lines.push(`    "${escapeHcl(cmd)}",`);
     }
-    lines.push('  ]');
+    lines.push('  ])');
+    if (zoneResources.length > 0) {
+      lines.push(`  depends_on = [${zoneResources.join(', ')}]`);
+    }
     lines.push('}');
+    lines.push('');
+  }
+
+  // One resource per zone pair: the provider ID is <from_zone>_-_<to_zone>.
+  const policyDependencies = [...zoneResources];
+  if (hasRawBlock) policyDependencies.push('junos_null_load_config.additional');
+  const takenPolicyNames = new Set();
+  for (const pair of groups.zonePairs) {
+    const resourceName = uniqueResourceName(`${pair.fromZone}_to_${pair.toZone}`, takenPolicyNames);
+    lines.push(`# --- Security Policies: ${pair.fromZone} -> ${pair.toZone} ---`);
+    lines.push(`resource "junos_security_policy" "${resourceName}" {`);
+    lines.push(`  from_zone = "${escapeHcl(pair.fromZone)}"`);
+    lines.push(`  to_zone   = "${escapeHcl(pair.toZone)}"`);
+    for (const policy of pair.policies) {
+      lines.push('  policy {');
+      lines.push(`    name                      = "${escapeHcl(policy.name)}"`);
+      lines.push(`    match_source_address      = ${toHclList(policy.srcAddrs)}`);
+      lines.push(`    match_destination_address = ${toHclList(policy.dstAddrs)}`);
+      if (policy.apps.length > 0) lines.push(`    match_application         = ${toHclList(policy.apps)}`);
+      if (policy.srcExcluded) lines.push('    match_source_address_excluded      = true');
+      if (policy.dstExcluded) lines.push('    match_destination_address_excluded = true');
+      lines.push(`    then                      = "${policy.action}"`);
+      if (policy.logInit) lines.push('    log_init  = true');
+      if (policy.logClose) lines.push('    log_close = true');
+      if (policy.count) lines.push('    count     = true');
+      if (policy.description !== null) lines.push(`    description = "${escapeHcl(policy.description)}"`);
+      const services = Object.entries(policy.appServices);
+      if (services.length > 0) {
+        lines.push('    permit_application_services {');
+        for (const [attribute, value] of services) {
+          lines.push(`      ${attribute} = "${escapeHcl(value)}"`);
+        }
+        lines.push('    }');
+      }
+      lines.push('  }');
+    }
+    if (policyDependencies.length > 0) {
+      lines.push(`  depends_on = [${policyDependencies.join(', ')}]`);
+    }
+    lines.push('}');
+    lines.push('');
   }
 
   return lines.join('\n');
@@ -195,9 +205,25 @@ function sanitizeResourceName(name) {
   return name.replace(/[^a-zA-Z0-9_]/g, '_').replace(/^(\d)/, '_$1').toLowerCase();
 }
 
-/** Escape string for HCL */
+/** Sanitize a name and suffix it until it is not in `taken` (distinct names can collapse to one). */
+function uniqueResourceName(name, taken) {
+  const base = sanitizeResourceName(name);
+  let candidate = base;
+  for (let suffix = 2; taken.has(candidate); suffix++) candidate = `${base}_${suffix}`;
+  taken.add(candidate);
+  return candidate;
+}
+
+/** Escape string for an HCL quoted string; neutralizes `${` and `%{` template sequences. */
 function escapeHcl(str) {
-  return (str || '').replace(/\\/g, '\\\\').replace(/"/g, '\\"');
+  return (str || '')
+    .replace(/\\/g, '\\\\')
+    .replace(/"/g, '\\"')
+    .replace(/\n/g, '\\n')
+    .replace(/\r/g, '\\r')
+    .replace(/\t/g, '\\t')
+    .replace(/\$\{/g, () => '$${')
+    .replace(/%\{/g, () => '%%{');
 }
 
 /** Escape string for YAML */
@@ -211,94 +237,132 @@ function toHclList(arr) {
   return '[' + arr.map(v => `"${escapeHcl(v)}"`).join(', ') + ']';
 }
 
+const POLICY_LINE = /^set security policies from-zone (\S+) to-zone (\S+) policy (\S+)\s+(.+)$/;
+const POLICY_DEACTIVATE = /^deactivate security policies from-zone (\S+) to-zone (\S+)(?:\s|$)/;
+const APP_SERVICE_ATTRIBUTES = {
+  'utm-policy': 'utm_policy',
+  'idp-policy': 'idp_policy',
+  'security-intelligence-policy': 'security_intelligence_policy',
+};
+
+/**
+ * Apply one policy body line (the text after `policy <name> `) to a policy record.
+ * @returns {boolean} false when the line has no Terraform equivalent
+ */
+function applyPolicyLine(policy, rest) {
+  let match;
+  if ((match = rest.match(/^match source-address (\S+)$/))) policy.srcAddrs.push(match[1]);
+  else if ((match = rest.match(/^match destination-address (\S+)$/))) policy.dstAddrs.push(match[1]);
+  else if ((match = rest.match(/^match application (\S+)$/))) policy.apps.push(match[1]);
+  else if (rest === 'match source-address-excluded') policy.srcExcluded = true;
+  else if (rest === 'match destination-address-excluded') policy.dstExcluded = true;
+  else if ((match = rest.match(/^then (permit|deny|reject)$/))) {
+    if (policy.action && policy.action !== match[1]) return false;
+    policy.action = match[1];
+  } else if (rest === 'then log session-init') policy.logInit = true;
+  else if (rest === 'then log session-close') policy.logClose = true;
+  else if (rest === 'then count') policy.count = true;
+  else if ((match = rest.match(/^description "((?:[^"\\]|\\.)*)"$/))) policy.description = match[1].replace(/\\(.)/g, '$1');
+  else if ((match = rest.match(/^description (\S+)$/))) policy.description = match[1];
+  else if ((match = rest.match(/^then permit application-services (utm-policy|idp-policy|security-intelligence-policy) (\S+)$/))) {
+    policy.appServices[APP_SERVICE_ATTRIBUTES[match[1]]] = match[2];
+  } else return false;
+  return true;
+}
+
 /**
  * Parse set commands into structured groups for Terraform resource generation.
+ * A zone pair is structured only if every one of its lines maps to a
+ * junos_security_policy attribute and none is deactivated; otherwise all its
+ * lines stay in `remaining` (original order) so nothing is dropped.
  */
 function groupSetCommands(commands) {
   const zones = [];
-  const addresses = [];
-  const policies = [];
-  const remaining = [];
+  const zoneMap = Object.create(null); // prototype-free: a zone or policy may be named "constructor"
+  const pairs = [];
+  const pairMap = Object.create(null);
+  const items = []; // { cmd, pair?, zone? } in input order; neither for plain raw lines
 
-  const zoneMap = {};
-  const addrMap = {};
-  const policyMap = {};
+  const pairFor = (fromZone, toZone) => {
+    const key = `${fromZone}\u0000${toZone}`;
+    if (!pairMap[key]) {
+      pairMap[key] = { fromZone, toZone, policies: [], policyMap: Object.create(null), rawReason: null };
+      pairs.push(pairMap[key]);
+    }
+    return pairMap[key];
+  };
 
   for (const cmd of commands) {
     if (!cmd.startsWith('set ') && !cmd.startsWith('deactivate ')) continue;
 
-    // Security zones
-    const zoneMatch = cmd.match(/^set security zones security-zone (\S+)/);
+    // junos_security_zone owns the whole zone stanza, so a zone with any other line stays raw entirely
+    const zoneMatch = cmd.match(/^(set|deactivate) security zones security-zone (\S+)(?:\s+(.+))?$/);
     if (zoneMatch) {
-      const zoneName = zoneMatch[1];
+      const [, verb, zoneName, zoneRest] = zoneMatch;
       if (!zoneMap[zoneName]) {
-        zoneMap[zoneName] = { name: zoneName, interfaces: [] };
+        zoneMap[zoneName] = { name: zoneName, interfaces: [], rawReason: null };
         zones.push(zoneMap[zoneName]);
       }
-      const ifaceMatch = cmd.match(/interfaces (\S+)/);
-      if (ifaceMatch) {
-        zoneMap[zoneName].interfaces.push(ifaceMatch[1]);
-      }
+      const zone = zoneMap[zoneName];
+      const interfaceMatch = verb === 'set' && zoneRest && zoneRest.match(/^interfaces (\S+)$/);
+      if (interfaceMatch) zone.interfaces.push(interfaceMatch[1]);
+      else if (verb !== 'set' || zoneRest) zone.rawReason = zone.rawReason || `unmapped line "${verb} ${zoneRest || ''}"`;
+      items.push({ cmd, zone });
       continue;
     }
 
-    // Global address book
-    const addrMatch = cmd.match(/^set security address-book global address (\S+)\s+(.+)/);
-    if (addrMatch) {
-      const addrName = addrMatch[1];
-      const rest = addrMatch[2];
-      if (!addrMap[addrName]) {
-        addrMap[addrName] = { name: addrName };
-        addresses.push(addrMap[addrName]);
-      }
-      if (rest.startsWith('description ')) {
-        addrMap[addrName].description = rest.replace('description ', '').replace(/^"(.*)"$/, '$1');
-      } else {
-        addrMap[addrName].value = rest.split(/\s/)[0];
-      }
+    const deactivateMatch = cmd.match(POLICY_DEACTIVATE);
+    if (deactivateMatch) {
+      const pair = pairFor(deactivateMatch[1], deactivateMatch[2]);
+      pair.rawReason = pair.rawReason || 'contains deactivated policy';
+      items.push({ cmd, pair });
       continue;
     }
 
-    // Security policies
-    const policyMatch = cmd.match(/^set security policies from-zone (\S+) to-zone (\S+) policy (\S+)\s+(.+)/);
-    if (policyMatch) {
-      const fromZone = policyMatch[1];
-      const toZone = policyMatch[2];
-      const policyName = policyMatch[3];
-      const rest = policyMatch[4];
-      const key = `${fromZone}/${toZone}/${policyName}`;
-
-      if (!policyMap[key]) {
-        policyMap[key] = {
-          fromZone, toZone, name: policyName,
-          srcAddrs: [], dstAddrs: [], apps: [],
-          action: 'permit', logInit: false, logClose: false,
-        };
-        policies.push(policyMap[key]);
-      }
-
-      const pol = policyMap[key];
-      if (rest.startsWith('match source-address ')) {
-        pol.srcAddrs.push(rest.replace('match source-address ', ''));
-      } else if (rest.startsWith('match destination-address ')) {
-        pol.dstAddrs.push(rest.replace('match destination-address ', ''));
-      } else if (rest.startsWith('match application ')) {
-        pol.apps.push(rest.replace('match application ', ''));
-      } else if (rest.includes('then deny')) {
-        pol.action = 'deny';
-      } else if (rest.includes('then reject')) {
-        pol.action = 'reject';
-      } else if (rest.includes('log session-init')) {
-        pol.logInit = true;
-      } else if (rest.includes('log session-close')) {
-        pol.logClose = true;
-      }
+    const policyMatch = cmd.match(POLICY_LINE);
+    if (!policyMatch) {
+      items.push({ cmd, pair: null });
       continue;
     }
-
-    // Everything else
-    remaining.push(cmd);
+    const [, fromZone, toZone, policyName, rest] = policyMatch;
+    const pair = pairFor(fromZone, toZone);
+    items.push({ cmd, pair });
+    if (!pair.policyMap[policyName]) {
+      pair.policyMap[policyName] = {
+        name: policyName, srcAddrs: [], dstAddrs: [], apps: [], action: null,
+        srcExcluded: false, dstExcluded: false, logInit: false, logClose: false,
+        count: false, description: null, appServices: {},
+      };
+      pair.policies.push(pair.policyMap[policyName]);
+    }
+    if (!applyPolicyLine(pair.policyMap[policyName], rest)) {
+      pair.rawReason = pair.rawReason || `policy ${policyName} has unmapped line "${rest}"`;
+    }
   }
 
-  return { zones, addresses, policies, remaining };
+  // The provider defaults `then` to permit; a policy without an action must not become one.
+  for (const pair of pairs) {
+    const actionless = pair.policies.find(policy => !policy.action);
+    if (actionless) pair.rawReason = pair.rawReason || `policy ${actionless.name} has no then action`;
+  }
+
+  // Raw zones and zone pairs keep every line, in place among the other raw commands.
+  const remaining = items
+    .filter(({ pair, zone }) => {
+      const owner = pair || zone;
+      return !owner || owner.rawReason;
+    })
+    .map(({ cmd }) => cmd);
+  const rawNotes = [
+    ...zones.filter(zone => zone.rawReason)
+      .map(zone => `Zone ${zone.name} exported as raw set commands: ${zone.rawReason}`),
+    ...pairs.filter(pair => pair.rawReason)
+      .map(pair => `Zone pair ${pair.fromZone} -> ${pair.toZone} exported as raw set commands: ${pair.rawReason}`),
+  ].map(note => note.replace(/[\r\n]+/g, ' '));
+  return {
+    zones: zones.filter(zone => !zone.rawReason),
+    zonePairs: pairs.filter(pair => !pair.rawReason),
+    remaining,
+    rawNotes,
+  };
 }
