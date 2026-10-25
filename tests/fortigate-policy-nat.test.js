@@ -106,6 +106,48 @@ end`);
     expect(centralLines.some((l) => /then source-nat pool /.test(l))).toBe(true);
   });
 
+  it('maps central SNAT interfaces to their zones (#114)', () => {
+    const zoned = CONFIG.replace(/config firewall policy[\s\S]*$/, `config system zone
+    edit "inside"
+        set interface "port2"
+    next
+    edit "outside"
+        set interface "port1"
+    next
+end
+config firewall central-snat-map
+    edit 1
+        set srcintf "port2"
+        set dstintf "port1"
+        set orig-addr "lan-net"
+        set dst-addr "all"
+    next
+end`);
+    const zonedLines = convertToSrxSetCommands(parseFortigateConfig(zoned).intermediateConfig, {}, null, {}).commands;
+    expect(zonedLines.some((l) => /nat source rule-set \S+ from zone inside$/.test(l))).toBe(true);
+    expect(zonedLines.some((l) => /nat source rule-set \S+ to zone outside$/.test(l))).toBe(true);
+    expect(zonedLines.some((l) => / zone port[12]$/.test(l))).toBe(false);
+  });
+
+  it('skips central SNAT on a member of a multi-interface zone (#114)', () => {
+    const shared = CONFIG.replace(/config firewall policy[\s\S]*$/, `config system zone
+    edit "inside"
+        set interface "port2" "port3"
+    next
+end
+config firewall central-snat-map
+    edit 1
+        set srcintf "port2"
+        set dstintf "port1"
+        set orig-addr "lan-net"
+        set dst-addr "all"
+    next
+end`);
+    const { intermediateConfig, warnings } = parseFortigateConfig(shared);
+    expect(intermediateConfig.nat_rules.some((rule) => rule.name === 'Central-SNAT-1')).toBe(false);
+    expect(warnings.some((warning) => /interface "port2", one of several members of zone "inside" — not converted/.test(warning.message))).toBe(true);
+  });
+
   it('flags a zone pair whose policies translate differently', () => {
     expect(commands.some((l) => l.startsWith('# CAVEAT: source NAT for policy "lan-out" ignores policy order'))).toBe(true);
     expect(commands.some((l) => l.includes('"guest-out-no-nat"') && l.startsWith('# CAVEAT:'))).toBe(true);

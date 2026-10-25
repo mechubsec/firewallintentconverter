@@ -1822,11 +1822,16 @@ function parseSecurityPolicies(tree, warnings) {
 function parseNatRules(tree, warnings) {
   const natRules = [];
   const ifaceToZone = {};
+  const zoneMemberCount = {};
   for (const zone of parseZones(tree, warnings)) {
+    zoneMemberCount[zone.name] = zone.interfaces.length;
     for (const iface of zone.interfaces) ifaceToZone[iface] = zone.name;
   }
   let ruleIndex = 1;
   const zoneOf = (iface) => ifaceToZone[iface] || iface;
+  // A zone stands for an interface only when it is the zone's sole member; otherwise
+  // the zone-scoped rule-set would also translate traffic on the sibling interfaces.
+  const sharedZoneOf = (iface) => (ifaceToZone[iface] && zoneMemberCount[ifaceToZone[iface]] > 1 ? ifaceToZone[iface] : null);
 
   // IP pools become SRX source pools only where a rule names them; an
   // unknown or absent pool means egress-interface NAT.
@@ -1859,11 +1864,19 @@ function parseNatRules(tree, warnings) {
   const csnatSection = tree['firewall central-snat-map'] || {};
   for (const [id, entry] of Object.entries(csnatSection)) {
     if (typeof entry !== 'object') continue;
+    const ruleName = getString(entry['comments']) || `Central-SNAT-${id}`;
+    const sharedIface = [...ensureArray(entry['srcintf']), ...ensureArray(entry['dstintf'])].find(sharedZoneOf);
+    if (sharedIface) {
+      warnings.push(createWarning('warning', `nat/${ruleName}`,
+        `Central SNAT "${ruleName}" matches interface "${sharedIface}", one of several members of zone "${sharedZoneOf(sharedIface)}" — not converted`,
+        `Build it manually as a rule-set scoped "from interface"/"to interface" ${sharedIface}`));
+      continue;
+    }
     natRules.push({
-      name: getString(entry['comments']) || `Central-SNAT-${id}`,
+      name: ruleName,
       type: 'source',
-      src_zones: ensureArray(entry['srcintf']),
-      dst_zones: ensureArray(entry['dstintf']),
+      src_zones: ensureArray(entry['srcintf']).map(zoneOf),
+      dst_zones: ensureArray(entry['dstintf']).map(zoneOf),
       src_addresses: ensureArray(entry['orig-addr']),
       dst_addresses: ensureArray(entry['dst-addr']),
       translated_src: poolTranslation(ensureArray(entry['nat-ippool'])),
