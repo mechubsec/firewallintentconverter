@@ -104,7 +104,8 @@ export function parseFortigateConfig(configText) {
   const lagInterfaces = parseFortigateLagInterfaces(tree, interfaces, warnings);
 
   // Merge zone and interface data — FortiGate can use interfaces directly as zones
-  const mergedZones = mergeZonesAndInterfaces(zones, interfaces, securityPolicies);
+  const lagMemberNames = new Set(lagInterfaces.flatMap(lag => lag.source_members));
+  const mergedZones = mergeZonesAndInterfaces(zones, interfaces, securityPolicies, natRules, lagMemberNames, warnings);
 
   // Normalize interfaces to standard schema
   const ifToZone = {};
@@ -1481,6 +1482,10 @@ function parseInterfaces(tree, warnings) {
       ipv6,
       type: getString(entry['type']) || 'physical',
       vdom: getString(entry['vdom']) || 'root',
+      mode: getString(entry['mode']) || 'static',
+      dedicated_to: getString(entry['dedicated-to']) || '',
+      fortilink: getString(entry['fortilink']) === 'enable',
+      status: getString(entry['status']) || 'up',
       zone: '', // will be filled by zone data
     });
   }
@@ -1488,7 +1493,7 @@ function parseInterfaces(tree, warnings) {
 }
 
 // --- Merge zones and interfaces ---
-function mergeZonesAndInterfaces(zones, interfaces, policies) {
+function mergeZonesAndInterfaces(zones, interfaces, policies, natRules = [], lagMemberNames = new Set(), warnings = []) {
   // Build a map of interface-name → zone
   const ifaceToZone = {};
   for (const zone of zones) {
@@ -1523,7 +1528,42 @@ function mergeZonesAndInterfaces(zones, interfaces, policies) {
     }
   }
 
+  zoneAllL3InterfacesForAny({ zoneMap, ifaceToZone, interfaces, policies, natRules, lagMemberNames, warnings });
+
   return Object.values(zoneMap);
+}
+
+// "any" as srcintf/dstintf covers every interface, but an unzoned interface
+// drops all transit traffic on the SRX, so zone each L3 interface that has none.
+function zoneAllL3InterfacesForAny({ zoneMap, ifaceToZone, interfaces, policies, natRules, lagMemberNames, warnings }) {
+  const isAny = (rule) => [...rule.src_zones, ...rule.dst_zones].includes('any');
+  // A VIP with extintf "any" (or none) has no src zone: it listens on every interface.
+  const vipMatchesAny = (rule) => rule.type === 'destination' && rule.src_zones.length === 0;
+  if (!policies.some(isAny) && !natRules.some(rule => isAny(rule) || vipMatchesAny(rule))) return;
+
+  const isZoned = (iface) => zoneMap[iface.name] || ifaceToZone[iface.name];
+  // DHCP/PPPoE interfaces are L3 without a static address; 0.0.0.0 and ::/0 are FortiOS "unset".
+  const isL3 = (iface) => ['dhcp', 'pppoe'].includes(iface.mode)
+    || (iface.ip && !iface.ip.startsWith('0.0.0.0'))
+    || (iface.ipv6 && !/^::(\/0)?$/.test(iface.ipv6));
+  // Management and FortiLink ports carry no policy traffic; a down port carries none at all.
+  const isControlLink = (iface) => iface.dedicated_to === 'management' || iface.fortilink;
+  const isDown = (iface) => iface.status === 'down';
+  const unzoned = interfaces.filter(iface => !isZoned(iface) && isL3(iface) && !isControlLink(iface)
+    && !isDown(iface) && iface.type !== 'tunnel' && !lagMemberNames.has(iface.name));
+  if (unzoned.length === 0) return;
+
+  // "any" is per-VDOM in FortiOS; with several VDOMs here we can't tell which one it means.
+  if (new Set(interfaces.map(iface => iface.vdom)).size > 1) {
+    warnings.push(createWarning('warning', 'zones',
+      `A policy or NAT rule uses interface "any" but interfaces span multiple VDOMs; left unzoned: ${unzoned.map(i => i.name).join(', ')}`,
+      'Assign these interfaces to zones manually'));
+    return;
+  }
+
+  for (const iface of unzoned) {
+    zoneMap[iface.name] = { name: iface.name, description: iface.alias || '', interfaces: [iface.name] };
+  }
 }
 
 
