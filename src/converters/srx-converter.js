@@ -38,6 +38,8 @@ import {
   planMergedJunosIdentifiers,
 } from '../security/junos-identifiers.js';
 import { canonicalizeJunosSecurityFeatures } from '../security/junos-identifier-catalog.js';
+import { mapInterfaceName } from './srx-interface-names.js';
+import { resolveLagInterfaces, lagDeviceCount, resolveLagMemberPort } from './srx-lag-mapping.js';
 import { validateSetOutput } from '../security/junos-output-validation.js';
 import { findPolicyReferenceIssues, findNegationIssues, findUnresolvedServiceGroups } from '../security/policy-reference-integrity.js';
 
@@ -85,7 +87,9 @@ export function convertToSrxSetCommands(config, interfaceMappings = {}, targetCo
   const targetContextPath = options.targetContextPath || 'targetContext.name';
   const commands = [];
   commands.push(setComment(versionStamp(options.llmModel), 'version'));
-  const warnings = [...identifiers.warnings];
+  const lagResolution = resolveLagInterfaces(config, interfaceMappings);
+  interfaceMappings = lagResolution.interfaceMappings;
+  const warnings = [...identifiers.warnings, ...lagResolution.warnings];
   const summary = {
     identifier_collisions_resolved: identifiers.collisionCount,
     zones_converted: 0,
@@ -135,7 +139,7 @@ export function convertToSrxSetCommands(config, interfaceMappings = {}, targetCo
   convertInterfaceAddresses(config.interfaces, commands, warnings, summary, interfaceMappings);
   convertRemoteAccessPlaceholders(config.interfaces, commands, interfaceMappings, config.global_protect);
   ensureZoneInterfaceFamilies(config.zones, config.interfaces, commands, interfaceMappings);
-  convertLagInterfaces(config.lag_interfaces, commands, warnings, summary, interfaceMappings);
+  convertLagInterfaces(lagResolution.lagInterfaces, commands, warnings, summary, interfaceMappings, !options.skipLagChassis);
   convertAddressObjects(config.address_objects, commands, warnings, summary, identifiers, identifierPath);
   // Detect source vendor for 1:1 passthrough (SRX→SRX needs no app mapping)
   const sourceVendor = config.metadata?.source_vendor || '';
@@ -325,6 +329,7 @@ export function convertToSrxSetCommands(config, interfaceMappings = {}, targetCo
 
     for (let i = 0; i < commands.length; i++) {
       const cmd = commands[i];
+      if (cmd.startsWith('set chassis aggregated-devices ')) continue;
       if (cmd.startsWith('set ')) {
         commands[i] = `set ${prefix} ${cmd.slice(4)}`;
       } else if (cmd.startsWith('deactivate ')) {
@@ -457,131 +462,6 @@ function pushHostInbound(commands, warnings, prefix, access, element) {
 }
 
 /**
- * Maps PAN-OS interface naming (ethernet1/1, ethernet1/1.100) to
- * SRX interface naming (ge-0/0/0, ge-0/0/0.100).
- *
- * This is a best-effort mapping — real deployments will need the user to
- * confirm interface assignments, which is handled in the interview phase.
- */
-function mapInterfaceName(panosIface, interfaceMappings = {}) {
-  // Check user-defined mappings first
-  if (interfaceMappings[panosIface]) {
-    const srx = interfaceMappings[panosIface];
-    // Append .0 unit if not already specified
-    return srx.includes('.') ? srx : `${srx}.0`;
-  }
-
-  // Strip VLAN unit for lookup, then re-add
-  const base = panosIface.split('.')[0];
-  const unit = panosIface.includes('.') ? panosIface.split('.')[1] : null;
-  if (interfaceMappings[base]) {
-    const srx = interfaceMappings[base];
-    const srxBase = srx.split('.')[0];
-    return `${srxBase}.${unit || '0'}`;
-  }
-
-  // Fallback: auto-map vendor interface naming to SRX ge-/xe- naming
-
-  // PAN-OS: ethernet1/2 → ge-0/0/1.0  (slot-1, port-1)
-  const panos = panosIface.match(/^ethernet(\d+)\/(\d+)(\.(\d+))?$/i);
-  if (panos) {
-    const slot = parseInt(panos[1]) - 1;
-    const port = parseInt(panos[2]) - 1;
-    const u = panos[4] || '0';
-    return `ge-0/${slot}/${port}.${u}`;
-  }
-
-  // FortiGate: port1 → ge-0/0/0.0  (N-1)
-  const forti = panosIface.match(/^port(\d+)(\.(\d+))?$/i);
-  if (forti) {
-    const port = parseInt(forti[1]) - 1;
-    const u = forti[3] || '0';
-    return `ge-0/0/${port}.${u}`;
-  }
-
-  // Check Point Gaia: eth0 → ge-0/0/0.0, bond0 passes through
-  const cpEth = panosIface.match(/^eth(\d+)(\.(\d+))?$/i);
-  if (cpEth) {
-    const port = parseInt(cpEth[1]);
-    const u = cpEth[3] || '0';
-    return `ge-0/0/${port}.${u}`;
-  }
-
-  // SonicWall: X0 → ge-0/0/0.0
-  const swX = panosIface.match(/^X(\d+)(\.(\d+))?$/i);
-  if (swX) {
-    const port = parseInt(swX[1]);
-    const u = swX[3] || '0';
-    return `ge-0/0/${port}.${u}`;
-  }
-
-  // Huawei: GigabitEthernet0/0/1 → ge-0/0/1.0
-  const hwGe = panosIface.match(/^GigabitEthernet(\d+)\/(\d+)\/(\d+)(\.(\d+))?$/i);
-  if (hwGe) {
-    const slot = parseInt(hwGe[2]);
-    const port = parseInt(hwGe[3]);
-    const u = hwGe[5] || '0';
-    return `ge-0/${slot}/${port}.${u}`;
-  }
-
-  // Huawei: XGigabitEthernet0/0/0 → xe-0/0/0.0
-  const hwXe = panosIface.match(/^XGigabitEthernet(\d+)\/(\d+)\/(\d+)(\.(\d+))?$/i);
-  if (hwXe) {
-    const slot = parseInt(hwXe[2]);
-    const port = parseInt(hwXe[3]);
-    const u = hwXe[5] || '0';
-    return `xe-0/${slot}/${port}.${u}`;
-  }
-
-  // Cisco ASA/IOS: GigabitEthernet1/1 (2-segment) → ge-0/0/0.0
-  const ciscoGe2 = panosIface.match(/^GigabitEthernet(\d+)\/(\d+)(\.(\d+))?$/i);
-  if (ciscoGe2) {
-    const slot = parseInt(ciscoGe2[1]);
-    const port = parseInt(ciscoGe2[2]);
-    const u = ciscoGe2[4] || '0';
-    return `ge-0/${slot}/${port}.${u}`;
-  }
-
-  // Cisco: TenGigabitEthernet1/1 → xe-0/1/1.0
-  const ciscoXe = panosIface.match(/^TenGigabitEthernet(\d+)\/(\d+)(\.(\d+))?$/i);
-  if (ciscoXe) {
-    const slot = parseInt(ciscoXe[1]);
-    const port = parseInt(ciscoXe[2]);
-    const u = ciscoXe[4] || '0';
-    return `xe-0/${slot}/${port}.${u}`;
-  }
-
-  // FortiGate named interfaces: internal/dmz/wan → ge-0/0/N.0
-  const fortiNamed = panosIface.match(/^(internal|dmz|wan|lan)(\d*)(\.(\d+))?$/i);
-  if (fortiNamed) {
-    const nameMap = { internal: 1, dmz: 2, wan: 3, lan: 4 };
-    const basePort = nameMap[fortiNamed[1].toLowerCase()] || 0;
-    const idx = fortiNamed[2] ? parseInt(fortiNamed[2]) : 0;
-    const u = fortiNamed[4] || '0';
-    return `ge-0/0/${basePort + idx}.${u}`;
-  }
-
-  // Cisco: Tunnel interfaces → st0.N
-  const tunnelMatch = panosIface.match(/^tunnel(\d+)(\.(\d+))?$/i);
-  if (tunnelMatch) {
-    const u = tunnelMatch[1] || '0';
-    return `st0.${u}`;
-  }
-
-  // Bug 1 fix: Map vendor "loopback" interfaces to SRX lo0 naming.
-  // Vendor configs use "loopback.X" but SRX expects "lo0.X". Without this,
-  // the zone references an undefined interface-range 'loopback.X'.
-  const loMatch = panosIface.match(/^loopback(\.(\d+))?$/i);
-  if (loMatch) {
-    const u = loMatch[2] || '0';
-    return `lo0.${u}`;
-  }
-
-  // If it doesn't match any known format, return as-is
-  return panosIface;
-}
-
-/**
  * Checks if an interface name is a valid SRX interface (not a leftover vendor name).
  * Valid SRX interfaces: ge-/xe-/et-/lo0/st0/irb/ae/fxp/em/reth/vlan/me
  */
@@ -638,10 +518,15 @@ function emitInterfaceAddress(commands, warnings, base, unit, ifKey, family, raw
     `Assign the interface ${label} address manually on the SRX`));
 }
 
+/** True when the interface has a static IPv4/IPv6 address or a DHCP client. */
+function hasInterfaceAddressing(iface) {
+  return Boolean(iface.ip || iface.ipv6 || iface.mode === 'dhcp');
+}
+
 function convertInterfaceAddresses(interfaces, commands, warnings, summary, interfaceMappings = {}) {
   if (!interfaces || interfaces.length === 0) return;
 
-  const hasAddresses = interfaces.some(i => i.ip || i.ipv6);
+  const hasAddresses = interfaces.some(hasInterfaceAddressing);
   if (!hasAddresses) return;
 
   commands.push('# =============================================');
@@ -653,7 +538,7 @@ function convertInterfaceAddresses(interfaces, commands, warnings, summary, inte
   const vlanByBase = new Map();       // base -> Map(unit -> tag)
   const baseHasNativeIp = new Map();  // base -> true when a unit-0 iface has an IP and no tag
   for (const iface of interfaces) {
-    if (!iface.ip && !iface.ipv6) continue;
+    if (!hasInterfaceAddressing(iface)) continue;
     const [base, unit = '0'] = mapInterfaceName(iface.name || '', interfaceMappings).split('.');
     const tag = iface.vlan ? String(iface.vlan) : '';
     if (tag) {
@@ -679,7 +564,7 @@ function convertInterfaceAddresses(interfaces, commands, warnings, summary, inte
 
   const configuredInterfaces = new Set();
   for (const iface of interfaces) {
-    if (!iface.ip && !iface.ipv6) continue;
+    if (!hasInterfaceAddressing(iface)) continue;
 
     const srxName = mapInterfaceName(iface.name || '', interfaceMappings);
     const [base, unit = '0'] = srxName.split('.');
@@ -698,7 +583,11 @@ function convertInterfaceAddresses(interfaces, commands, warnings, summary, inte
       commands.push(`set interfaces ${base} unit ${unit} vlan-id ${String(iface.vlan)}`);
     }
 
-    emitInterfaceAddress(commands, warnings, base, unit, ifKey, 'inet', iface.ip);
+    if (iface.mode === 'dhcp') {
+      commands.push(`set interfaces ${base} unit ${unit} family inet dhcp`);
+    } else {
+      emitInterfaceAddress(commands, warnings, base, unit, ifKey, 'inet', iface.ip);
+    }
     emitInterfaceAddress(commands, warnings, base, unit, ifKey, 'inet6', iface.ipv6);
     if (iface.description) {
       commands.push(`set interfaces ${base} unit ${unit} description ${setQuoted(iface.description, 'interfaces.description')}`);
@@ -809,24 +698,17 @@ function ensureZoneInterfaceFamilies(zones, interfaces, commands, interfaceMappi
  * @param {Object} summary - Summary counters
  * @param {Object} interfaceMappings - User-defined interface mappings
  */
-function convertLagInterfaces(lagInterfaces, commands, warnings, summary, interfaceMappings = {}) {
+function convertLagInterfaces(lagInterfaces, commands, warnings, summary, interfaceMappings = {}, emitDeviceCount = true) {
   if (!lagInterfaces || lagInterfaces.length === 0) return;
 
   commands.push('# =============================================');
   commands.push('# LAG / Aggregate Ethernet Interfaces');
   commands.push('# =============================================');
 
-  // Device count must accommodate the highest ae index
-  let maxAeIndex = 0;
-  for (const lag of lagInterfaces) {
-    const aeMatch = lag.name.match(/^ae(\d+)$/);
-    if (aeMatch) {
-      const idx = parseInt(aeMatch[1], 10);
-      if (idx >= maxAeIndex) maxAeIndex = idx + 1;
-    }
+  // Chassis config is root-level: the wrapping step leaves it unwrapped, and merged output emits it once.
+  if (emitDeviceCount) {
+    commands.push(`set chassis aggregated-devices ethernet device-count ${lagDeviceCount(lagInterfaces)}`);
   }
-
-  commands.push(`set chassis aggregated-devices ethernet device-count ${maxAeIndex}`);
 
   for (const lag of lagInterfaces) {
     const aeName = lag.name;
@@ -847,10 +729,8 @@ function convertLagInterfaces(lagInterfaces, commands, warnings, summary, interf
     }
 
     // Member interface bindings
-    for (const member of lag.members) {
-      // Apply interface mapping if available
-      const mappedMember = mapInterfaceName(member, interfaceMappings);
-      const memberBase = mappedMember.split('.')[0];
+    for (let memberIndex = 0; memberIndex < lag.members.length; memberIndex += 1) {
+      const memberBase = resolveLagMemberPort(lag, memberIndex, interfaceMappings);
       commands.push(`set interfaces ${memberBase} ether-options 802.3ad ${aeName}`);
     }
 
@@ -5068,6 +4948,12 @@ export function convertMergedToSrxSetCommands(configSlots, crossLsLinks = [], gl
     allCommands.push('');
   }
 
+  // Chassis aggregated-devices is root-level: emit it once for every slot's aggregates.
+  const mergedLags = configSlots.flatMap(slot => resolveLagInterfaces(slot.intermediateConfig, slot.interfaceMappings || {}).lagInterfaces);
+  if (mergedLags.length > 0) {
+    allCommands.push(`set chassis aggregated-devices ethernet device-count ${lagDeviceCount(mergedLags)}`);
+  }
+
   // 2. Per-LS sections
   for (let slotIndex = 0; slotIndex < configSlots.length; slotIndex += 1) {
     const slot = configSlots[slotIndex];
@@ -5084,6 +4970,7 @@ export function convertMergedToSrxSetCommands(configSlots, crossLsLinks = [], gl
       identifierPlan: identifiers,
       pathPrefix: `configSlots[${slotIndex}].intermediateConfig.`,
       targetContextPath: `configSlots[${slotIndex}].lsName`,
+      skipLagChassis: true,
     });
 
     allCommands.push(...result.commands);

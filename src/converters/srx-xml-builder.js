@@ -21,6 +21,7 @@ import {
   xmlText,
 } from '../security/junos-serialization.js';
 import { findNegationIssues, findPolicyReferenceIssues, findUnresolvedServiceGroups } from '../security/policy-reference-integrity.js';
+import { resolveLagInterfaces, lagDeviceCount, resolveLagMemberPort } from './srx-lag-mapping.js';
 import { validateJunosInput } from '../security/junos-input-validation.js';
 import { encodeJunosZonePair } from '../security/junos-identifier-identity.js';
 import {
@@ -65,7 +66,9 @@ export function buildSrxXml(config, interfaceMappings = {}, targetContext = null
       entry.definitionPath?.startsWith(`${identifierPath(localPath)}#generated:`)
     )),
   };
-  const warnings = [...identifiers.warnings];
+  const lagResolution = resolveLagInterfaces(config, interfaceMappings);
+  interfaceMappings = lagResolution.interfaceMappings;
+  const warnings = [...identifiers.warnings, ...lagResolution.warnings];
   const summary = {
     identifier_collisions_resolved: identifiers.collisionCount,
   };
@@ -115,6 +118,9 @@ export function buildSrxXml(config, interfaceMappings = {}, targetContext = null
     }
   }
 
+  // Chassis config is root-level: never inside a logical-system/tenant, and merged output emits it once.
+  if (!options.skipLagChassis) buildLagChassisXml(lagResolution.lagInterfaces, lines, '  ');
+
   // Open logical-system or tenant wrapper
   if (useContext) {
     const ctxTag = xmlElementName(
@@ -130,7 +136,7 @@ export function buildSrxXml(config, interfaceMappings = {}, targetContext = null
   buildSystemConfigXml(config.system_config, lines, indent);
 
   // Interface addresses (IPv4 + IPv6)
-  buildInterfaceAddressesXml(config.interfaces, lines, interfaceMappings, indent);
+  buildInterfaceAddressesXml(config.interfaces, lines, interfaceMappings, indent, lagResolution.lagInterfaces);
 
   // Security section
   lines.push(`${indent}<security>`);
@@ -3279,11 +3285,37 @@ function buildFlowMonitoringXml(flowConfig, lines, identifierNames) {
 // System Configuration (Day-0)
 // ---------------------------------------------------------------------------
 
-function buildInterfaceAddressesXml(interfaces, lines, interfaceMappings = {}, indent = '  ') {
-  if (!interfaces || interfaces.length === 0) return;
+/** Mirrors the set converter: chassis aggregated-devices ethernet device-count = highest aeN + 1. */
+function buildLagChassisXml(lagInterfaces, lines, indent = '  ') {
+  if (!lagInterfaces || lagInterfaces.length === 0) return;
+  const deviceCount = lagDeviceCount(lagInterfaces);
+  lines.push(`${indent}<chassis><aggregated-devices><ethernet><device-count>${deviceCount}</device-count></ethernet></aggregated-devices></chassis>`);
+}
 
-  const withAddrs = interfaces.filter(i => i.ip || i.ipv6);
-  if (withAddrs.length === 0) return;
+/** One <interface> per ae (LACP, description) and per member port (bundle binding). */
+function buildLagInterfacesXml(lagInterfaces, lines, interfaceMappings, indent) {
+  for (const lag of lagInterfaces || []) {
+    lines.push(`${indent}  <interface>`);
+    lines.push(`${indent}    <name>${xmlText(lag.name)}</name>`);
+    if (lag.description) lines.push(`${indent}    <description>${xmlText(lag.description)}</description>`);
+    const lacp = [];
+    if (lag.lacp_mode === 'active' || lag.lacp_mode === 'passive') lacp.push(`<${lag.lacp_mode}/>`);
+    if (lag.lacp_priority) lacp.push(`<system-priority>${xmlText(String(lag.lacp_priority))}</system-priority>`);
+    if (lacp.length > 0) lines.push(`${indent}    <aggregated-ether-options><lacp>${lacp.join('')}</lacp></aggregated-ether-options>`);
+    lines.push(`${indent}  </interface>`);
+    for (let memberIndex = 0; memberIndex < lag.members.length; memberIndex += 1) {
+      const memberBase = resolveLagMemberPort(lag, memberIndex, interfaceMappings);
+      lines.push(`${indent}  <interface>`);
+      lines.push(`${indent}    <name>${xmlText(memberBase)}</name>`);
+      lines.push(`${indent}    <ether-options><ieee-802.3ad><bundle>${xmlText(lag.name)}</bundle></ieee-802.3ad></ether-options>`);
+      lines.push(`${indent}  </interface>`);
+    }
+  }
+}
+
+function buildInterfaceAddressesXml(interfaces, lines, interfaceMappings = {}, indent = '  ', lagInterfaces = []) {
+  const withAddrs = (interfaces || []).filter(i => i.ip || i.ipv6 || i.mode === 'dhcp');
+  if (withAddrs.length === 0 && lagInterfaces.length === 0) return;
 
   lines.push(`${indent}<!-- Interface Addresses -->`);
   lines.push(`${indent}<interfaces>`);
@@ -3310,28 +3342,28 @@ function buildInterfaceAddressesXml(interfaces, lines, interfaceMappings = {}, i
     if (iface.description) {
       lines.push(`${indent}      <description>${xmlText(iface.description)}</description>`);
     }
-    if (iface.ip) {
+    const inetBody = iface.mode === 'dhcp'
+      ? `${indent}          <dhcp/>`
+      : iface.ip ? `${indent}          <address><name>${xmlText(iface.ip)}</name></address>` : '';
+    if (inetBody || iface.ipv6) {
       lines.push(`${indent}      <family>`);
-      lines.push(`${indent}        <inet>`);
-      lines.push(`${indent}          <address><name>${xmlText(iface.ip)}</name></address>`);
-      lines.push(`${indent}        </inet>`);
+      if (inetBody) {
+        lines.push(`${indent}        <inet>`);
+        lines.push(inetBody);
+        lines.push(`${indent}        </inet>`);
+      }
       if (iface.ipv6) {
         lines.push(`${indent}        <inet6>`);
         lines.push(`${indent}          <address><name>${xmlText(iface.ipv6)}</name></address>`);
         lines.push(`${indent}        </inet6>`);
       }
       lines.push(`${indent}      </family>`);
-    } else if (iface.ipv6) {
-      lines.push(`${indent}      <family>`);
-      lines.push(`${indent}        <inet6>`);
-      lines.push(`${indent}          <address><name>${xmlText(iface.ipv6)}</name></address>`);
-      lines.push(`${indent}        </inet6>`);
-      lines.push(`${indent}      </family>`);
     }
     lines.push(`${indent}    </unit>`);
     lines.push(`${indent}  </interface>`);
   }
 
+  buildLagInterfacesXml(lagInterfaces, lines, interfaceMappings, indent);
   lines.push(`${indent}</interfaces>`);
 }
 
@@ -3448,6 +3480,8 @@ export function buildMergedSrxXml(configSlots, crossLsLinks = [], globalConfig =
   ));
 
   buildHaXml(globalConfig.ha_config, allLines);
+  const mergedLags = configSlots.flatMap(slot => resolveLagInterfaces(slot.intermediateConfig, slot.interfaceMappings || {}).lagInterfaces);
+  buildLagChassisXml(mergedLags, allLines, '  ');
   buildSyslogXml(globalConfig.syslog_config, allLines);
   buildSnmpXml(globalConfig.snmp_config, allLines, globalIdentifierNames);
   buildAaaXml(globalConfig.aaa_config, allLines, globalIdentifierNames);
@@ -3463,6 +3497,7 @@ export function buildMergedSrxXml(configSlots, crossLsLinks = [], globalConfig =
       ctx,
       {
         omitConfigurationWrapper: true,
+        skipLagChassis: true,
         identifierPlan: identifiers,
         pathPrefix: `configSlots[${slotIndex}].intermediateConfig.`,
         targetContextPath: `configSlots[${slotIndex}].lsName`,

@@ -127,6 +127,8 @@ export function parseFortigateConfig(configText) {
     return {
       name: iface.name,
       ip,
+      ipv6: iface.hasIpv6Address ? iface.ipv6 : '',
+      mode: iface.mode === 'dhcp' || iface.mode === 'pppoe' ? iface.mode : '',
       zone: ifToZone[iface.name] || iface.zone || '',
       vlan: '',
       type: iface.type || 'physical',
@@ -1501,12 +1503,18 @@ function parseInterfaces(tree, warnings) {
         `allowaccess ${unmapped.join(', ')} on interface ${name} has no SRX host-inbound-traffic equivalent and was dropped`,
         'Configure equivalent management access on the SRX manually if needed'));
     }
+    if (mode === 'pppoe') {
+      warnings.push(createWarning('warning', `interfaces/${name}`,
+        `Interface ${name} uses PPPoE; FortiGate credentials are encrypted and cannot be converted, so no pp0 interface was generated`,
+        'Configure a pp0 PPPoE interface (username/password, underlying-interface) manually on the SRX'));
+    }
     interfaces.push({
       name,
       allowaccess: allowaccess.filter(token => ALLOWACCESS_TO_SRX_SERVICE[token]).map(token => ALLOWACCESS_TO_SRX_SERVICE[token]),
       alias: getString(entry['alias']) || '',
       ip: ipv4,
       ipv6,
+      hasIpv6Address: ipv6 !== '' && !/^::(\/0)?$/.test(ipv6),
       type: getString(entry['type']) || 'physical',
       vdom: getString(entry['vdom']) || 'root',
       mode,
@@ -1578,7 +1586,9 @@ function mergeZonesAndInterfaces(zones, interfaces, policies, natRules = [], lag
       const iface = interfaces.find(candidate => candidate.name === ifaceName);
       if (!iface) continue;
       zone.interface_host_inbound_traffic ??= {};
-      zone.interface_host_inbound_traffic[ifaceName] = { system_services: [...iface.allowaccess], protocols: [] };
+      // The SRX only accepts DHCP replies on an interface whose host-inbound allows dhcp.
+      const services = iface.mode === 'dhcp' ? [...new Set([...iface.allowaccess, 'dhcp'])] : [...iface.allowaccess];
+      zone.interface_host_inbound_traffic[ifaceName] = { system_services: services, protocols: [] };
     }
   }
   const unzonedAccess = interfaces.filter(iface => iface.allowaccess.length > 0 && !zonedInterfaces.has(iface.name));

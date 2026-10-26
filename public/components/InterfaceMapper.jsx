@@ -152,17 +152,7 @@ export default function InterfaceMapper({
   // Initialize mappings from existing or build fresh
   const [mappings, setMappings] = useState(() => {
     if (existingMappings && Object.keys(existingMappings).length > 0) {
-      // Filter out stale mappings that reference ports not on the current target model
-      const validPortNames = targetModelData ? new Set(targetModelData.ports.map(p => p.name)) : null;
-      const cleaned = {};
-      for (const [panos, srx] of Object.entries(existingMappings)) {
-        if (isTunnelInterface(panos) || isLoopbackInterface(panos)) {
-          cleaned[panos] = srx; // virtual interfaces are always valid
-        } else if (!validPortNames || validPortNames.has(srx)) {
-          cleaned[panos] = srx;
-        }
-        // else: stale mapping from a different model — drop it
-      }
+      const cleaned = cleanMappings(existingMappings, targetModelData);
       if (Object.keys(cleaned).length > 0) {
         return cleaned;
       }
@@ -394,16 +384,7 @@ export default function InterfaceMapper({
     const tpl = templates[key];
     if (!tpl) return;
 
-    // Apply mappings, filtering out stale port references
-    const validPortNames = targetModelData ? new Set(targetModelData.ports.map(p => p.name)) : null;
-    const cleaned = {};
-    for (const [src, dst] of Object.entries(tpl.mappings || {})) {
-      if (isTunnelInterface(src) || isLoopbackInterface(src)) {
-        cleaned[src] = dst;
-      } else if (!validPortNames || validPortNames.has(dst)) {
-        cleaned[src] = dst;
-      }
-    }
+    const cleaned = cleanMappings(tpl.mappings, targetModelData);
     setMappings(cleaned);
     if (tpl.tunnelTypes) setTunnelTypes(tpl.tunnelTypes);
     if (tpl.tunnelUnits) setTunnelUnits(tpl.tunnelUnits);
@@ -805,6 +786,26 @@ export default function InterfaceMapper({
 }
 
 /**
+ * Drops stale mappings that point at ports not on the target model. Virtual
+ * interfaces (tunnels, loopbacks) and aeN targets (generated or user-chosen
+ * aggregate names) are always kept.
+ * @param {{ [source: string]: string }} mappings
+ * @param {object} targetModelData - { ports: [{ name }] }
+ * @returns {{ [source: string]: string }}
+ */
+export function cleanMappings(mappings, targetModelData) {
+  const validPortNames = targetModelData ? new Set(targetModelData.ports.map(p => p.name)) : null;
+  const cleaned = {};
+  for (const [source, target] of Object.entries(mappings || {})) {
+    if (isTunnelInterface(source) || isLoopbackInterface(source) || /^ae\d+(\.\d+)?$/.test(target)
+      || !validPortNames || validPortNames.has(target)) {
+      cleaned[source] = target;
+    }
+  }
+  return cleaned;
+}
+
+/**
  * Build default PAN-OS→SRX interface mappings. Parents and tunnels/loopbacks
  * get their own target; sub-interfaces map to a unit on their parent's port.
  * @param {object} intermediateConfig
@@ -815,11 +816,16 @@ export function buildDefaultMappings(intermediateConfig, targetModelData) {
   const mappings = {};
   const availablePorts = targetModelData ? [...targetModelData.ports] : [];
   const usedPorts = new Set();
+  // LAG parents (and their units, e.g. PAN-OS ae1.100) map to the generated aeN, never a physical port.
+  const lagBySource = new Map((intermediateConfig?.lag_interfaces || []).map(lag => [lag.source_name || lag.name, lag.name]));
 
   // Pass 1: tunnels, loopbacks, and parent physical interfaces.
   for (const zone of (intermediateConfig?.zones || [])) {
     for (const iface of (zone.interfaces || [])) {
-      if (isTunnelInterface(iface)) {
+      const [ifaceBase, ...unitParts] = iface.split('.');
+      if (lagBySource.has(ifaceBase)) {
+        mappings[iface] = unitParts.length > 0 ? `${lagBySource.get(ifaceBase)}.${unitParts.join('.')}` : lagBySource.get(ifaceBase);
+      } else if (isTunnelInterface(iface)) {
         mappings[iface] = `st0.${getUnit(iface)}`;
       } else if (isLoopbackInterface(iface)) {
         mappings[iface] = `lo0.${getUnit(iface)}`;
@@ -832,6 +838,17 @@ export function buildDefaultMappings(intermediateConfig, targetModelData) {
           usedPorts.add(port.name);
         }
       }
+    }
+  }
+
+  // LAG members take free physical ports so the UI shows (and the converters bundle) them.
+  for (const lag of (intermediateConfig?.lag_interfaces || [])) {
+    for (const member of (lag.source_members || [])) {
+      if (mappings[member]) continue;
+      const port = availablePorts.find(p => !usedPorts.has(p.name));
+      if (!port) continue;
+      mappings[member] = port.name;
+      usedPorts.add(port.name);
     }
   }
 

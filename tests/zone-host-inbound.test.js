@@ -168,7 +168,7 @@ config firewall policy
 end
 `);
     const access = Object.assign({}, ...intermediateConfig.zones.map(zone => zone.interface_host_inbound_traffic || {}));
-    expect(access.wan1.system_services).toEqual(['ping']);
+    expect(access.wan1.system_services).toEqual(['ping', 'dhcp']);
     expect(warnings.some(w => /wan1: allowaccess/.test(w.message))).toBe(false);
     expect(warnings.some(w => /local-in-policy restricts management access/.test(w.message))).toBe(true);
   });
