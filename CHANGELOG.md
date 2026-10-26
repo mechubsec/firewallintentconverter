@@ -2,6 +2,82 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.3.0] - 2026-10-26
+
+Conversion-fidelity release. Several fixes change generated policy and NAT
+behaviour; review the **Security** section before re-exporting configurations
+made with 1.2.x.
+
+### Security
+- Policies with `application any` next to specific services (PAN-OS
+  `application any` + `service-https`, AWS SG, Azure NSG, GCP) converted to
+  `match application any`, permitting every port. The services now define the
+  match (#163).
+- GCP, AWS SG and Azure NSG allow rules converted to `then deny` (the parsers
+  emitted a non-schema action value) (#154).
+- Output ends in `security policies default-policy deny-all` in set and XML
+  (#139).
+- Zones no longer get a blanket `host-inbound-traffic system-services ping`.
+  Host-inbound access is converted per zone and interface from the source:
+  FortiGate `allowaccess`/`ip6-allowaccess`, PAN-OS interface management
+  profiles, ASA `ssh`/`http`/`telnet`/`icmp`, Huawei `service-manage`, SRX
+  passthrough. Source-restricted management access (ASA source lines, PAN-OS
+  `permitted-ip`, Huawei ACLs, ASA control-plane ACLs, FortiGate local-in deny
+  policies) fails closed with a warning, since host-inbound cannot restrict
+  sources (#138, #156).
+- Undefined services whose name matches another vendor's built-in (e.g. a
+  FortiGate `web-browsing`) no longer become that built-in; built-in detection
+  is scoped to the source vendor (#152).
+- Analysis: shadow, redundancy, merge and consolidation checks respect
+  negated addresses, so "everything except X" is no longer reported as
+  equal to X (#124).
+
+### Added
+- SRX `system services` (ssh, web-management https/http, netconf, custom
+  ports) generated from converted management access (#156).
+- One-way static NAT (PAN-OS `bi-directional no`, ASA `unidirectional`) as a
+  `port no-translation` source pool with `host-address-base` for subnets
+  (#149).
+- Check Point static NAT: automatic pairs collapse into Junos static NAT;
+  lone rows convert one-way (#148).
+- FortiGate policy NAT in config order with `source-nat off` exemptions,
+  protocol/port matches, and ippool modes (`port no-translation`,
+  `block-allocation`, `deterministic`) (#115).
+- Interface-scoped destination NAT rule-sets (`from interface`) for
+  FortiGate VIPs (#106).
+- Terraform export emits the global address book as
+  `junos_security_address_book` (#129).
+- GCP implied allow-egress and deny-ingress rules (#154).
+- PAN-OS and ASA static NAT with `from zone` and proxy ARP (#136, #146, #147);
+  proxy ARP for NAT addresses on connected subnets (#135).
+
+### Fixed
+- FortiGate interfaces: aggregates map to `aeN` everywhere (and the XML
+  creates the LAG), DHCP interfaces get `family inet dhcp`, IPv6 addresses
+  are kept (#132).
+- FortiGate: policies and NAT in config order (#126), source NAT for
+  `nat enable` (#120), VIP/vipgrp destinations resolved (#119), multi-range
+  services (#118), every L3 interface zoned when a rule uses `any` (#133),
+  sctp/icmp port-forward VIPs skipped instead of aborting (#113), masks kept
+  and VIP NAT scoped to its ingress zone (#102).
+- One NAT plan shared by set and XML output (#134); NAT warnings carry a real
+  severity (#140); range match addresses expand to covering prefixes (#112).
+- Negated source/destination addresses honoured (#117); SRX parser reads
+  address-excluded and deactivated policies (#130); XML deactivates disabled,
+  unmapped-application and undefined-reference policies (#128).
+- Huawei `action no-nat` kept as source NAT off (#137); ASA twice NAT and NAT
+  exemptions (#147).
+- GRE maps to the predefined `junos-gre` application (#153).
+- Terraform export: policies per zone pair, negation kept (#131).
+- Zone editor host-inbound checkboxes bound to the zone's access data (#157).
+
+### Changed
+- pyez-bridge: all-or-nothing load and same-session commit; the candidate is
+  locked before `/confirm` and `/rollback` commit it (#81, #83, #84).
+- Local-only LLM mode enforced at the network boundary, with CSP and consent
+  fixes (#79).
+- Dependencies: vite 8.3.5, vitest 4.1.12, source-map-js 1.2.2.
+
 ## [1.2.2] - 2026-08-26
 
 Supply-chain and CI only. No behaviour change in the converter itself; the
