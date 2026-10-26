@@ -759,7 +759,7 @@ function buildNatXml(config, lines, warnings, identifierNames, interfaceMappings
         matchElements('              ', 'source-address', rule.match.source);
         matchElements('              ', 'destination-address', rule.match.destination);
         if (rule.match.protocol) lines.push(`              <protocol>${xmlText(rule.match.protocol)}</protocol>`);
-        if (rule.match.destinationPort) lines.push(portElement('              ', rule.match.destinationPort));
+        for (const port of rule.match.destinationPorts) lines.push(portElement('              ', port));
         lines.push('            </src-nat-rule-match>');
         comments('            ', rule.thenComments);
         lines.push('            <then>');
@@ -786,6 +786,12 @@ function buildNatXml(config, lines, warnings, identifierNames, interfaceMappings
       }
       if (pool.hostAddressBase) lines.push(`          <host-address-base>${xmlText(pool.hostAddressBase)}</host-address-base>`);
       if (pool.noPortTranslation) lines.push('          <port><no-translation/></port>');
+      if (pool.deterministic) lines.push(`          <port><deterministic><host><address>${xmlText(pool.deterministic.hostAddress)}</address></host></deterministic></port>`);
+      if (pool.blockAllocation) {
+        const { blockSize, maximumBlocksPerHost } = pool.blockAllocation;
+        const children = `${blockSize ? `<block-size>${xmlText(blockSize)}</block-size>` : ''}${maximumBlocksPerHost ? `<maximum-blocks-per-host>${xmlText(maximumBlocksPerHost)}</maximum-blocks-per-host>` : ''}`;
+        lines.push(`          <port><block-allocation${children ? `>${children}</block-allocation>` : '/>'}</port>`);
+      }
       lines.push('        </pool>');
     }
     lines.push('      </source>');

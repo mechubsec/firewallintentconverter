@@ -2268,7 +2268,7 @@ function convertNatRules(
       commands.push(...matchLines(rulePath, 'source-address', rule.match.source));
       commands.push(...matchLines(rulePath, 'destination-address', rule.match.destination));
       if (rule.match.protocol) commands.push(`set ${rulePath} match protocol ${rule.match.protocol}`);
-      if (rule.match.destinationPort) commands.push(`set ${rulePath} match destination-port ${portText(rule.match.destinationPort)}`);
+      for (const port of rule.match.destinationPorts) commands.push(`set ${rulePath} match destination-port ${portText(port)}`);
       rule.thenComments.forEach(comment);
       const persistent = rule.persistent ? ' persistent-nat permit target-host' : '';
       if (rule.then.kind === 'pool') {
@@ -2277,6 +2277,15 @@ function convertNatRules(
         }
         if (rule.then.pool.hostAddressBase) commands.push(`set security nat source pool ${rule.then.pool.name} host-address-base ${rule.then.pool.hostAddressBase}`);
         if (rule.then.pool.noPortTranslation) commands.push(`set security nat source pool ${rule.then.pool.name} port no-translation`);
+        if (rule.then.pool.deterministic) commands.push(`set security nat source pool ${rule.then.pool.name} port deterministic host address ${rule.then.pool.deterministic.hostAddress}`);
+        if (rule.then.pool.blockAllocation) {
+          const { blockSize, maximumBlocksPerHost } = rule.then.pool.blockAllocation;
+          const blockPath = `set security nat source pool ${rule.then.pool.name} port block-allocation`;
+          // One command per leaf; a bare block-allocation when neither is set.
+          if (!blockSize && !maximumBlocksPerHost) commands.push(blockPath);
+          if (blockSize) commands.push(`${blockPath} block-size ${blockSize}`);
+          if (maximumBlocksPerHost) commands.push(`${blockPath} maximum-blocks-per-host ${maximumBlocksPerHost}`);
+        }
         commands.push(`set ${rulePath} then source-nat pool ${rule.then.pool.name}${persistent}`);
       } else if (rule.then.kind === 'off') {
         commands.push(`set ${rulePath} then source-nat off`);

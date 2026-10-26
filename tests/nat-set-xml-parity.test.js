@@ -54,12 +54,21 @@ function normalizeSet(commands) {
     }
     match = line.match(/^set security nat (source|destination) pool (\S+) address port (\S+)$/);
     if (match) {
-      (shape.pools[match[2]] ||= { addresses: [], port: null }).port = match[3];
+      (shape.pools[match[2]] ||= { addresses: [], port: null, flags: [] }).port = match[3];
+      continue;
+    }
+    match = line.match(/^set security nat source pool (\S+) ((?:port|host-address-base) .+)$/);
+    if (match) {
+      const { flags } = (shape.pools[match[1]] ||= { addresses: [], port: null, flags: [] });
+      // Block allocation leaves are separate set commands but one XML element.
+      const blockIndex = flags.findIndex(flag => flag.startsWith('port block-allocation'));
+      if (match[2].startsWith('port block-allocation ') && blockIndex >= 0) flags[blockIndex] += match[2].slice('port block-allocation'.length);
+      else flags.push(match[2]);
       continue;
     }
     match = line.match(/^set security nat (source|destination) pool (\S+) address (.+)$/);
     if (match) {
-      addUnique((shape.pools[match[2]] ||= { addresses: [], port: null }).addresses, match[3]);
+      addUnique((shape.pools[match[2]] ||= { addresses: [], port: null, flags: [] }).addresses, match[3]);
       continue;
     }
     match = line.match(/^set security nat (source|destination|static) rule-set (\S+) (from|to) zone (\S+)$/);
@@ -80,7 +89,7 @@ function normalizeSet(commands) {
     if (section === 'match') {
       const [field, value] = [rest.split(' ')[0], rest.split(' ').slice(1).join(' ')];
       if (field === 'protocol') rule.protocol = value;
-      else if (field === 'destination-port') rule.port = value;
+      else if (field === 'destination-port') rule.port = rule.port ? `${rule.port},${value}` : value;
       else if (field.endsWith('-name')) rule[field.replace('-address-name', '')].push(`name:${value}`);
       else rule[field.replace('-address', '')].push(`prefix:${value}`);
     } else if (rest === 'source-nat interface') rule.then = 'interface';
@@ -147,7 +156,7 @@ function normalizeXml(xml) {
       if (node.tag === '#comment') {
         if (COMMENT_PREFIX.test(node.text)) shape.comments.push(node.text);
       } else if (node.tag === 'pool') {
-        const pool = { addresses: [], port: null };
+        const pool = { addresses: [], port: null, flags: [] };
         for (const address of childrenOf(node, 'address')) {
           if (child(address, 'ipaddr')) {
             pool.addresses.push(child(address, 'ipaddr').text);
@@ -156,6 +165,13 @@ function normalizeXml(xml) {
             const to = child(address, 'to');
             pool.addresses.push(to ? `${child(address, 'name').text} to ${child(to, 'ipaddr').text}` : child(address, 'name').text);
           }
+        }
+        if (child(node, 'host-address-base')) pool.flags.push(`host-address-base ${child(node, 'host-address-base').text}`);
+        const portNode = child(node, 'port');
+        for (const mode of portNode?.children || []) {
+          const hostAddress = child(child(mode, 'host') || { children: [] }, 'address');
+          const options = hostAddress ? ` host address ${hostAddress.text}` : mode.children.map(option => ` ${option.tag} ${option.text}`).join('');
+          pool.flags.push(`port ${mode.tag}${options}`);
         }
         shape.pools[child(node, 'name').text] = pool;
       } else if (node.tag === 'rule-set') {
@@ -185,7 +201,8 @@ function normalizeXmlRule(ruleSet, node, shape) {
     if (field.tag === 'protocol') rule.protocol = field.text;
     else if (field.tag === 'destination-port') {
       const high = child(field, 'to') && child(child(field, 'to'), 'high').text;
-      rule.port = high ? `${child(field, 'name').text} to ${high}` : child(field, 'name').text;
+      const port = high ? `${child(field, 'name').text} to ${high}` : child(field, 'name').text;
+      rule.port = rule.port ? `${rule.port},${port}` : port;
     }
     else if (child(field, 'dst-addr')) rule.destination.push(`prefix:${child(field, 'dst-addr').text}`);
     else if (child(field, 'dst-addr-name')) rule.destination.push(`name:${child(field, 'dst-addr-name').text}`);
@@ -248,6 +265,108 @@ config firewall central-snat-map
         set orig-addr "lan-net"
         set dst-addr "all"
         set nat-ippool "pool1"
+    next
+end
+`;
+
+const FORTIGATE_POLICY_NAT = `config system interface
+    edit "port1"
+        set ip 203.0.113.2 255.255.255.248
+    next
+    edit "port2"
+        set ip 192.168.10.1 255.255.255.0
+    next
+end
+config firewall address
+    edit "lan-net"
+        set subnet 192.168.10.0 255.255.255.0
+    next
+    edit "srv"
+        set subnet 192.168.10.50 255.255.255.255
+    next
+end
+config firewall service custom
+    edit "web-alt"
+        set tcp-portrange 8080-8090 9000
+    next
+end
+config firewall ippool
+    edit "pba"
+        set type port-block-allocation
+        set startip 203.0.113.10
+        set endip 203.0.113.20
+        set block-size 256
+        set num-blocks-per-user 4
+    next
+    edit "fpr"
+        set type fixed-port-range
+        set startip 203.0.113.30
+        set endip 203.0.113.40
+        set source-startip 192.168.10.0
+        set source-endip 192.168.10.255
+    next
+    edit "o2o"
+        set type one-to-one
+        set startip 203.0.113.50
+        set endip 203.0.113.60
+    next
+end
+config firewall policy
+    edit 1
+        set name "srv-direct"
+        set srcintf "port2"
+        set dstintf "port1"
+        set srcaddr "srv"
+        set dstaddr "all"
+        set action accept
+        set service "HTTPS"
+    next
+    edit 2
+        set name "web-nat"
+        set srcintf "port2"
+        set dstintf "port1"
+        set srcaddr "lan-net"
+        set dstaddr "all"
+        set action accept
+        set service "web-alt"
+        set nat enable
+    next
+    edit 3
+        set name "pba-nat"
+        set srcintf "port2"
+        set dstintf "port1"
+        set srcaddr "lan-net"
+        set dstaddr "all"
+        set action accept
+        set service "ALL"
+        set nat enable
+        set ippool enable
+        set poolname "pba"
+    next
+    edit 4
+        set name "fpr-nat"
+        set srcintf "port2"
+        set dstintf "port1"
+        set srcaddr "lan-net"
+        set dstaddr "all"
+        set action accept
+        set service "ALL"
+        set nat enable
+        set ippool enable
+        set poolname "fpr"
+    next
+    edit 5
+        set name "o2o-fixed"
+        set srcintf "port2"
+        set dstintf "port1"
+        set srcaddr "lan-net"
+        set dstaddr "all"
+        set action accept
+        set service "ALL"
+        set nat enable
+        set ippool enable
+        set poolname "o2o"
+        set fixedport enable
     next
 end
 `;
@@ -435,6 +554,7 @@ const CASES = {
     translated_src: { type: 'interface' },
   }]),
   'IPv6 any address': () => handBuilt([sourceRule({ src_addresses: undefined, dst_addresses: ['2001:db8::/64'] })]),
+  'FortiGate ordered policy NAT, services and pool modes (#115)': () => parseFortigateConfig(FORTIGATE_POLICY_NAT).intermediateConfig,
   'PAN-OS NAT': () => parsePanosConfig(PANOS_NAT).intermediateConfig,
   'Cisco ASA NAT': () => parseCiscoAsaConfig(ASA_NAT).intermediateConfig,
   'SRX source-nat off exemption before interface NAT': () => parseSrxConfig(SRX_NO_NAT).intermediateConfig,

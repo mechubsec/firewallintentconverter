@@ -155,11 +155,13 @@ const oneLine = value => String(value).replace(/[\r\n]+/g, ' ');
  * - source / destination / static: rule-set arrays, or null when no rule has that type
  * - rule-set: { type, name, fromZones, toZones, fromInterfaces?, comments, skipped, rules }
  *   (a destination rule-set has fromInterfaces instead of fromZones when its VIP interface shares a zone)
- * - rule: { name, comments, skipped, match: { source, destination, protocol, destinationPort },
+ * - rule: { name, comments, skipped, match: { source, destination, protocol, destinationPort | destinationPorts },
  *           then, persistent }; match entries are { kind: 'prefix' | 'address-name', value };
- *           destinationPort is { name, high? } ("high" for a start-end range);
+ *           destinationPort is { name, high? } ("high" for a start-end range); source rules
+ *           carry destinationPorts, an array of those (Junos takes several per rule);
  *           destination and static rules keep one destination entry (Junos takes one)
- * - then: { kind: 'interface' } | { kind: 'off' } | { kind: 'pool', pool: { name, addresses: [{ prefix, to? }], noPortTranslation?, hostAddressBase? } }
+ * - then: { kind: 'interface' } | { kind: 'off' } | { kind: 'pool', pool: { name, addresses: [{ prefix, to? }], noPortTranslation?, hostAddressBase?,
+ *         blockAllocation?: { blockSize?, maximumBlocksPerHost? }, deterministic?: { hostAddress } } }
  *       | { kind: 'destination-pool', pool: { name, prefix, port } } | { kind: 'static-prefix', prefix }
  * - comments are plain text; the emitters add their own comment syntax
  * - proxyArp: [{ interface, address, to? }] host addresses and ranges (/32 forms) the SRX must
@@ -406,6 +408,12 @@ export function planNat({
     const range = port.match(/^(\d+)-(\d+)$/);  // njsscan-ignore: regex_dos
     return range ? { name: range[1], high: range[2] } : { name: port };
   };
+  // A source rule may list several ports ("match_ports"); a single "match_port" stays one entry.
+  const planPorts = rule => (
+    Array.isArray(rule.match_ports)
+      ? rule.match_ports.map(port => planPort({ match_port: port })).filter(Boolean)
+      : [planPort(rule)].filter(Boolean)
+  );
   // Junos takes one destination address per DNAT/static rule; later ones would silently replace it.
   const firstDestination = (type, ruleName, entries, anyAddress) => {
     if (entries.length <= 1) return entries;
@@ -440,6 +448,29 @@ export function planNat({
     return isHost ? {} : { hostAddressBase: privatePrefix };
   };
 
+  // Pool port behaviour: one pool per rule, so the flags are plain properties both emitters render.
+  const applyPoolMode = (pool, translated, rule) => {
+    if (translated.no_port_translation || translated.pool_mode === 'no-translation') {
+      pool.noPortTranslation = true;
+    } else if (translated.pool_mode === 'block-allocation') {
+      pool.blockAllocation = {
+        ...(translated.block_size ? { blockSize: translated.block_size } : {}),
+        ...(translated.max_blocks_per_host ? { maximumBlocksPerHost: translated.max_blocks_per_host } : {}),
+      };
+    } else if (translated.pool_mode === 'deterministic') {
+      // Deterministic NAT maps a fixed inside range, so it needs that range as one prefix.
+      const range = String(translated.source_range || '').match(IPV4_RANGE);
+      const prefixes = range ? ipv4RangeToPrefixes(range[1], range[2]) : null;
+      if (prefixes?.length === 1) {
+        pool.deterministic = { hostAddress: prefixes[0] };
+      } else {
+        warnings.push(createWarning('warning', `nat/source/${rule.name}`,
+          `Source NAT rule "${oneLine(rule.name)}" uses a fixed-port-range pool whose source range "${oneLine(translated.source_range)}" is not one prefix — converted as a default Junos PAT pool`,
+          'Build the deterministic NAT pool manually (port deterministic host address)'));
+      }
+    }
+  };
+
   const planSourceThen = (ruleIndex, rule, comments, sourceEntries) => {
     const translated = rule.translated_src;
     const interfaceThen = { kind: 'interface' };
@@ -472,7 +503,9 @@ export function planNat({
         // A pool range the source disabled ARP replies for is left to the user's own ARP setup.
         const arpDisabled = translated.arp_reply_disabled || [];
         if (rule.arp_reply !== false) addProxyCandidates(addresses.filter((_, index) => !arpDisabled.includes(translated.addresses[index])), natDestinationZones(rule));
-        return { kind: 'pool', pool: { name: poolName, addresses } };
+        const pool = { name: poolName, addresses };
+        applyPoolMode(pool, translated, rule);
+        return { kind: 'pool', pool };
       }
       // Can't resolve pool addresses (e.g. Check Point hide NAT using a gateway name)
       comments.push('NAT pool address could not be resolved — using interface NAT');
@@ -558,7 +591,7 @@ export function planNat({
           source: source.entries,
           destination: destination.entries,
           protocol: planProtocol(rule),
-          destinationPort: planPort(rule),
+          destinationPorts: planPorts(rule),
         };
         planned.then = planSourceThen(ruleIndex, rule, planned.thenComments, source.entries);
         if (planned.then.kind === 'skip') {

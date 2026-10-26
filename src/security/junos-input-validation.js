@@ -353,10 +353,14 @@ function validateNat(rules, basePath) {
     const rulePath = `${basePath}[${index}]`;
     if (rule.match_port) validatePortExpression(rule.match_port, `${rulePath}.match_port`);
     if (rule.translated_port) validatePortExpression(rule.translated_port, `${rulePath}.translated_port`);
+    (rule.match_ports || []).forEach((port, portIndex) => validatePortExpression(port, `${rulePath}.match_ports[${portIndex}]`));
     if (rule.match_protocol) {
       setEnum(String(rule.match_protocol).toLowerCase(), ['tcp', 'udp'], `${rulePath}.match_protocol`);
     }
     const translatedSource = rule.translated_src || {};
+    for (const key of ['block_size', 'max_blocks_per_host']) {
+      if (translatedSource[key]) setInteger(translatedSource[key], { min: 1 }, `${rulePath}.translated_src.${key}`);
+    }
     if (translatedSource.address) validateAddressOrReference(translatedSource.address, `${rulePath}.translated_src.address`);
     (translatedSource.addresses || []).forEach((address, addressIndex) => (
       validateAddressOrReference(address, `${rulePath}.translated_src.addresses[${addressIndex}]`)
