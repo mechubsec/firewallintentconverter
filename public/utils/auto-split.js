@@ -144,6 +144,7 @@ export function autoSplitRoutingContexts(intermediateConfig) {
         external_lists: intermediateConfig.external_lists || [],
         vpn_tunnels: [], // VPN is typically per-context
         ha_config: { enabled: false }, // HA is chassis-level
+        management_ports: intermediateConfig.management_ports || {}, // device-global admin ports
         screen_config: screenConfig,
         syslog_config: [], // Syslog is typically chassis-level
         dhcp_config: [],

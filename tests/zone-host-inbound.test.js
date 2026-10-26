@@ -129,7 +129,7 @@ end
     expect(access.v6only.system_services).toEqual(['ping', 'ssh']);
     expect(access.dual.system_services).toEqual(['ping']);
     expect(warnings.some(w => /dual: allowaccess \(ping\) and ip6-allowaccess \(ping https\) differ/.test(w.message))).toBe(true);
-    expect(warnings.some(w => /allowaccess ssh is converted to host-inbound-traffic only/.test(w.message))).toBe(true);
+    expect(warnings.some(w => /converted to host-inbound-traffic only/.test(w.message))).toBe(false);
   });
 
   it('treats DHCP links as IPv4, ignores ::/0, and warns about local-in policies', () => {

@@ -242,6 +242,7 @@ export function parseFortigateConfig(configText) {
     external_lists: [],
     vpn_tunnels: vpnTunnels,
     ha_config: haConfig,
+    management_ports: parseManagementPorts(tree),
     screen_config: screenConfig,
     syslog_config: syslogConfig,
     snmp_config: parseFortigateSnmpConfig(tree, warnings),
@@ -1441,6 +1442,21 @@ function fortiSubnetToCidr(subnetStr) {
 }
 
 
+/**
+ * Custom admin ports from `config system global` (admin-ssh-port, admin-sport = HTTPS,
+ * admin-port = HTTP). Only non-default values are kept; the converter validates the range.
+ */
+function parseManagementPorts(tree) {
+  const global = tree['system global'] || {};
+  const ports = {};
+  const fields = { ssh: ['admin-ssh-port', '22'], https: ['admin-sport', '443'], http: ['admin-port', '80'] };
+  for (const [service, [field, defaultPort]] of Object.entries(fields)) {
+    const value = getString(global[field]);
+    if (value && value !== defaultPort) ports[service] = value;
+  }
+  return ports;
+}
+
 function extractVersion(tree) {
   const global = tree['system global'] || {};
   // Sometimes version is at top-level as a comment: #config-version=...
@@ -1523,12 +1539,6 @@ function parseInterfaces(tree, warnings) {
       status: getString(entry['status']) || 'up',
       zone: '', // will be filled by zone data
     });
-  }
-  const daemonServices = [...new Set(interfaces.flatMap(iface => iface.allowaccess))].filter(service => service !== 'ping');
-  if (daemonServices.length > 0) {
-    warnings.push(createWarning('warning', 'interfaces/allowaccess',
-      `allowaccess ${daemonServices.join(', ')} is converted to host-inbound-traffic only; the SRX service configuration (system services ssh/telnet, web-management http/https, snmp) is not generated`,
-      'Enable the matching services on the SRX, or management access on these interfaces will not work'));
   }
   const hasLocalIn = ['firewall local-in-policy', 'firewall local-in-policy6']
     .some(section => Object.keys(tree[section] || {}).length > 0);

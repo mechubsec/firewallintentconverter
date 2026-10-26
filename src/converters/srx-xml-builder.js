@@ -31,7 +31,12 @@ import {
 import { canonicalizeJunosSecurityFeatures } from '../security/junos-identifier-catalog.js';
 import { validateXmlOutput } from '../security/junos-output-validation.js';
 import { versionStamp } from '../version.js';
-import { hostInboundEntries, warnZonesWithoutHostInbound } from './srx-host-inbound.js';
+import {
+  deriveManagementServices,
+  hostInboundEntries,
+  managementServiceXmlElements,
+  warnZonesWithoutHostInbound,
+} from './srx-host-inbound.js';
 import { planNat } from './nat-plan.js';
 
 /**
@@ -121,6 +126,12 @@ export function buildSrxXml(config, interfaceMappings = {}, targetContext = null
   // Chassis config is root-level: never inside a logical-system/tenant, and merged output emits it once.
   if (!options.skipLagChassis) buildLagChassisXml(lagResolution.lagInterfaces, lines, '  ');
 
+  // system services is root-level, so it goes before any logical-system/tenant wrapper.
+  // Merged output derives it once for all slots.
+  const managementServices = options.skipSystemServices ? {} : deriveManagementServices([config], warnings);
+  const serviceElements = managementServiceXmlElements(managementServices);
+  if (useContext && serviceElements.length > 0) buildSystemServicesXml(serviceElements, lines, '  ');
+
   // Open logical-system or tenant wrapper
   if (useContext) {
     const ctxTag = xmlElementName(
@@ -133,7 +144,7 @@ export function buildSrxXml(config, interfaceMappings = {}, targetContext = null
   }
 
   // System configuration (Day-0)
-  buildSystemConfigXml(config.system_config, lines, indent);
+  buildSystemConfigXml(config.system_config, lines, indent, useContext ? [] : serviceElements);
 
   // Interface addresses (IPv4 + IPv6)
   buildInterfaceAddressesXml(config.interfaces, lines, interfaceMappings, indent, lagResolution.lagInterfaces);
@@ -3373,10 +3384,22 @@ function buildInterfaceAddressesXml(interfaces, lines, interfaceMappings = {}, i
   lines.push(`${indent}</interfaces>`);
 }
 
-function buildSystemConfigXml(systemConfig, lines, indent = '  ') {
-  if (!systemConfig) return;
+function pushServicesXml(serviceElements, lines, indent) {
+  lines.push(`${indent}<services>`);
+  for (const element of serviceElements) lines.push(`${indent}  ${element}`);
+  lines.push(`${indent}</services>`);
+}
 
-  const hasContent = systemConfig.hostname || systemConfig.domain_name ||
+function buildSystemServicesXml(serviceElements, lines, indent) {
+  lines.push(`${indent}<system>`);
+  pushServicesXml(serviceElements, lines, `${indent}  `);
+  lines.push(`${indent}</system>`);
+}
+
+function buildSystemConfigXml(systemConfig, lines, indent = '  ', serviceElements = []) {
+  systemConfig = systemConfig || {};
+
+  const hasContent = serviceElements.length > 0 || systemConfig.hostname || systemConfig.domain_name ||
     (systemConfig.dns_servers && systemConfig.dns_servers.length > 0) ||
     (systemConfig.ntp_servers && systemConfig.ntp_servers.length > 0) ||
     systemConfig.timezone || systemConfig.login_banner;
@@ -3404,20 +3427,7 @@ function buildSystemConfigXml(systemConfig, lines, indent = '  ') {
     lines.push(`${indent}  </login>`);
   }
 
-  const mgmt = systemConfig.management_services || {};
-  if (mgmt.ssh || mgmt.https || mgmt.netconf) {
-    lines.push(`${indent}  <services>`);
-    if (mgmt.ssh) lines.push(`${indent}    <ssh/>`);
-    if (mgmt.https) {
-      lines.push(`${indent}    <web-management>`);
-      lines.push(`${indent}      <https><system-generated-certificate/></https>`);
-      lines.push(`${indent}    </web-management>`);
-    }
-    if (mgmt.netconf) {
-      lines.push(`${indent}    <netconf><ssh/></netconf>`);
-    }
-    lines.push(`${indent}  </services>`);
-  }
+  if (serviceElements.length > 0) pushServicesXml(serviceElements, lines, `${indent}  `);
 
   if (systemConfig.ntp_servers && systemConfig.ntp_servers.length > 0) {
     lines.push(`${indent}  <ntp>`);
@@ -3492,6 +3502,16 @@ export function buildMergedSrxXml(configSlots, crossLsLinks = [], globalConfig =
   buildSnmpXml(globalConfig.snmp_config, allLines, globalIdentifierNames);
   buildAaaXml(globalConfig.aaa_config, allLines, globalIdentifierNames);
 
+  // System services are root-level: enable the union once for all logical systems.
+  const mergedServiceElements = managementServiceXmlElements(
+    deriveManagementServices(
+      configSlots.map(slot => slot.intermediateConfig),
+      allWarnings,
+      configSlots.map(slot => slot.lsName),
+    ),
+  );
+  if (mergedServiceElements.length > 0) buildSystemServicesXml(mergedServiceElements, allLines, '  ');
+
   // Per-LS sections
   for (let slotIndex = 0; slotIndex < configSlots.length; slotIndex += 1) {
     const slot = configSlots[slotIndex];
@@ -3504,6 +3524,7 @@ export function buildMergedSrxXml(configSlots, crossLsLinks = [], globalConfig =
       {
         omitConfigurationWrapper: true,
         skipLagChassis: true,
+        skipSystemServices: true,
         identifierPlan: identifiers,
         pathPrefix: `configSlots[${slotIndex}].intermediateConfig.`,
         targetContextPath: `configSlots[${slotIndex}].lsName`,

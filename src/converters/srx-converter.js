@@ -19,7 +19,12 @@
  */
 
 import { sanitizeJunosName, mapAppToJunos, hasSpecificService, mapProfileToSrx, createWarning, isPredefEquivalent, JUNOS_PREDEFINED_APPS } from '../parsers/parser-utils.js';
-import { hostInboundEntries, warnZonesWithoutHostInbound } from './srx-host-inbound.js';
+import {
+  deriveManagementServices,
+  hostInboundEntries,
+  managementServiceSetLines,
+  warnZonesWithoutHostInbound,
+} from './srx-host-inbound.js';
 import { getJunosEmission } from '../utils/app-mappings.js';
 import {
   setAddressOrPrefix,
@@ -58,6 +63,8 @@ function serializeSetComments(commands) {
 // Internal marker every parser puts on the implicit rules it synthesises;
 // the rules carry their own descriptions, so it is never printed.
 const INTERNAL_IMPLICIT_RULE_TAG = 'added_by_fpic';
+
+const ROOT_SYSTEM_SERVICE_LINE = /^set system services (ssh( port \d+)?$|web-management |netconf )/;
 
 /**
  * Converts an intermediate config to SRX set commands.
@@ -134,7 +141,9 @@ export function convertToSrxSetCommands(config, interfaceMappings = {}, targetCo
   unresolvedServiceApps.clear();
 
   // Generate commands in Junos hierarchy order
-  convertSystemConfig(config.system_config, commands, warnings, summary);
+  // Merged output derives services once for all slots (system services is root-level).
+  const managementServices = options.skipSystemServices ? {} : deriveManagementServices([config], warnings);
+  convertSystemConfig(config.system_config, managementServices, commands, warnings, summary);
   convertZones(config.zones, commands, warnings, summary, interfaceMappings, identifiers, identifierPath);
   convertInterfaceAddresses(config.interfaces, commands, warnings, summary, interfaceMappings);
   convertRemoteAccessPlaceholders(config.interfaces, commands, interfaceMappings, config.global_protect);
@@ -330,6 +339,9 @@ export function convertToSrxSetCommands(config, interfaceMappings = {}, targetCo
     for (let i = 0; i < commands.length; i++) {
       const cmd = commands[i];
       if (cmd.startsWith('set chassis aggregated-devices ')) continue;
+      // Management daemons are root-level (not valid inside logical-systems or tenants);
+      // other system services lines, e.g. dhcp-local-server, stay in the context.
+      if (ROOT_SYSTEM_SERVICE_LINE.test(cmd)) continue;
       if (cmd.startsWith('set ')) {
         commands[i] = `set ${prefix} ${cmd.slice(4)}`;
       } else if (cmd.startsWith('deactivate ')) {
@@ -347,10 +359,11 @@ export function convertToSrxSetCommands(config, interfaceMappings = {}, targetCo
 // System Configuration Converter (Day-0)
 // ---------------------------------------------------------------------------
 
-function convertSystemConfig(systemConfig, commands, warnings, summary) {
-  if (!systemConfig) return;
+function convertSystemConfig(systemConfig, managementServices, commands, warnings, summary) {
+  const serviceLines = managementServiceSetLines(managementServices);
+  systemConfig = systemConfig || {};
 
-  const hasContent = systemConfig.hostname || systemConfig.domain_name ||
+  const hasContent = serviceLines.length > 0 || systemConfig.hostname || systemConfig.domain_name ||
     (systemConfig.dns_servers && systemConfig.dns_servers.length > 0) ||
     (systemConfig.ntp_servers && systemConfig.ntp_servers.length > 0) ||
     systemConfig.timezone || systemConfig.login_banner;
@@ -385,16 +398,7 @@ function convertSystemConfig(systemConfig, commands, warnings, summary) {
     commands.push(`set system login message ${setQuoted(systemConfig.login_banner, 'system_config.login_banner')}`);
   }
 
-  const mgmt = systemConfig.management_services || {};
-  if (mgmt.ssh) {
-    commands.push('set system services ssh');
-  }
-  if (mgmt.https) {
-    commands.push('set system services web-management https system-generated-certificate');
-  }
-  if (mgmt.netconf) {
-    commands.push('set system services netconf ssh');
-  }
+  for (const line of serviceLines) commands.push(`set system services ${line}`);
 
   commands.push('');
   summary.system_config_converted = 1;
@@ -4963,6 +4967,19 @@ export function convertMergedToSrxSetCommands(configSlots, crossLsLinks = [], gl
     allCommands.push(`set chassis aggregated-devices ethernet device-count ${lagDeviceCount(mergedLags)}`);
   }
 
+  // System services are root-level: enable the union once for all logical systems.
+  const mergedServiceLines = managementServiceSetLines(
+    deriveManagementServices(
+      configSlots.map(slot => slot.intermediateConfig),
+      allWarnings,
+      configSlots.map(slot => slot.lsName),
+    ),
+  );
+  if (mergedServiceLines.length > 0) {
+    for (const line of mergedServiceLines) allCommands.push(`set system services ${line}`);
+    allCommands.push('');
+  }
+
   // 2. Per-LS sections
   for (let slotIndex = 0; slotIndex < configSlots.length; slotIndex += 1) {
     const slot = configSlots[slotIndex];
@@ -4976,6 +4993,7 @@ export function convertMergedToSrxSetCommands(configSlots, crossLsLinks = [], gl
     // Use existing converter with targetContext set to logical-system
     const targetContext = { type: 'logical-system', name: lsName };
     const result = convertToSrxSetCommands(config, interfaceMappings, targetContext, {
+      skipSystemServices: true,
       identifierPlan: identifiers,
       pathPrefix: `configSlots[${slotIndex}].intermediateConfig.`,
       targetContextPath: `configSlots[${slotIndex}].lsName`,
