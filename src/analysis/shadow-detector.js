@@ -124,8 +124,7 @@ function checkShadow(earlier, later) {
     if (earlierUsers.length === 0 && laterUsers.length > 0) return null;
     return 'fully shadowed (any/any/any match-all)';
   }
-  if (arraysMatchUnordered(earlier.src_addresses, later.src_addresses) &&
-      arraysMatchUnordered(earlier.dst_addresses, later.dst_addresses) &&
+  if (srcMatch(earlier, later) && dstMatch(earlier, later) &&
       (earlierUsers.length === 0 || arraysMatchUnordered(earlierUsers, laterUsers)) &&
       servicesMatch(earlier, later)) {
     return 'exactly shadowed (identical match criteria)';
@@ -198,8 +197,7 @@ function detectRedundantRules(zonePairs, warnings) {
         if (earlierRule.disabled || earlierRule.action !== 'allow') continue;
 
         // Skip if it's an exact match (already caught by shadow detector)
-        if (arraysMatchUnordered(earlierRule.src_addresses, laterRule.src_addresses) &&
-            arraysMatchUnordered(earlierRule.dst_addresses, laterRule.dst_addresses) &&
+        if (srcMatch(earlierRule, laterRule) && dstMatch(earlierRule, laterRule) &&
             servicesMatch(earlierRule, laterRule)) {
           break; // already reported as shadow
         }
@@ -241,9 +239,11 @@ function detectMergeableRules(zonePairs, warnings) {
       const ruleB = activeRules[i + 1];
 
       if (ruleA.action !== ruleB.action) continue;
+      // Unioning negated lists is wrong (not-X + not-Y is not not-(X+Y)), so never suggest it.
+      if (hasNegation(ruleA) || hasNegation(ruleB)) continue;
 
-      const sameSrc = arraysMatchUnordered(ruleA.src_addresses, ruleB.src_addresses);
-      const sameDst = arraysMatchUnordered(ruleA.dst_addresses, ruleB.dst_addresses);
+      const sameSrc = srcMatch(ruleA, ruleB);
+      const sameDst = dstMatch(ruleA, ruleB);
       const sameSvc = servicesMatch(ruleA, ruleB);
 
       let mergeField = null;
@@ -290,6 +290,7 @@ function detectConsolidationOpportunities(zonePairs, warnings) {
     for (const rule of activePermits) {
       const svcKey = getAllServices(rule).sort().join('|');
       if (svcKey === 'any') continue; // skip any/any rules
+      if (hasNegation(rule)) continue; // a merged list can't express "except X"
 
       const srcKey = [...(rule.src_addresses || ['any'])].sort().join('|');
       const dstKey = [...(rule.dst_addresses || ['any'])].sort().join('|');
@@ -343,12 +344,14 @@ function detectConsolidationOpportunities(zonePairs, warnings) {
 // ---------------------------------------------------------------------------
 
 function isAnyMatch(rule) {
-  return isAnyAddresses(rule.src_addresses) &&
-         isAnyAddresses(rule.dst_addresses) &&
+  return isAnyAddresses(rule.src_addresses, rule.negate_source) &&
+         isAnyAddresses(rule.dst_addresses, rule.negate_destination) &&
          isAnyService(rule);
 }
 
-function isAnyAddresses(addrs) {
+// A negated side ("everything except X") is never "any", even when its list is.
+function isAnyAddresses(addrs, negated) {
+  if (negated) return false;
   if (!addrs || addrs.length === 0) return true;
   return addrs.length === 1 && (addrs[0] === 'any' || addrs[0] === 'all');
 }
@@ -370,6 +373,21 @@ function arraysMatchUnordered(a, b) {
   return sortedA.every((v, i) => v === sortedB[i]);
 }
 
+// Address sides are only comparable when their negation flags match.
+function srcMatch(ruleA, ruleB) {
+  return !ruleA.negate_source === !ruleB.negate_source &&
+    arraysMatchUnordered(ruleA.src_addresses, ruleB.src_addresses);
+}
+
+function dstMatch(ruleA, ruleB) {
+  return !ruleA.negate_destination === !ruleB.negate_destination &&
+    arraysMatchUnordered(ruleA.dst_addresses, ruleB.dst_addresses);
+}
+
+function hasNegation(rule) {
+  return Boolean(rule.negate_source || rule.negate_destination);
+}
+
 function getAllServices(rule) {
   return [...(rule.applications || []), ...(rule.services || [])]
     .filter(s => s !== 'application-default');
@@ -383,16 +401,16 @@ function servicesMatch(earlier, later) {
 }
 
 function isSupersetByAny(earlier, later) {
-  const earlierSrcAny = isAnyAddresses(earlier.src_addresses);
-  const earlierDstAny = isAnyAddresses(earlier.dst_addresses);
+  const earlierSrcAny = isAnyAddresses(earlier.src_addresses, earlier.negate_source);
+  const earlierDstAny = isAnyAddresses(earlier.dst_addresses, earlier.negate_destination);
 
   if (!earlierSrcAny && !earlierDstAny) return false;
   if (earlierSrcAny && earlierDstAny) return false;
 
   if (earlierSrcAny && !earlierDstAny) {
-    if (!arraysMatchUnordered(earlier.dst_addresses, later.dst_addresses)) return false;
+    if (!dstMatch(earlier, later)) return false;
   } else if (!earlierSrcAny && earlierDstAny) {
-    if (!arraysMatchUnordered(earlier.src_addresses, later.src_addresses)) return false;
+    if (!srcMatch(earlier, later)) return false;
   }
 
   return servicesMatch(earlier, later);
@@ -403,15 +421,23 @@ function isSupersetByAny(earlier, later) {
  * ruleA is a subset of ruleB if every packet matching ruleA also matches ruleB.
  */
 function isSubset(ruleA, ruleB) {
-  const srcOk = isAnyAddresses(ruleB.src_addresses) ||
-    arraysSubset(ruleA.src_addresses, ruleB.src_addresses);
+  const srcOk = isAnyAddresses(ruleB.src_addresses, ruleB.negate_source) ||
+    addressesSubset(ruleA.src_addresses, ruleA.negate_source, ruleB.src_addresses, ruleB.negate_source);
   if (!srcOk) return false;
 
-  const dstOk = isAnyAddresses(ruleB.dst_addresses) ||
-    arraysSubset(ruleA.dst_addresses, ruleB.dst_addresses);
+  const dstOk = isAnyAddresses(ruleB.dst_addresses, ruleB.negate_destination) ||
+    addressesSubset(ruleA.dst_addresses, ruleA.negate_destination, ruleB.dst_addresses, ruleB.negate_destination);
   if (!dstOk) return false;
 
   return isAnyService(ruleB) || servicesSubset(ruleA, ruleB);
+}
+
+// Mismatched negation is never a subset; both-negated is only trusted on exact equality.
+function addressesSubset(subset, subsetNegated, superset, supersetNegated) {
+  if (subsetNegated || supersetNegated) {
+    return Boolean(subsetNegated) === Boolean(supersetNegated) && arraysMatchUnordered(subset, superset);
+  }
+  return arraysSubset(subset, superset);
 }
 
 function arraysSubset(subset, superset) {
