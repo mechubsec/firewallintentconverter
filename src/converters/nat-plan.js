@@ -31,8 +31,8 @@ function isLiteralAddress(addr) {
   return rest.length === 0 && (prefixLength === undefined || /^\d{1,3}$/.test(prefixLength)) && isIpv6Address(address);
 }
 
-/** Returns '::/0' for rules touching IPv6 addresses, else '0.0.0.0/0'. */
-function natAnyAddress(rule) {
+/** Returns '::/0' for rules touching IPv6 addresses, else '0.0.0.0/0'; `valueOf` resolves object names. */
+function natAnyAddressWith(rule, valueOf = addr => addr) {
   const allAddrs = [
     ...(rule.src_addresses || []),
     ...(rule.dst_addresses || []),
@@ -41,7 +41,7 @@ function natAnyAddress(rule) {
     ...(rule.translated_dst?.address ? [rule.translated_dst.address] : []),
     ...(typeof rule.translated_dst === 'string' ? [rule.translated_dst] : []),
   ];
-  return allAddrs.some(a => a && typeof a === 'string' && a.includes(':')) ? '::/0' : '0.0.0.0/0';
+  return allAddrs.some(a => a && typeof a === 'string' && String(valueOf(a)).includes(':')) ? '::/0' : '0.0.0.0/0';
 }
 
 function effectiveNatTypes(rule) {
@@ -153,7 +153,7 @@ const oneLine = value => String(value).replace(/[\r\n]+/g, ' ');
  *           then, persistent }; match entries are { kind: 'prefix' | 'address-name', value };
  *           destinationPort is { name, high? } ("high" for a start-end range);
  *           destination and static rules keep one destination entry (Junos takes one)
- * - then: { kind: 'interface' } | { kind: 'off' } | { kind: 'pool', pool: { name, addresses: [{ prefix, to? }] } }
+ * - then: { kind: 'interface' } | { kind: 'off' } | { kind: 'pool', pool: { name, addresses: [{ prefix, to? }], noPortTranslation?, hostAddressBase? } }
  *       | { kind: 'destination-pool', pool: { name, prefix, port } } | { kind: 'static-prefix', prefix }
  * - comments are plain text; the emitters add their own comment syntax
  * - proxyArp: [{ interface, address, to? }] host addresses and ranges (/32 forms) the SRX must
@@ -222,6 +222,8 @@ export function planNat({
     const literal = isLiteralAddress(rawAddress) && !rawAddressNames.has(rawAddress);
     return resolveNatAddress(literal ? rawAddress : plannedName);
   };
+  // Object names carry no colon, so the wildcard family follows the address each name resolves to.
+  const natAnyAddress = rule => natAnyAddressWith(rule, addr => addrLookup[rawAddressNames.get(addr) || addr] || addr);
   const translatedAddress = rawAddress => (
     resolveNatAddress(rawAddressNames.get(rawAddress) || rawAddress)
   );
@@ -413,7 +415,22 @@ export function planNat({
     rule.caveat ? [`CAVEAT: ${oneLine(rule.caveat)}`] : []
   );
 
-  const planSourceThen = (ruleIndex, rule, comments) => {
+  // One-way static NAT keeps ports and, for a subnet, host N -> public host N, so both sides must match in size.
+  const oneWayPoolMapping = (sourceEntries, publicPrefix) => {
+    const privateEntries = sourceEntries.filter(entry => entry.kind === 'prefix');
+    if (privateEntries.length !== 1 || privateEntries.length !== sourceEntries.length) {
+      return { error: 'its source is not a single address or subnet' };
+    }
+    const privatePrefix = withPrefix(privateEntries[0].value);
+    const lengthOf = prefix => prefix.split('/')[1];
+    if (lengthOf(privatePrefix) !== lengthOf(publicPrefix)) {
+      return { error: `its private side (${privatePrefix}) and public side (${publicPrefix}) differ in size` };
+    }
+    const isHost = lengthOf(privatePrefix) === (privatePrefix.includes(':') ? '128' : '32');
+    return isHost ? {} : { hostAddressBase: privatePrefix };
+  };
+
+  const planSourceThen = (ruleIndex, rule, comments, sourceEntries) => {
     const translated = rule.translated_src;
     const interfaceThen = { kind: 'interface' };
     if (!translated) return interfaceThen;
@@ -455,9 +472,18 @@ export function planNat({
       const poolName = naming.generated(`nat_rules[${ruleIndex}]`, 'static-source-nat-pool');
       const resolved = translatedAddress(translated.address);
       if (resolved) {
-        if (rule.arp_reply !== false) addProxyCandidates([{ prefix: withPrefix(resolved) }], natDestinationZones(rule));
-        return { kind: 'pool', pool: { name: poolName, addresses: [{ prefix: withPrefix(resolved) }] } };
+        const publicPrefix = withPrefix(resolved);
+        const pool = { name: poolName, addresses: [{ prefix: publicPrefix }] };
+        if (translated.one_way) {
+          const mapping = oneWayPoolMapping(sourceEntries, publicPrefix);
+          if (mapping.error) return { kind: 'skip', reason: mapping.error };
+          pool.noPortTranslation = true;
+          if (mapping.hostAddressBase) pool.hostAddressBase = mapping.hostAddressBase;
+        }
+        if (rule.arp_reply !== false) addProxyCandidates([{ prefix: publicPrefix }], natDestinationZones(rule));
+        return { kind: 'pool', pool };
       }
+      if (translated.one_way) return { kind: 'skip', reason: `its translated address "${oneLine(translated.address)}" could not be resolved to an IP/prefix` };
       comments.push(`NAT: translated source "${translated.address}" is not a resolvable IP/prefix — using interface NAT`);
       warnings.push(createWarning('warning', `nat/source/${rule.name || ruleIndex}`,
         `Source NAT translated address "${translated.address}" could not be resolved to an IP/prefix — fell back to interface NAT`,
@@ -524,7 +550,15 @@ export function planNat({
           protocol: planProtocol(rule),
           destinationPort: planPort(rule),
         };
-        planned.then = planSourceThen(ruleIndex, rule, planned.thenComments);
+        planned.then = planSourceThen(ruleIndex, rule, planned.thenComments, source.entries);
+        if (planned.then.kind === 'skip') {
+          planned.skipped = true;
+          comments.push(`WARNING: Static NAT rule ${name} skipped — ${planned.then.reason}`);
+          warnings.push(createWarning('warning', `nat/static/${rule.name || ruleIndex}`,
+            `Static NAT rule "${oneLine(rule.name || ruleIndex)}" skipped — ${planned.then.reason}, which a one-way Junos source pool cannot express`,
+            'Build the NAT rule manually'));
+          continue;
+        }
         // U-turn/hairpin NAT: persistent-nat for return traffic
         planned.persistent = Boolean(rule._uturn);
       }

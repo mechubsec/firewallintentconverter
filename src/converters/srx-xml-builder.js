@@ -775,6 +775,8 @@ function buildNatXml(config, lines, warnings, identifierNames, interfaceMappings
           ? `          <address><name>${xmlText(address.prefix)}</name><to><ipaddr>${xmlText(address.to)}</ipaddr></to></address>`
           : `          <address><name>${xmlText(address.prefix)}</name></address>`);
       }
+      if (pool.hostAddressBase) lines.push(`          <host-address-base>${xmlText(pool.hostAddressBase)}</host-address-base>`);
+      if (pool.noPortTranslation) lines.push('          <port><no-translation/></port>');
       lines.push('        </pool>');
     }
     lines.push('      </source>');

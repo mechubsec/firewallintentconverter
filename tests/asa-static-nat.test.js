@@ -54,12 +54,13 @@ describe('Cisco ASA static NAT', () => {
     expect(natLines.some((line) => /static rule-set \S+ from zone outside$/.test(line))).toBe(true);
   });
 
-  it('twice NAT unidirectional is one-way, so it is dropped with a warning', () => {
+  it('twice NAT unidirectional becomes a no-port-translation source pool', () => {
     const text = asaConfig('').replace('object network WEB-PUB', 'nat (inside,outside) source static WEB WEB-PUB unidirectional\nobject network WEB-PUB');
-    const { intermediateConfig, warnings, natLines } = convert(text);
-    expect(intermediateConfig.nat_rules).toHaveLength(0);
+    const { intermediateConfig, natLines } = convert(text);
+    expect(intermediateConfig.nat_rules[0]).toMatchObject({ type: 'source', src_zones: ['inside'], dst_zones: ['outside'] });
     expect(natLines.some((line) => line.startsWith('set security nat static'))).toBe(false);
-    expect(warnings.some((item) => item.element === 'nat/static/Manual-NAT-1' && item.message.includes('one-way'))).toBe(true);
+    expect(natLines.some((line) => /source pool \S+ address 203\.0\.113\.10\/32$/.test(line))).toBe(true);
+    expect(natLines.some((line) => /source pool \S+ port no-translation$/.test(line))).toBe(true);
   });
 
   it.each([

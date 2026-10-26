@@ -2383,6 +2383,8 @@ function convertNatRules(
         for (const address of rule.then.pool.addresses) {
           commands.push(`set security nat source pool ${rule.then.pool.name} address ${address.prefix}${address.to ? ` to ${address.to}` : ''}`);
         }
+        if (rule.then.pool.hostAddressBase) commands.push(`set security nat source pool ${rule.then.pool.name} host-address-base ${rule.then.pool.hostAddressBase}`);
+        if (rule.then.pool.noPortTranslation) commands.push(`set security nat source pool ${rule.then.pool.name} port no-translation`);
         commands.push(`set ${rulePath} then source-nat pool ${rule.then.pool.name}${persistent}`);
       } else if (rule.then.kind === 'off') {
         commands.push(`set ${rulePath} then source-nat off`);

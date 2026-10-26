@@ -1,6 +1,7 @@
 import { describe, it, expect } from 'vitest';
 import { parsePanosConfig } from '../src/parsers/panos-parser.js';
 import { convertToSrxSetCommands } from '../src/converters/srx-converter.js';
+import { buildSrxXml } from '../src/converters/srx-xml-builder.js';
 
 const panosStatic = ({ bidirectional, destination = 'any' }) => `<?xml version="1.0"?>
 <config>
@@ -63,15 +64,77 @@ describe('PAN-OS static-ip NAT', () => {
     expect(lines.some((line) => /then static-nat prefix 192\.168\.1\.10\/32$/.test(line))).toBe(true);
   });
 
-  it('bi-directional no is one-way, so it is dropped with a warning rather than opened inbound', () => {
-    const result = parsePanosConfig(panosStatic({ bidirectional: 'no' }));
-    expect(result.intermediateConfig.nat_rules).toHaveLength(0);
-    expect(result.warnings.some((item) => item.element === 'nat/static/srv-static' && item.message.includes('one-way'))).toBe(true);
+  it('bi-directional no becomes a source rule with a no-port-translation pool', () => {
+    const { intermediateConfig, commands } = convert(panosStatic({ bidirectional: 'no' }));
+    expect(intermediateConfig.nat_rules[0]).toMatchObject({
+      type: 'source',
+      src_zones: ['trust'],
+      dst_zones: ['untrust'],
+      src_addresses: ['srv'],
+      translated_src: { type: 'static', address: 'srv-pub', one_way: true },
+    });
+    const lines = natLines(commands);
+    expect(lines.some((line) => /^set security nat static/.test(line))).toBe(false);
+    expect(lines.some((line) => /source pool \S+ address 203\.0\.113\.10\/32$/.test(line))).toBe(true);
+    expect(lines.some((line) => /source pool \S+ port no-translation$/.test(line))).toBe(true);
+    expect(lines.some((line) => line.includes('host-address-base'))).toBe(false);
+    expect(lines.some((line) => /rule \S+ match source-address 192\.168\.1\.10\/32$/.test(line))).toBe(true);
   });
 
   it('a missing bi-directional element defaults to one-way', () => {
     const xml = panosStatic({ bidirectional: 'no' }).replace(/<bi-directional>no<\/bi-directional>/, '');
-    expect(parsePanosConfig(xml).intermediateConfig.nat_rules).toHaveLength(0);
+    expect(parsePanosConfig(xml).intermediateConfig.nat_rules[0].type).toBe('source');
+  });
+
+  const subnetXml = (publicValue) => panosStatic({ bidirectional: 'no' })
+    .replace('192.168.1.10/32', '192.168.1.0/29').replace('203.0.113.10/32', publicValue);
+
+  it('a one-way subnet mapping keeps host numbers with host-address-base, in set and XML', () => {
+    const { intermediateConfig, commands } = convert(subnetXml('203.0.113.8/29'));
+    const lines = natLines(commands);
+    expect(lines.some((line) => /source pool \S+ host-address-base 192\.168\.1\.0\/29$/.test(line))).toBe(true);
+    expect(lines.some((line) => /source pool \S+ port no-translation$/.test(line))).toBe(true);
+    const xml = buildSrxXml(structuredClone(intermediateConfig), {}).xml;
+    expect(xml).toContain('<address><name>203.0.113.8/29</name></address>');
+    expect(xml).toMatch(/<host-address-base>192\.168\.1\.0\/29<\/host-address-base>\s*<port><no-translation\/><\/port>/);
+  });
+
+  it('a one-way host mapping renders port no-translation in XML without host-address-base', () => {
+    const { intermediateConfig } = convert(panosStatic({ bidirectional: 'no' }));
+    const xml = buildSrxXml(structuredClone(intermediateConfig), {}).xml;
+    expect(xml).toContain('<port><no-translation/></port>');
+    expect(xml).not.toContain('host-address-base');
+  });
+
+  it('a one-way mapping whose sides differ in size is skipped with a warning', () => {
+    const { commands, warnings } = convert(subnetXml('203.0.113.8/30'));
+    expect(natLines(commands).some((line) => line.includes('pool'))).toBe(false);
+    expect(warnings.some((item) => item.element === 'nat/static/srv-static' && item.message.includes('differ in size'))).toBe(true);
+  });
+
+  it('a one-way rule whose translated address does not resolve is skipped, not turned into interface NAT', () => {
+    const xml = panosStatic({ bidirectional: 'no' }).replace(/<entry name="srv-pub">.*?<\/entry>/, '');
+    const { commands, warnings } = convert(xml);
+    expect(natLines(commands).some((line) => line.includes('source-nat'))).toBe(false);
+    expect(warnings.some((item) => item.element === 'nat/static/srv-static' && item.message.includes('could not be resolved'))).toBe(true);
+  });
+
+  it('an IPv6 one-way mapping built from address objects matches ::/0 in set and XML', () => {
+    const xml = panosStatic({ bidirectional: 'no' })
+      .replace('192.168.1.10/32', '2001:db8:1::10/128').replace('203.0.113.10/32', '2001:db8:2::10/128');
+    const { intermediateConfig, commands } = convert(xml);
+    const lines = natLines(commands);
+    expect(lines.some((line) => /match destination-address ::\/0$/.test(line))).toBe(true);
+    expect(lines.some((line) => line.includes('0.0.0.0/0'))).toBe(false);
+    const output = buildSrxXml(structuredClone(intermediateConfig), {}).xml;
+    expect(output).toContain('<destination-address>::/0</destination-address>');
+  });
+
+  it('a one-way rule scoped to a service is skipped with a warning', () => {
+    const xml = panosStatic({ bidirectional: 'no' }).replace('<source-translation>', '<service>service-https</service>\n                  <source-translation>');
+    const result = parsePanosConfig(xml);
+    expect(result.intermediateConfig.nat_rules).toHaveLength(0);
+    expect(result.warnings.some((item) => item.element === 'nat/static/srv-static' && item.message.includes('service-https'))).toBe(true);
   });
 
   it.each([['service-https'], ['443']])('a bi-directional rule scoped to service %s is dropped rather than widened to every port', (service) => {

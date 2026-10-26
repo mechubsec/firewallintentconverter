@@ -109,6 +109,8 @@ export function createWarning(severity, element, message, suggestion = '') {
  * `dst_addresses` is the public address, `translated_src.address` the private one,
  * `src_zones` the zone the public address is reached from and `dst_zones` the inside.
  * Returns null, with a warning, for shapes one Junos static NAT rule cannot express.
+ * A one-way mapping becomes a source-side rule (zones and addresses not swapped) that the NAT
+ * plan renders as a no-port-translation source pool.
  *
  * @param {Object} input
  * @param {string} input.name - Source rule name
@@ -129,8 +131,7 @@ export function buildStaticNatFields({
   const scopedServices = services.filter((service) => service && service !== 'any');
   let reason = null;
   // Junos static NAT translates both ways on every port, so a narrower source mapping must not widen.
-  if (!bidirectional) reason = 'it is one-way, and Junos static NAT always translates both ways';
-  else if (scopedServices.length > 0) reason = `it is scoped to service ${scopedServices.join(', ')}`;
+  if (scopedServices.length > 0) reason = `it is scoped to service ${scopedServices.join(', ')}`;
   else if ((destinationFilter || []).some((address) => address !== 'any')) reason = 'it matches a specific destination';
   else if (privateAddresses.length !== 1 || publicAddresses.length !== 1) reason = 'it maps more than one address';
   // Identity NAT exempts traffic from other NAT rules; as static NAT it would proxy ARP for an inside host.
@@ -143,6 +144,16 @@ export function buildStaticNatFields({
       'Build the static NAT rule manually',
     ));
     return null;
+  }
+  if (!bidirectional) {
+    return {
+      type: 'source',
+      src_zones: insideZones,
+      dst_zones: outsideZones,
+      src_addresses: privateAddresses,
+      dst_addresses: ['any'],
+      translated_src: { type: 'static', address: publicAddresses[0], addresses: [publicAddresses[0]], one_way: true },
+    };
   }
   return {
     src_zones: outsideZones,
