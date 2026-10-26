@@ -10,6 +10,47 @@
 import React, { useState } from 'react';
 import { mapInterfaceToSrx } from '../utils/srx-view-transforms.js';
 
+const HOST_INBOUND_SERVICES = ['ping', 'ssh', 'https', 'dhcp', 'dns', 'snmp'];
+
+/**
+ * Add or remove a system-service in a host-inbound access object, keeping
+ * protocols and *_except lists intact.
+ * @param {{system_services?: string[], protocols?: string[]}|undefined} access
+ * @param {string} service
+ * @returns {object} new access object
+ */
+export function toggleHostInboundService(access, service) {
+  const current = access || { system_services: [], protocols: [] };
+  const services = current.system_services || [];
+  const next = services.includes(service)
+    ? services.filter(s => s !== service)
+    : [...services, service];
+  return { protocols: [], ...current, system_services: next };
+}
+
+/** Protocol and except entries as display labels. */
+function protocolAndExceptLabels(access) {
+  return [
+    ...(access?.protocols || []).map(p => `protocol ${p}`),
+    ...(access?.system_services_except || []).map(s => `except ${s}`),
+    ...(access?.protocols_except || []).map(p => `except protocol ${p}`),
+  ];
+}
+
+/** Zone-level entries not covered by the fixed checkboxes (read-only display). */
+function extraHostInboundEntries(access) {
+  return [
+    ...(access?.system_services || []).filter(s => !HOST_INBOUND_SERVICES.includes(s)),
+    ...protocolAndExceptLabels(access),
+  ];
+}
+
+/** Compact one-line text for a host-inbound access object. */
+function describeHostInbound(access) {
+  const parts = [...(access?.system_services || []), ...protocolAndExceptLabels(access)];
+  return parts.length ? parts.join(', ') : 'none';
+}
+
 export default function ZoneEditor({ zones, onZonesUpdate, viewMode, interfaceMappings }) {
   const isSrx = viewMode === 'srx';
   const [editingZone, setEditingZone] = useState(null); // index of zone being edited
@@ -136,17 +177,41 @@ export default function ZoneEditor({ zones, onZonesUpdate, viewMode, interfaceMa
                   <div className="editor-field">
                     <label>host-inbound-traffic</label>
                     <div style={{ display: 'flex', gap: 8, flexWrap: 'wrap', fontSize: 11, color: 'var(--text-secondary)' }}>
-                      {['ping', 'ssh', 'https', 'dhcp', 'dns', 'snmp'].map(svc => (
-                        <label key={svc} style={{ display: 'flex', alignItems: 'center', gap: 3, cursor: 'pointer' }}>
-                          <input
-                            type="checkbox"
-                            defaultChecked={svc === 'ping'}
-                            style={{ accentColor: 'var(--accent)' }}
-                          />
-                          {svc}
-                        </label>
-                      ))}
+                      {HOST_INBOUND_SERVICES.map(svc => {
+                        const access = zone.host_inbound_traffic;
+                        // `system-services all` (minus excepts) can't be edited per service, so show its effect read-only.
+                        const wildcard = (access?.system_services || []).includes('all');
+                        const checked = wildcard
+                          ? !(access?.system_services_except || []).includes(svc)
+                          : (access?.system_services || []).includes(svc);
+                        return (
+                          <label key={svc} style={{ display: 'flex', alignItems: 'center', gap: 3, cursor: wildcard ? 'default' : 'pointer' }}>
+                            <input
+                              type="checkbox"
+                              checked={checked}
+                              disabled={wildcard}
+                              title={wildcard ? 'Set by system-services all' : undefined}
+                              onChange={() => handleFieldChange(index, 'host_inbound_traffic', toggleHostInboundService(access, svc))}
+                              style={{ accentColor: 'var(--accent)' }}
+                            />
+                            {svc}
+                          </label>
+                        );
+                      })}
                     </div>
+                    {extraHostInboundEntries(zone.host_inbound_traffic).length > 0 && (
+                      <div style={{ display: 'flex', gap: 4, flexWrap: 'wrap', marginTop: 4 }}>
+                        {extraHostInboundEntries(zone.host_inbound_traffic).map(entry => (
+                          <span key={entry} className="chip">{entry}</span>
+                        ))}
+                      </div>
+                    )}
+                    {/* Converters only read entries for interfaces still in the zone. */}
+                    {Object.entries(zone.interface_host_inbound_traffic || {}).filter(([iface]) => zone.interfaces.includes(iface)).map(([iface, access]) => (
+                      <div key={iface} style={{ fontSize: 11, color: 'var(--text-secondary)', marginTop: 4 }}>
+                        {mapInterfaceToSrx(iface, interfaceMappings || {})}: {describeHostInbound(access)}
+                      </div>
+                    ))}
                   </div>
                 )}
               </div>
