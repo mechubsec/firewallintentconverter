@@ -418,7 +418,6 @@ const APP_MAP = {
   'syslog-ng': 'junos-syslog',
   'citrix': 'junos-winframe',
   'citrix-online': 'junos-winframe',
-  'gre': 'junos-udp-any',  // GRE is IP protocol 47 — no junos-gre predefined
   // Misc management
   'finger': 'junos-finger',
   'gopher': 'junos-gopher',
@@ -488,7 +487,6 @@ const APP_MAP = {
   'BGP': 'junos-bgp',
   'OSPF': 'junos-ospf',
   'RIP': 'junos-rip',
-  'GRE': 'junos-udp-any',  // GRE is IP protocol 47 — not PPTP
   'STUN': 'junos-stun',
   'QUIC': 'junos-quic',
   'FINGER': 'junos-finger',

@@ -9,9 +9,13 @@
  *   - a literal service ('application-default', proto/port shape, or bare port) for service fields
  *   - a defined name in address_objects ∪ address_groups (for addresses)
  *   - a defined name in service_objects ∪ service_groups (for services)
+ *   - a vendor built-in the converter maps to a Junos predefined application
+ *     (mapAppToJunos for the config's source vendor, as the identifier catalog does)
  *
  * Applications are intentionally NOT checked here (covered by issue #33).
  */
+
+import { JUNOS_PREDEFINED_APPS, mapAppToJunos } from '../parsers/parser-utils.js';
 
 /**
  * Detects whether a string looks like a literal IP address, prefix, or range.
@@ -89,6 +93,7 @@ export function findPolicyReferenceIssues(config) {
     if (grp.name) serviceNames.add(grp.name);
   }
 
+  const sourceVendor = config.metadata?.source_vendor || '';
   const policies = config.security_policies || [];
   for (let i = 0; i < policies.length; i++) {
     const policy = policies[i];
@@ -129,6 +134,10 @@ export function findPolicyReferenceIssues(config) {
       if (svc === 'any') continue;
       if (serviceNames.has(svc)) continue;
       if (isLiteralService(svc)) continue;
+      // Only a known predefined target counts: app-mappings.json can yield names
+      // (e.g. junos-gre) that may not exist on the device.
+      const mapped = mapAppToJunos(svc, sourceVendor);
+      if (mapped === 'any' || JUNOS_PREDEFINED_APPS.has(mapped)) continue;
 
       // Undefined reference — add if not already tracked
       if (!undefinedServices.includes(svc)) {
