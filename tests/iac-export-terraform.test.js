@@ -157,7 +157,7 @@ describe('exportToTerraform policies', () => {
     expect(hcl).not.toContain('junos_config');
     expect(hcl).not.toContain('junos_security_global_address_book');
     const raw = rawConfigOf(hcl);
-    expect(raw).toContain('"set security address-book global address h1 10.0.0.1/32"');
+    expect(hcl).toContain('network_address {\n    name = "h1"');
     expect(raw).toContain('"set security zones security-zone lan host-inbound-traffic system-services ssh"');
     expect(raw).toContain('action = "set"');
   });
@@ -219,5 +219,113 @@ describe('exportToTerraform policies', () => {
     expect(raw).toContain('depends_on = [junos_security_zone.lan]');
     const policyBlock = hcl.slice(hcl.indexOf('resource "junos_security_policy"'));
     expect(policyBlock).toContain('depends_on = [junos_security_zone.lan, junos_null_load_config.additional]');
+  });
+});
+
+describe('exportToTerraform address book', () => {
+  const bookConfig = () => {
+    const config = buildConfig([{ name: 'p', src_addresses: ['host1'], dst_addresses: ['lan-net'] }]);
+    config.address_objects = [
+      { name: 'host1', type: 'ip-netmask', value: '198.51.100.7/32' },
+      { name: 'lan-net', type: 'ip-netmask', value: '192.168.10.0/24', description: 'say "hi" ${file("/etc/passwd")}' },
+      { name: 'pool', type: 'range', value: '10.0.0.1-10.0.0.9' },
+      { name: 'web', type: 'fqdn', value: 'example.com', fqdn_ip_version: 'v4' },
+    ];
+    config.address_groups = [
+      { name: 'inner', members: ['host1', 'pool'] },
+      { name: 'outer', members: ['inner', 'lan-net', 'web'], description: 'all of it' },
+    ];
+    return config;
+  };
+  const bookCommands = () => (
+    convertToSrxSetCommands(bookConfig(), {}, null, { policyStructure: 'zone-pair' }).commands
+  );
+  const bookResourceOf = (hcl) => hcl.match(/resource "junos_security_address_book" "global" \{[\s\S]*?\n\}/)?.[0] ?? '';
+
+  it('maps host, network, range, FQDN and address-set lines to one resource', () => {
+    const hcl = exportToTerraform(bookCommands());
+    const book = bookResourceOf(hcl);
+    expect(hcl.match(/resource "junos_security_address_book"/g)).toHaveLength(1);
+    expect(book).toContain('name = "global"');
+    expect(book).toMatch(/network_address \{\n    name = "host1"\n    value = "198.51.100.7\/32"\n  \}/);
+    expect(book).toMatch(/range_address \{\n    name = "pool"\n    from = "10.0.0.1"\n    to = "10.0.0.9"\n  \}/);
+    expect(book).toMatch(/dns_name \{\n    name = "web"\n    value = "example.com"\n    ipv4_only = true\n  \}/);
+    expect(book).toMatch(/address_set \{\n    name = "outer"\n    address = \["lan-net", "web"\]\n    address_set = \["inner"\]\n    description = "all of it"\n  \}/);
+    expect(book).toContain('address = ["host1", "pool"]');
+    expect(hcl).not.toContain('junos_security_global_address_book');
+  });
+
+  it('escapes quotes and template sequences in descriptions', () => {
+    const book = bookResourceOf(exportToTerraform(bookCommands()));
+    expect(book).toContain('description = "say \\"hi\\" $${file(\\"/etc/passwd\\")}"');
+  });
+
+  it('maps prefixless hosts with /32 and /128', () => {
+    const hcl = exportToTerraform([
+      'set security address-book global address h4 192.168.10.10',
+      'set security address-book global address h6 2001:db8::10',
+    ]);
+    expect(bookResourceOf(hcl)).toContain('name = "h4"\n    value = "192.168.10.10/32"');
+    expect(bookResourceOf(hcl)).toContain('name = "h6"\n    value = "2001:db8::10/128"');
+    expect(rawConfigOf(hcl)).toBe('');
+  });
+
+  it('maps wildcard-address lines', () => {
+    const hcl = exportToTerraform(['set security address-book global address w wildcard-address 192.0.2.0/255.255.0.255']);
+    expect(bookResourceOf(hcl)).toContain('wildcard_address {\n    name = "w"\n    value = "192.0.2.0/255.255.0.255"');
+    expect(rawConfigOf(hcl)).toBe('');
+  });
+
+  it('makes policies and the raw block depend on the address book', () => {
+    const hcl = exportToTerraform([...bookCommands(), 'set system host-name fw1']);
+    expect(rawConfigOf(hcl)).toContain('depends_on = [junos_security_zone.lan, junos_security_zone.wan, junos_security_address_book.global]');
+    const policyBlock = hcl.slice(hcl.indexOf('resource "junos_security_policy"'));
+    expect(policyBlock).toContain('junos_security_address_book.global');
+  });
+
+  it('keeps every address-book line either mapped or raw', () => {
+    const commands = [
+      ...bookCommands(),
+      'set security address-book global address odd 192.0.2.1/32 extra',
+      'set security address-book branch address b 192.0.2.5/32',
+      'set security address-book branch attach zone lan',
+    ];
+    const hcl = exportToTerraform(commands);
+    const raw = rawConfigOf(hcl);
+    // an unmapped global line keeps the whole global book raw, with a note
+    expect(hcl).not.toContain('junos_security_address_book');
+    expect(hcl).toContain('# Global address book exported as raw set commands');
+    for (const cmd of commands.filter(line => line.startsWith('set security address-book'))) {
+      expect(raw).toContain(cmd.replace(/[\\"]/g, '\\$&').replace('${', () => '$${'));
+    }
+  });
+
+  it('structures the global book while zone-scoped books stay raw', () => {
+    const scoped = ['set security address-book branch address b 192.0.2.5/32', 'set security address-book branch attach zone lan'];
+    const hcl = exportToTerraform([...bookCommands(), ...scoped]);
+    expect(bookResourceOf(hcl)).toContain('network_address');
+    for (const cmd of scoped) expect(rawConfigOf(hcl)).toContain(cmd);
+    expect(rawConfigOf(hcl)).not.toContain('address-book global');
+  });
+
+  it('keeps a deactivated global book raw', () => {
+    const hcl = exportToTerraform([
+      'set security address-book global address a 192.0.2.1/32',
+      'deactivate security address-book global address a',
+    ]);
+    expect(bookResourceOf(hcl)).toBe('');
+    expect(rawConfigOf(hcl)).toContain('deactivate security address-book global address a');
+  });
+
+  it('keeps the book raw when raw lines (global policies) reference it', () => {
+    const commands = convertToSrxSetCommands(bookConfig(), {}, null, {}).commands;
+    const hcl = exportToTerraform(commands);
+    expect(hcl).not.toContain('resource "junos_security_address_book"');
+    expect(hcl).toMatch(/# Global address book exported as raw set commands: referenced by raw command/);
+    expect(rawConfigOf(hcl)).toContain('set security address-book global address host1');
+  });
+
+  it('emits no address book resource when there are no address-book lines', () => {
+    expect(exportToTerraform(['set system host-name fw1'])).not.toContain('junos_security_address_book');
   });
 });

@@ -10,7 +10,9 @@ import { BRAND } from './brand.js';
 /**
  * Generates Terraform HCL configuration using the Junos Terraform provider.
  *
- * Zones become `junos_security_zone` resources and each from/to zone pair
+ * The global address book becomes one `junos_security_address_book` resource
+ * (all-or-nothing, like zones: any unmapped global line keeps it raw; zone-scoped
+ * books always stay raw). Zones become `junos_security_zone` resources and each from/to zone pair
  * becomes one `junos_security_policy` (the provider keys it by zone pair, with
  * an ordered policy list). A zone pair is structured only when every one of its
  * lines maps to a provider attribute and none is deactivated; otherwise all its
@@ -79,6 +81,33 @@ export function exportToTerraform(commands, options = {}) {
     lines.push('');
   }
 
+  // Global address book: one resource, referenced by policies and raw lines.
+  const addressBookResources = [];
+  const book = groups.addressBook;
+  if (book) {
+    addressBookResources.push('junos_security_address_book.global');
+    lines.push('# --- Address Book: global ---');
+    lines.push('resource "junos_security_address_book" "global" {');
+    lines.push('  name = "global"');
+    for (const address of book.addresses) {
+      lines.push(`  ${address.block} {`);
+      lines.push(`    name = "${escapeHcl(address.name)}"`);
+      for (const [attribute, value] of address.attributes) lines.push(`    ${attribute} = ${value}`);
+      if (address.description !== null) lines.push(`    description = "${escapeHcl(address.description)}"`);
+      lines.push('  }');
+    }
+    for (const set of book.sets) {
+      lines.push('  address_set {');
+      lines.push(`    name = "${escapeHcl(set.name)}"`);
+      if (set.addresses.length > 0) lines.push(`    address = ${toHclList(set.addresses)}`);
+      if (set.sets.length > 0) lines.push(`    address_set = ${toHclList(set.sets)}`);
+      if (set.description !== null) lines.push(`    description = "${escapeHcl(set.description)}"`);
+      lines.push('  }');
+    }
+    lines.push('}');
+    lines.push('');
+  }
+
   // Everything not structured, in original order. Applied after the zones and
   // before the policies, which reference the objects defined here.
   const hasRawBlock = groups.remaining.length > 0;
@@ -92,15 +121,16 @@ export function exportToTerraform(commands, options = {}) {
       lines.push(`    "${escapeHcl(cmd)}",`);
     }
     lines.push('  ])');
-    if (zoneResources.length > 0) {
-      lines.push(`  depends_on = [${zoneResources.join(', ')}]`);
+    const rawDependencies = [...zoneResources, ...addressBookResources];
+    if (rawDependencies.length > 0) {
+      lines.push(`  depends_on = [${rawDependencies.join(', ')}]`);
     }
     lines.push('}');
     lines.push('');
   }
 
   // One resource per zone pair: the provider ID is <from_zone>_-_<to_zone>.
-  const policyDependencies = [...zoneResources];
+  const policyDependencies = [...zoneResources, ...addressBookResources];
   if (hasRawBlock) policyDependencies.push('junos_null_load_config.additional');
   const takenPolicyNames = new Set();
   for (const pair of groups.zonePairs) {
@@ -237,6 +267,66 @@ function toHclList(arr) {
   return '[' + arr.map(v => `"${escapeHcl(v)}"`).join(', ') + ']';
 }
 
+const BOOK_LINE = /^(set|deactivate) security address-book global(?:\s|$)/;
+const BOOK_ENTRY = /^set security address-book global (address|address-set) (\S+) (.+)$/;
+const BOOK_ADDRESS_FORMS = [
+  [/^(?:\d{1,3}(?:\.\d{1,3}){3}|[0-9a-fA-F:]*:[0-9a-fA-F:.]*)\/\d{1,3}$/, 'network_address', match => [['value', match[0]]]],
+  // Junos accepts a bare host; the provider value needs the prefix.
+  [/^\d{1,3}(?:\.\d{1,3}){3}$/, 'network_address', match => [['value', `${match[0]}/32`]]],
+  [/^[0-9a-fA-F:]*:[0-9a-fA-F:.]*$/, 'network_address', match => [['value', `${match[0]}/128`]]],
+  [/^range-address (\S+) to (\S+)$/, 'range_address', match => [['from', match[1]], ['to', match[2]]]],
+  [/^wildcard-address (\S+)$/, 'wildcard_address', match => [['value', match[1]]]],
+  [/^dns-name (\S+?)(?: (ipv4-only|ipv6-only))?$/, 'dns_name', match => [
+    ['value', match[1]], ...(match[2] ? [[match[2].replace('-', '_'), true]] : []),
+  ]],
+];
+
+/** Parse a Junos description argument (quoted or bare); null when it is neither. */
+function parseDescription(text) {
+  const quoted = text.match(/^description "((?:[^"\\]|\\.)*)"$/);
+  if (quoted) return quoted[1].replace(/\\(.)/g, '$1');
+  const bare = text.match(/^description (\S+)$/);
+  return bare ? bare[1] : null;
+}
+
+/**
+ * Apply one global address-book line to `book`.
+ * @returns {boolean} false when the line has no junos_security_address_book equivalent
+ */
+function applyAddressBookLine(book, cmd) {
+  const entry = cmd.match(BOOK_ENTRY);
+  if (!entry || entry[2].includes('"')) return false;
+  const [, kind, name, rest] = entry;
+  const description = parseDescription(rest);
+  if (kind === 'address-set') {
+    const set = book.setMap[name] || (book.setMap[name] = { name, addresses: [], sets: [], description: null });
+    if (!book.sets.includes(set)) book.sets.push(set);
+    const member = rest.match(/^(address|address-set) (\S+)$/);
+    if (member && !member[2].includes('"')) set[member[1] === 'address' ? 'addresses' : 'sets'].push(member[2]);
+    else if (description !== null && set.description === null) set.description = description;
+    else return false;
+    return true;
+  }
+  const address = book.addressMap[name] || (book.addressMap[name] = { name, block: null, attributes: [], description: null });
+  if (!book.addresses.includes(address)) book.addresses.push(address);
+  if (description !== null) {
+    if (address.description !== null) return false;
+    address.description = description;
+    return true;
+  }
+  if (address.block) return false;
+  for (const [pattern, block, toAttributes] of BOOK_ADDRESS_FORMS) {
+    const match = rest.match(pattern);
+    if (!match) continue;
+    address.block = block;
+    address.attributes = toAttributes(match).map(([attribute, value]) => [
+      attribute, value === true ? 'true' : `"${escapeHcl(value)}"`,
+    ]);
+    return true;
+  }
+  return false;
+}
+
 const POLICY_LINE = /^set security policies from-zone (\S+) to-zone (\S+) policy (\S+)\s+(.+)$/;
 const POLICY_DEACTIVATE = /^deactivate security policies from-zone (\S+) to-zone (\S+)(?:\s|$)/;
 const APP_SERVICE_ATTRIBUTES = {
@@ -281,7 +371,10 @@ function groupSetCommands(commands) {
   const zoneMap = Object.create(null); // prototype-free: a zone or policy may be named "constructor"
   const pairs = [];
   const pairMap = Object.create(null);
-  const items = []; // { cmd, pair?, zone? } in input order; neither for plain raw lines
+  const book = {
+    addresses: [], addressMap: Object.create(null), sets: [], setMap: Object.create(null), rawReason: null,
+  };
+  const items = []; // { cmd, pair?, zone?, book? } in input order; neither for plain raw lines
 
   const pairFor = (fromZone, toZone) => {
     const key = `${fromZone}\u0000${toZone}`;
@@ -308,6 +401,13 @@ function groupSetCommands(commands) {
       if (interfaceMatch) zone.interfaces.push(interfaceMatch[1]);
       else if (verb !== 'set' || zoneRest) zone.rawReason = zone.rawReason || `unmapped line "${verb} ${zoneRest || ''}"`;
       items.push({ cmd, zone });
+      continue;
+    }
+
+    // Only the global book is structured; zone-scoped books stay raw.
+    if (BOOK_LINE.test(cmd)) {
+      if (!applyAddressBookLine(book, cmd)) book.rawReason = book.rawReason || `unmapped line "${cmd}"`;
+      items.push({ cmd, book });
       continue;
     }
 
@@ -346,21 +446,38 @@ function groupSetCommands(commands) {
     if (actionless) pair.rawReason = pair.rawReason || `policy ${actionless.name} has no then action`;
   }
 
+  // An address with no value (description only) cannot be a provider block.
+  if (book.addresses.some(address => !address.block)) book.rawReason = book.rawReason || 'address without a value';
+  // Terraform never removes raw lines, so a managed book referenced by one could not drop or rename
+  // that entry later (Junos rejects the dangling reference). Such a book stays raw too.
+  if (!book.rawReason) {
+    const bookNames = new Set([...book.addresses, ...book.sets].map(entry => entry.name));
+    const referencing = items.find(({ cmd, pair, zone, book: itemBook }) => {
+      const owner = pair || zone;
+      if (itemBook || (owner && !owner.rawReason)) return false;
+      return cmd.split(/\s+/).some(token => bookNames.has(token.replace(/^"|"$/g, '')));
+    });
+    if (referencing) book.rawReason = `referenced by raw command "${referencing.cmd}"`;
+  }
+  const hasBookLines = items.some(item => item.book);
+
   // Raw zones and zone pairs keep every line, in place among the other raw commands.
   const remaining = items
-    .filter(({ pair, zone }) => {
-      const owner = pair || zone;
+    .filter(({ pair, zone, book: itemBook }) => {
+      const owner = pair || zone || itemBook;
       return !owner || owner.rawReason;
     })
     .map(({ cmd }) => cmd);
   const rawNotes = [
     ...zones.filter(zone => zone.rawReason)
       .map(zone => `Zone ${zone.name} exported as raw set commands: ${zone.rawReason}`),
+    ...(book.rawReason ? [`Global address book exported as raw set commands: ${book.rawReason}`] : []),
     ...pairs.filter(pair => pair.rawReason)
       .map(pair => `Zone pair ${pair.fromZone} -> ${pair.toZone} exported as raw set commands: ${pair.rawReason}`),
   ].map(note => note.replace(/[\r\n]+/g, ' '));
   return {
     zones: zones.filter(zone => !zone.rawReason),
+    addressBook: hasBookLines && !book.rawReason ? book : null,
     zonePairs: pairs.filter(pair => !pair.rawReason),
     remaining,
     rawNotes,
