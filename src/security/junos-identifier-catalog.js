@@ -2,6 +2,7 @@ import {
   JUNOS_PREDEFINED_APPS,
   isPredefEquivalent,
   mapAppToJunos,
+  mapServiceToJunos,
   mapProfileToSrx,
   sanitizeJunosName,
 } from '../parsers/parser-utils.js';
@@ -631,7 +632,9 @@ function addResolvedApplicationUse(state, sourceName, referencePath, options = {
     );
     return;
   }
-  const mapped = mapAppToJunos(sourceName, state.sourceVendor);
+  const mapped = options.service
+    ? mapServiceToJunos(sourceName, state.sourceVendor)
+    : mapAppToJunos(sourceName, state.sourceVendor);
   if (mapped) {
     addApplicationReference(state.collector, state.device, sourceName, referencePath, {
       literalOutputName: mapped,
@@ -887,7 +890,7 @@ function collectApplications(config, state) {
       } else if (applicationAliases.has(member)) {
         addApplicationReference(collector, device, member, path, applicationAliases.get(member));
       } else {
-        const mapped = mapAppToJunos(member, state.sourceVendor);
+        const mapped = mapServiceToJunos(member, state.sourceVendor);
         addApplicationReference(collector, device, member, path, mapped
           ? { literalOutputName: mapped, compatibleKinds: ['application'] }
           : { compatibleKinds: ['application'] });

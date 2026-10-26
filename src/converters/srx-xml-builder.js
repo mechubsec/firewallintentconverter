@@ -20,7 +20,7 @@ import {
   xmlElementName,
   xmlText,
 } from '../security/junos-serialization.js';
-import { findNegationIssues, findPolicyReferenceIssues } from '../security/policy-reference-integrity.js';
+import { findNegationIssues, findPolicyReferenceIssues, findUnresolvedServiceGroups } from '../security/policy-reference-integrity.js';
 import { validateJunosInput } from '../security/junos-input-validation.js';
 import { encodeJunosZonePair } from '../security/junos-identifier-identity.js';
 import {
@@ -195,7 +195,7 @@ export function buildSrxXml(config, interfaceMappings = {}, targetContext = null
   buildFlowMonitoringXml(config.flow_monitoring_config, lines, identifierNames);
 
   // Applications (includes Customfwic placeholders for unmapped apps)
-  buildApplicationsXml(config.service_objects, config.applications, config.service_groups, lines, xmlCustomfwicApps, identifierNames);
+  buildApplicationsXml(config.service_objects, config.applications, config.service_groups, lines, xmlCustomfwicApps, identifierNames, findUnresolvedServiceGroups(config), warnings);
 
   // Schedulers
   buildSchedulersXml(config.schedules, lines, identifierNames);
@@ -876,7 +876,7 @@ function buildNatXml(config, lines, warnings, identifierNames, interfaceMappings
 // Applications XML Builder
 // ---------------------------------------------------------------------------
 
-function buildApplicationsXml(serviceObjects, applications, serviceGroups, lines, customfwicMap, identifierNames) {
+function buildApplicationsXml(serviceObjects, applications, serviceGroups, lines, customfwicMap, identifierNames, unresolvedSvcGroups = new Set(), warnings = []) {
   const allApps = [
     ...(serviceObjects || []).map((app, index) => ({ app, index, root: 'service_objects', kind: 'service', portField: 'port_range' })),
     ...(applications || []).map((app, index) => ({ app, index, root: 'applications', kind: 'application', portField: 'port' })),
@@ -971,7 +971,15 @@ function buildApplicationsXml(serviceObjects, applications, serviceGroups, lines
   for (let groupIndex = 0; groupIndex < groups.length; groupIndex += 1) {
     const group = groups[groupIndex];
     const groupName = identifierNames.definition(`service_groups[${groupIndex}].name`);
-    lines.push('    <application-set>');
+    if (unresolvedSvcGroups.has(group.name)) {
+      warnings.push(createWarning(
+        'warning',
+        `service-group/${group.name}`,
+        `Service group "${group.name}" has undefined member(s) — application-set deactivated`,
+        'Define the missing services, then activate the application-set and the policies that use it',
+      ));
+    }
+    lines.push(unresolvedSvcGroups.has(group.name) ? '    <application-set inactive="inactive">' : '    <application-set>');
     lines.push(`      <name>${xmlText(groupName)}</name>`);
     for (let memberIndex = 0; memberIndex < group.members.length; memberIndex += 1) {
       const member = group.members[memberIndex];

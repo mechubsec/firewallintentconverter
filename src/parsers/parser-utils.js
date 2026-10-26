@@ -6,6 +6,9 @@
  * validation / transformation functions.
  */
 
+import appMappingData from '../data/app-mappings.json' with { type: 'json' };
+import { VENDOR_KEY_MAP, normalizeJunosName, getAppOverride } from '../utils/app-mappings.js';
+
 /**
  * Safely parse JSON text, stripping prototype pollution keys (__proto__,
  * constructor, prototype) from all objects in the parsed tree.
@@ -270,6 +273,111 @@ export const JUNOS_PREDEFINED_APPS = new Set([
   'junos-stun', 'junos-quic', 'junos-ocsp',
 ]);
 
+/** FortiGate predefined service names (case-sensitive). */
+const FORTIGATE_SERVICES = {
+  'HTTP': 'junos-http',
+  'HTTPS': 'junos-https',
+  'DNS': 'junos-dns-udp',
+  'FTP': 'junos-ftp',
+  'FTP_GET': 'junos-ftp',
+  'FTP_PUT': 'junos-ftp',
+  'TFTP': 'junos-tftp',
+  'SSH': 'junos-ssh',
+  'TELNET': 'junos-telnet',
+  'SMTP': 'junos-smtp',
+  'SMTPS': 'junos-smtps',
+  'POP3': 'junos-pop3',
+  'POP3S': 'junos-pop3s',
+  'IMAP': 'junos-imap',
+  'IMAPS': 'junos-imaps',
+  'SNMP': 'junos-snmp',
+  'NTP': 'junos-ntp',
+  'SYSLOG': 'junos-syslog',
+  'RDP': 'junos-rdp',
+  'SIP': 'junos-sip',
+  'SIP-MSNmessenger': 'junos-sip',
+  'H.323': 'junos-h323',
+  'PING': 'junos-ping',
+  'PING6': 'junos-icmp-any',
+  'TRACEROUTE': 'junos-traceroute',
+  'IKE': 'junos-ike',
+  'IKE_NAT_TRAVERSAL': 'junos-ike-nat',
+  'L2TP': 'junos-l2tp',
+  'PPTP': 'junos-pptp',
+  'IRC': 'junos-irc',
+  'LDAP': 'junos-ldap',
+  'LDAP_UDP': 'junos-ldap',
+  'SMB': 'junos-smb',
+  'SAMBA': 'junos-smb',
+  'DCE-RPC': 'junos-ms-rpc-epm',
+  'MS-SQL': 'junos-ms-sql',
+  'MYSQL': 'junos-mysql',
+  'RADIUS': 'junos-radius',
+  'RADIUS-OLD': 'junos-radius',
+  'WINS': 'junos-nbname',
+  'NBNAME': 'junos-nbname',
+  'NBDATAGRAM': 'junos-nbds',
+  'NBSESSION': 'junos-smb',
+  'NFS': 'junos-nfs',
+  'X-WINDOWS': 'junos-x-windows',
+  'VNC': 'junos-vnc',
+  'BGP': 'junos-bgp',
+  'OSPF': 'junos-ospf',
+  'RIP': 'junos-rip',
+  'GRE': 'junos-gre',
+  'STUN': 'junos-stun',
+  'QUIC': 'junos-quic',
+  'FINGER': 'junos-finger',
+  'GOPHER': 'junos-gopher',
+  'NNTP': 'junos-nntp',
+  'WHOIS': 'junos-whois',
+  'AH': 'junos-ipsec',
+  'ESP': 'junos-ipsec',
+  'ALL': 'any',
+  'ALL_TCP': 'junos-tcp-any',
+  'ALL_UDP': 'junos-udp-any',
+  'ALL_ICMP': 'junos-icmp-any',
+  'ALL_ICMP6': 'junos-icmp-any',
+  'webproxy': 'junos-http',
+  'DHCP': 'junos-dhcp-client',
+  'SCP': 'junos-ssh',
+  'SFTP': 'junos-ssh',
+  'TWAMP': 'junos-twamp',
+  'SNMP_TRAP': 'junos-snmp',
+  'RADIUS_ACCOUNTING': 'junos-radius-accounting',
+  'TIMESTAMP': 'junos-icmp-timestamp',
+  'INFO_REQUEST': 'junos-icmp-info',
+  'INFO_ADDRESS': 'junos-icmp-address-mask',
+  'SCCP': 'junos-sccp',
+  'PC-Anywhere': 'junos-pc-anywhere',
+  'LPR': 'junos-lpr',
+  'UUCP': 'junos-uucp',
+  'TALK': 'junos-talk',
+};
+
+/** Cisco ASA named ports / keywords. */
+const ASA_SERVICES = {
+  // Bare protocol keywords the ASA parser synthesizes from ACEs
+  'icmp': 'junos-icmp-all',
+  'icmp6': 'junos-icmp-any',
+  'ipsec': 'junos-ipsec',
+  'imap4': 'junos-imap',
+  'h323': 'junos-h323',
+  'www': 'junos-http',
+  'domain': 'junos-dns-udp',
+  'sunrpc': 'junos-sun-rpc-any',
+  'login': 'junos-rlogin',
+  'shell': 'junos-rsh',
+  'exec': 'junos-rsh',
+  'lpd': 'junos-lpr',
+};
+
+/** PAN-OS predefined service objects. */
+const PANOS_SERVICES = {
+  'service-http': 'junos-http',
+  'service-https': 'junos-https',
+};
+
 /**
  * Multi-vendor application name → Junos predefined application mapping.
  * Covers PAN-OS, FortiGate service names (uppercase), and Cisco ASA names.
@@ -449,94 +557,8 @@ const APP_MAP = {
   'uucp': 'junos-uucp',
   'talk': 'junos-talk',
 
-  // ── FortiGate Service Object Names (case-sensitive uppercase) ──
-  'HTTP': 'junos-http',
-  'HTTPS': 'junos-https',
-  'DNS': 'junos-dns-udp',
-  'FTP': 'junos-ftp',
-  'FTP_GET': 'junos-ftp',
-  'FTP_PUT': 'junos-ftp',
-  'TFTP': 'junos-tftp',
-  'SSH': 'junos-ssh',
-  'TELNET': 'junos-telnet',
-  'SMTP': 'junos-smtp',
-  'SMTPS': 'junos-smtps',
-  'POP3': 'junos-pop3',
-  'POP3S': 'junos-pop3s',
-  'IMAP': 'junos-imap',
-  'IMAPS': 'junos-imaps',
-  'SNMP': 'junos-snmp',
-  'NTP': 'junos-ntp',
-  'SYSLOG': 'junos-syslog',
-  'RDP': 'junos-rdp',
-  'SIP': 'junos-sip',
-  'SIP-MSNmessenger': 'junos-sip',
-  'H.323': 'junos-h323',
-  'PING': 'junos-ping',
-  'PING6': 'junos-icmp-any',
-  'TRACEROUTE': 'junos-traceroute',
-  'IKE': 'junos-ike',
-  'IKE_NAT_TRAVERSAL': 'junos-ike-nat',
-  'L2TP': 'junos-l2tp',
-  'PPTP': 'junos-pptp',
-  'IRC': 'junos-irc',
-  'LDAP': 'junos-ldap',
-  'LDAP_UDP': 'junos-ldap',
-  'SMB': 'junos-smb',
-  'SAMBA': 'junos-smb',
-  'DCE-RPC': 'junos-ms-rpc-epm',
-  'MS-SQL': 'junos-ms-sql',
-  'MYSQL': 'junos-mysql',
-  'RADIUS': 'junos-radius',
-  'RADIUS-OLD': 'junos-radius',
-  'WINS': 'junos-nbname',
-  'NBNAME': 'junos-nbname',
-  'NBDATAGRAM': 'junos-nbds',
-  'NBSESSION': 'junos-smb',
-  'NFS': 'junos-nfs',
-  'X-WINDOWS': 'junos-x-windows',
-  'VNC': 'junos-vnc',
-  'BGP': 'junos-bgp',
-  'OSPF': 'junos-ospf',
-  'RIP': 'junos-rip',
-  'GRE': 'junos-gre',
-  'STUN': 'junos-stun',
-  'QUIC': 'junos-quic',
-  'FINGER': 'junos-finger',
-  'GOPHER': 'junos-gopher',
-  'NNTP': 'junos-nntp',
-  'WHOIS': 'junos-whois',
-  'AH': 'junos-ipsec',
-  'ESP': 'junos-ipsec',
-  'ALL': 'any',
-  'ALL_TCP': 'junos-tcp-any',
-  'ALL_UDP': 'junos-udp-any',
-  'ALL_ICMP': 'junos-icmp-any',
-  'ALL_ICMP6': 'junos-icmp-any',
-  'webproxy': 'junos-http',
-  'DHCP': 'junos-dhcp-client',
-  'SCP': 'junos-ssh',
-  'SFTP': 'junos-ssh',
-  'TWAMP': 'junos-twamp',
-  'SNMP_TRAP': 'junos-snmp',
-  'RADIUS_ACCOUNTING': 'junos-radius-accounting',
-  'TIMESTAMP': 'junos-icmp-timestamp',
-  'INFO_REQUEST': 'junos-icmp-info',
-  'INFO_ADDRESS': 'junos-icmp-address-mask',
-  'SCCP': 'junos-sccp',
-  'PC-Anywhere': 'junos-pc-anywhere',
-  'LPR': 'junos-lpr',
-  'UUCP': 'junos-uucp',
-  'TALK': 'junos-talk',
-
-  // ── Cisco ASA Common Service Names ────────────────────────
-  'www': 'junos-http',
-  'domain': 'junos-dns-udp',
-  'sunrpc': 'junos-sun-rpc-any',
-  'login': 'junos-rlogin',
-  'shell': 'junos-rsh',
-  'exec': 'junos-rsh',
-  'lpd': 'junos-lpr',
+  ...FORTIGATE_SERVICES,
+  ...ASA_SERVICES,
 };
 
 /**
@@ -570,6 +592,74 @@ export function mapAppToJunos(appName, sourceVendor = '') {
   if (APP_MAP[appName]) return APP_MAP[appName];
   const normalized = appName.toLowerCase().trim();
   return APP_MAP[normalized] || null;
+}
+
+const bundledServiceCatalogs = new Map();
+
+/**
+ * Bundled app-mappings.json entries for one vendor whose Junos target is 'any'
+ * or a predefined application (confidence >= 0.8, as mapAppToJunos requires).
+ * Built from the static import, so it never depends on loadAppMappings().
+ * Keys are lower-cased vendor names/aliases; the first app wins, as in the
+ * runtime index.
+ */
+function bundledServiceCatalog(sourceVendor) {
+  if (bundledServiceCatalogs.has(sourceVendor)) return bundledServiceCatalogs.get(sourceVendor);
+  const catalog = new Map();
+  const vendorKey = VENDOR_KEY_MAP[sourceVendor];
+  for (const app of vendorKey ? appMappingData.apps : []) {
+    const vendorEntry = app.vendors[vendorKey];
+    const junosEntry = app.vendors.junos;
+    if (!vendorEntry || !junosEntry || junosEntry.confidence < 0.8) continue;
+    const target = normalizeJunosName(junosEntry.name);
+    if (target !== 'any' && !JUNOS_PREDEFINED_APPS.has(target)) continue;
+    for (const key of [vendorEntry.name, ...(vendorEntry.aliases || [])]) {
+      if (key && !catalog.has(String(key).toLowerCase())) catalog.set(String(key).toLowerCase(), target);
+    }
+  }
+  bundledServiceCatalogs.set(sourceVendor, catalog);
+  return catalog;
+}
+
+/**
+ * Resolves a policy service reference to a Junos predefined application using
+ * only the SOURCE vendor's built-in service catalog. Static (never consults
+ * app-mappings.json), so the answer is the same before and after any
+ * conversion, and another vendor's names (e.g. PAN-OS "web-browsing" in a
+ * FortiGate config) never match. Vendors whose parsers resolve services
+ * themselves keep the legacy mapAppToJunos behavior.
+ *
+ * @param {string} serviceName - Service name from the source config
+ * @param {string} [sourceVendor] - Source vendor id (fortigate, cisco_asa, panos, ...)
+ * @returns {string|null} Junos application name, 'any', or null when not a built-in
+ */
+export function mapServiceToJunos(serviceName, sourceVendor = '') {
+  if (!serviceName) return null;
+  if (JUNOS_PREDEFINED_APPS.has(serviceName)) return serviceName;
+  if (['fortigate', 'panos', 'cisco_asa'].includes(sourceVendor)) {
+    // User Settings overrides win, with mapVendorApp's semantics (explicit state, not load order)
+    const override = getAppOverride(serviceName, sourceVendor);
+    if (override) {
+      if (override._deleted) return null;
+      const target = normalizeJunosName(override.junosApp ?? (override.kind === 'predefined' ? override.name : null));
+      return target === 'any' || JUNOS_PREDEFINED_APPS.has(target) ? target : null;
+    }
+  }
+  switch (sourceVendor) {
+    case 'fortigate':
+      return FORTIGATE_SERVICES[serviceName]
+        || bundledServiceCatalog(sourceVendor).get(serviceName.toLowerCase()) || null;
+    case 'panos':
+      return PANOS_SERVICES[serviceName] || null;
+    case 'cisco_asa': {
+      if (ASA_SERVICES[serviceName]) return ASA_SERVICES[serviceName];
+      const generic = FORTIGATE_SERVICES[serviceName.toUpperCase()];
+      if (generic && generic !== 'any') return generic;
+      return bundledServiceCatalog(sourceVendor).get(serviceName.toLowerCase()) || null;
+    }
+    default:
+      return mapAppToJunos(serviceName, sourceVendor);
+  }
 }
 
 // Injected at runtime by engine.js after loadAppMappings() completes

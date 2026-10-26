@@ -60,9 +60,10 @@ describe('application any with specific services', () => {
 </entry></vsys></entry></devices></config>`;
     const config = parsePanosConfig(xml).intermediateConfig;
     const apps = setApps(config, 'web');
-    expect(apps).toEqual(['service-https']);
+    // PAN-OS predefined service-https resolves to junos-https (#152).
+    expect(apps).toEqual(['junos-https']);
     expect(apps).not.toContain('any');
-    expect(xmlApps(config, 'web')).toEqual(['service-https']);
+    expect(xmlApps(config, 'web')).toEqual(['junos-https']);
   });
 
   it('GCP allow rule becomes its service only', () => {

@@ -39,7 +39,7 @@ import {
 } from '../security/junos-identifiers.js';
 import { canonicalizeJunosSecurityFeatures } from '../security/junos-identifier-catalog.js';
 import { validateSetOutput } from '../security/junos-output-validation.js';
-import { findPolicyReferenceIssues, findNegationIssues } from '../security/policy-reference-integrity.js';
+import { findPolicyReferenceIssues, findNegationIssues, findUnresolvedServiceGroups } from '../security/policy-reference-integrity.js';
 
 function serializeSetComments(commands) {
   for (let index = 0; index < commands.length; index += 1) {
@@ -142,7 +142,7 @@ export function convertToSrxSetCommands(config, interfaceMappings = {}, targetCo
 
   convertAddressGroups(config.address_groups, commands, warnings, summary, identifiers, identifierPath);
   convertServiceObjects(config.service_objects, commands, warnings, summary, identifiers, identifierPath);
-  convertServiceGroups(config.service_groups, commands, warnings, summary, sourceVendor, identifiers, identifierPath);
+  convertServiceGroups(config.service_groups, commands, warnings, summary, sourceVendor, identifiers, identifierPath, findUnresolvedServiceGroups(config));
   convertApplications(config.applications, commands, warnings, summary, identifiers, identifierPath);
 
   // UTM / IDP / SecIntel — must run before security policies to build assignment maps
@@ -1133,7 +1133,7 @@ function convertServiceObjects(services, commands, warnings, summary, identifier
 // Service Group Converter → SRX Application Sets
 // ---------------------------------------------------------------------------
 
-function convertServiceGroups(groups, commands, warnings, summary, sourceVendor = '', identifiers, identifierPath) {
+function convertServiceGroups(groups, commands, warnings, summary, sourceVendor = '', identifiers, identifierPath, unresolvedGroups = new Set()) {
   if (!groups || groups.length === 0) return;
 
   commands.push('# =============================================');
@@ -1158,6 +1158,16 @@ function convertServiceGroups(groups, commands, warnings, summary, sourceVendor 
       }
     }
 
+    if (unresolvedGroups.has(group.name)) {
+      commands.push(`# CAVEAT: application-set deactivated — member(s) are undefined services`);
+      commands.push(`deactivate applications application-set ${groupName}`);
+      warnings.push(createWarning(
+        'warning',
+        `service-group/${group.name}`,
+        `Service group "${group.name}" has undefined member(s) — application-set deactivated`,
+        'Define the missing services, then activate the application-set and the policies that use it',
+      ));
+    }
     summary.services_converted++;
   }
 

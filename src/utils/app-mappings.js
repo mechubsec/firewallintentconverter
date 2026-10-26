@@ -6,7 +6,7 @@
  */
 
 // Our vendor IDs → fatcat vendor keys
-const VENDOR_KEY_MAP = {
+export const VENDOR_KEY_MAP = {
   panos: 'panos',
   fortigate: 'fortios',
   cisco_asa: 'ftd',
@@ -72,6 +72,22 @@ function _getOverride(vendorAppName, sourceVendor) {
 }
 
 /**
+ * Synchronous user-override lookup for (vendor, app), safe when localStorage
+ * is missing or unreadable. Returns the raw override record or null.
+ *
+ * @param {string} vendorAppName - App/service name from the source config
+ * @param {string} sourceVendor - Our vendor ID
+ * @returns {Object|null} Override record, or null
+ */
+export function getAppOverride(vendorAppName, sourceVendor) {
+  try {
+    return _getOverride(vendorAppName, sourceVendor);
+  } catch {
+    return null;
+  }
+}
+
+/**
  * Adds an indexable key → app entry, lower-cased and de-duplicated.
  * Existing keys are NOT overwritten (first app wins) so a rare-word canonical
  * cannot be hijacked by a later app listing it as an alias.
@@ -128,7 +144,7 @@ export async function loadAppMappings() {
 /**
  * Converts fatcat's "junos:HTTPS" format to our "junos-https" style.
  */
-function normalizeJunosName(name) {
+export function normalizeJunosName(name) {
   if (!name) return name;
   if (name.startsWith('junos:')) {
     return 'junos-' + name.slice(6).toLowerCase();

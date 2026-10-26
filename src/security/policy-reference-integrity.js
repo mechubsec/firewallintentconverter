@@ -10,12 +10,12 @@
  *   - a defined name in address_objects ∪ address_groups (for addresses)
  *   - a defined name in service_objects ∪ service_groups (for services)
  *   - a vendor built-in the converter maps to a Junos predefined application
- *     (mapAppToJunos for the config's source vendor, as the identifier catalog does)
+ *     (mapServiceToJunos: the source vendor's own catalog, as the identifier catalog does)
  *
  * Applications are intentionally NOT checked here (covered by issue #33).
  */
 
-import { JUNOS_PREDEFINED_APPS, mapAppToJunos } from '../parsers/parser-utils.js';
+import { JUNOS_PREDEFINED_APPS, mapServiceToJunos } from '../parsers/parser-utils.js';
 
 /**
  * Detects whether a string looks like a literal IP address, prefix, or range.
@@ -66,6 +66,41 @@ function isLiteralService(value) {
 }
 
 /**
+ * Finds service groups with a member that resolves to nothing (not a defined
+ * service/group, literal, or built-in of the source vendor), directly or via a
+ * nested group. Such a group cannot be emitted as a valid application-set.
+ *
+ * @param {Object} config - Intermediate JSON config
+ * @returns {Set<string>} Names of service groups with an unresolved member
+ */
+export function findUnresolvedServiceGroups(config) {
+  const sourceVendor = config.metadata?.source_vendor || '';
+  const groups = new Map((config.service_groups || []).map((group) => [group.name, group]));
+  const definedNames = new Set((config.service_objects || []).map((obj) => obj.name));
+  // Same emission rule as the identifier catalog: an application needs protocol+port (or a port list)
+  for (const app of config.applications || []) {
+    if (app.name && (String(app.port || '').includes(',') || (app.protocol && app.port))) definedNames.add(app.name);
+  }
+  const outcomes = new Map(); // group name -> true/false once decided; false while in progress (cycle guard)
+
+  const hasUnresolvedMember = (group) => {
+    if (outcomes.has(group.name)) return outcomes.get(group.name);
+    outcomes.set(group.name, false);
+    const bad = (group.members || []).some((member) => {
+      if (!member || typeof member !== 'string' || member === 'any' || member === 'service-set') return false;
+      if (groups.has(member)) return hasUnresolvedMember(groups.get(member));
+      if (definedNames.has(member) || isLiteralService(member)) return false;
+      const mapped = mapServiceToJunos(member, sourceVendor);
+      return !(mapped === 'any' || JUNOS_PREDEFINED_APPS.has(mapped));
+    });
+    outcomes.set(group.name, bad);
+    return bad;
+  };
+  for (const group of groups.values()) hasUnresolvedMember(group);
+  return new Set([...outcomes].filter(([, bad]) => bad).map(([name]) => name));
+}
+
+/**
  * Finds security policies with undefined address or service references.
  * Returns a map of policy index → { addresses: string[], services: string[] }
  * containing ONLY policies that have at least one undefined reference.
@@ -94,6 +129,7 @@ export function findPolicyReferenceIssues(config) {
   }
 
   const sourceVendor = config.metadata?.source_vendor || '';
+  const unresolvedGroups = findUnresolvedServiceGroups(config);
   const policies = config.security_policies || [];
   for (let i = 0; i < policies.length; i++) {
     const policy = policies[i];
@@ -132,17 +168,23 @@ export function findPolicyReferenceIssues(config) {
       // numeric-named service (e.g., service_objects: [{name: '8080', ...}]) is
       // treated as a defined reference, not a literal.
       if (svc === 'any') continue;
-      if (serviceNames.has(svc)) continue;
+      if (serviceNames.has(svc) && !unresolvedGroups.has(svc)) continue;
       if (isLiteralService(svc)) continue;
       // Only a known predefined target counts: app-mappings.json can yield names
       // (e.g. junos-gre) that may not exist on the device.
-      const mapped = mapAppToJunos(svc, sourceVendor);
+      const mapped = mapServiceToJunos(svc, sourceVendor);
       if (mapped === 'any' || JUNOS_PREDEFINED_APPS.has(mapped)) continue;
 
       // Undefined reference — add if not already tracked
       if (!undefinedServices.includes(svc)) {
         undefinedServices.push(svc);
       }
+    }
+
+    // Applications are not checked (#33), except a reference to a service group
+    // that is emitted deactivated: `match application <group>` would be invalid.
+    for (const app of policy.applications || []) {
+      if (unresolvedGroups.has(app) && !undefinedServices.includes(app)) undefinedServices.push(app);
     }
 
     // Include policy in map only if it has at least one undefined reference
