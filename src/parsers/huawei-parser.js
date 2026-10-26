@@ -188,6 +188,9 @@ function parseZones(sections, warnings) {
 // Interface Parser
 // ---------------------------------------------------------------------------
 
+// Huawei service-manage names with an SRX host-inbound system-service equivalent.
+const SERVICE_MANAGE_TO_SRX = { ping: 'ping', ssh: 'ssh', https: 'https', http: 'http', telnet: 'telnet', snmp: 'snmp', netconf: 'netconf' };
+
 function parseInterfaces(sections, warnings) {
   const interfaces = [];
 
@@ -201,6 +204,9 @@ function parseInterfaces(sections, warnings) {
     let description = '';
     let shutdown = false;
     let vlan = '';
+    // null = no service-manage line (access unknown); otherwise the permitted SRX system services.
+    let serviceManage = null;
+    const unmappedServices = new Set();
 
     // Detect Vlanif type
     const vlanMatch = ifaceName.match(/Vlanif(\d+)/i);
@@ -234,6 +240,24 @@ function parseInterfaces(sections, warnings) {
         shutdown = true;
         continue;
       }
+      const serviceMatch = line.match(/^service-manage\s+(\S+)(?:\s+(permit|deny))?/i);
+      if (serviceMatch) {
+        serviceManage ??= new Set();
+        const service = serviceMatch[1].toLowerCase();
+        const action = (serviceMatch[2] || '').toLowerCase();
+        if (service === 'disable' || (service === 'all' && action === 'deny')) serviceManage.clear();
+        else if (service === 'all' && action === 'permit') Object.values(SERVICE_MANAGE_TO_SRX).forEach(srxService => serviceManage.add(srxService));
+        else if (action && SERVICE_MANAGE_TO_SRX[service]) {
+          if (action === 'permit') serviceManage.add(SERVICE_MANAGE_TO_SRX[service]);
+          else serviceManage.delete(SERVICE_MANAGE_TO_SRX[service]);
+        } else if (action === 'permit') unmappedServices.add(service);
+        continue;
+      }
+    }
+    if (unmappedServices.size > 0) {
+      warnings.push(createWarning('warning', `interfaces/${ifaceName}`,
+        `service-manage ${[...unmappedServices].join(', ')} on interface ${ifaceName} has no SRX host-inbound-traffic equivalent and was dropped`,
+        'Configure equivalent management access on the SRX manually if needed'));
     }
 
     interfaces.push({
@@ -243,6 +267,7 @@ function parseInterfaces(sections, warnings) {
       description,
       shutdown,
       vlan,
+      serviceManage: serviceManage && [...serviceManage],
     });
   }
 
@@ -1628,6 +1653,53 @@ export function parseHuaweiConfig(configText) {
     for (const ifName of z.interfaces) {
       zoneByIface[ifName] = z.name;
     }
+  }
+
+  // A source ACL bound to a management service restricts who may connect; host-inbound cannot, so fail closed.
+  const aclsByService = {}; // service -> Set of ACL ids
+  const bindAcl = (services, acl) => services.forEach(service => (aclsByService[service] ??= new Set()).add(acl));
+  for (const rawLine of allLines) {
+    const line = rawLine.trim();
+    const sshAcl = line.match(/^ssh\s+(?:ipv6\s+)?server\s+acl\s+(?:ipv6\s+)?(\S+)/i)?.[1];
+    if (sshAcl) bindAcl(['ssh'], sshAcl);
+    const snmpAcl = line.match(/^snmp-agent\b.*\bacl\s+(?:ipv6\s+)?(\S+)/i)?.[1];
+    if (snmpAcl) bindAcl(['snmp'], snmpAcl);
+    const webAcl = line.match(/^(?:web-manager|http|https)\b.*\bacl\s+(?:ipv6\s+)?(\S+)/i)?.[1];
+    if (webAcl) bindAcl(['http', 'https'], webAcl);
+  }
+  for (const section of sections) {
+    if (!/^user-interface\s+(?:vty|ssh)\b/i.test(section.header)) continue;
+    for (const line of section.lines) {
+      const vtyAcl = line.trim().match(/^acl\s+(?:ipv6\s+)?(\S+)\s+inbound/i)?.[1];
+      if (vtyAcl) bindAcl(['ssh', 'telnet'], vtyAcl);
+    }
+  }
+  for (const [service, acls] of Object.entries(aclsByService)) {
+    if (!rawInterfaces.some(iface => iface.serviceManage?.includes(service))) continue;
+    for (const iface of rawInterfaces) {
+      if (iface.serviceManage) iface.serviceManage = iface.serviceManage.filter(candidate => candidate !== service);
+    }
+    warnings.push(createWarning('warning', 'interfaces/service-manage',
+      `service-manage ${service} is restricted by ACL ${[...acls].join(', ')} and was not converted; SRX host-inbound-traffic cannot restrict sources`,
+      `Allow ${service} with a lo0 firewall filter or a junos-host security policy`));
+  }
+
+  // Interfaces with service-manage lines have known access; those without get none (platform defaults are not guessed).
+  const zonedInterfaces = new Set();
+  for (const zone of zones) {
+    for (const ifName of zone.interfaces) {
+      zonedInterfaces.add(ifName);
+      const iface = rawInterfaces.find(candidate => candidate.name === ifName);
+      if (!iface?.serviceManage) continue;
+      zone.interface_host_inbound_traffic ??= {};
+      zone.interface_host_inbound_traffic[ifName] = { system_services: [...iface.serviceManage], protocols: [] };
+    }
+  }
+  const unzonedAccess = rawInterfaces.filter(iface => iface.serviceManage?.length > 0 && !zonedInterfaces.has(iface.name));
+  if (unzonedAccess.length > 0) {
+    warnings.push(createWarning('warning', 'interfaces/service-manage',
+      `service-manage on ${unzonedAccess.map(iface => iface.name).join(', ')} was not converted: these interfaces are in no firewall zone`,
+      'Add each interface to a security zone on the SRX with the host-inbound-traffic it needs'));
   }
 
   // Normalize interfaces to standard schema
