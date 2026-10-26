@@ -63,7 +63,7 @@ export function parseCiscoAsaConfig(configText) {
   const lagInterfaces = parseCiscoLagInterfaces(blocks, lines, warnings);
 
   // Build zones from interfaces (ASA uses nameif + security-level as zones)
-  const zones = buildZones(interfaces);
+  const zones = buildZones(interfaces, parseAsaInterfaceAccess(lines, interfaces, warnings));
 
   // Build address objects from object network + object-group network
   const addressObjects = buildAddressObjects(objectNetworks);
@@ -808,6 +808,8 @@ function parseAccessGroups(lines, warnings) {
     if (!trimmed.startsWith('access-group ')) continue;
     // access-group <acl-name> <in|out> interface <nameif>
     const tokens = tokenize(trimmed);
+    // A control-plane ACL filters traffic to the ASA itself, not transit traffic (see parseAsaInterfaceAccess).
+    if (tokens[5] === 'control-plane') continue;
     if (tokens.length >= 5 && tokens[3] === 'interface') {
       groups.push({
         aclName: tokens[1],
@@ -1068,13 +1070,154 @@ function parseNatRules(blocks, lines, warnings) {
 // Build functions: transform parsed data into intermediate schema
 // ---------------------------------------------------------------------------
 
-function buildZones(interfaces) {
+const ASA_ANY_SOURCE = /^(any4?|any6|0|::\/0)$/;
+const ASA_IPV4_ADDRESS = /^(\d+\.\d+\.\d+\.\d+|0)$/;
+
+/**
+ * Reads ASA management-access lines (ssh, http/ASDM, telnet, icmp, ipv6 icmp) into
+ * { [nameif]: SRX system-services[] } for every interface.
+ * SRX host-inbound-traffic can neither restrict sources nor split address
+ * families, so a service is granted only when an any-source line covers it in
+ * EVERY address family the interface uses. Anything else fails closed with a
+ * warning. Without icmp lines in a family the ASA default (ICMP permitted)
+ * applies; http is only effective with `http server enable`.
+ */
+function parseAsaInterfaceAccess(lines, interfaces, warnings) {
+  const lineSources = {}; // `${nameif} ${service} ${family}` -> { any: boolean, sources: string[] }
+  const icmpEntries = {}; // `${nameif} ${family}` -> [{ permit, anySource, pingRelevant, source }]
+  const httpNameifs = new Set();
+  let httpServerEnabled = false;
+  let httpServerPort = '443';
+  const recordLine = (nameif, service, family, isAny, source) => {
+    const entry = (lineSources[`${nameif} ${service} ${family}`] ??= { any: false, sources: [] });
+    entry.any ||= isAny;
+    entry.sources.push(source);
+  };
+
+  for (const line of lines) {
+    const tokens = line.split(/\s+/);
+    if (tokens[0] === 'http' && tokens[1] === 'server' && tokens[2] === 'enable') {
+      httpServerEnabled = true;
+      httpServerPort = tokens[3] || '443';
+      continue;
+    }
+    if (['ssh', 'telnet', 'http'].includes(tokens[0])) {
+      // IPv4: <cmd> <ip> <mask> <nameif>; IPv6: <cmd> <prefix>/<len> <nameif>
+      const isIpv6 = tokens.length === 3 && tokens[1].includes(':');
+      const isIpv4 = tokens.length === 4 && ASA_IPV4_ADDRESS.test(tokens[1]) && ASA_IPV4_ADDRESS.test(tokens[2]);
+      if (!isIpv4 && !isIpv6) continue;
+      const nameif = tokens[tokens.length - 1];
+      const source = isIpv4 ? `${tokens[1]} ${tokens[2]}` : tokens[1];
+      const isAny = isIpv4 ? /^(0\.0\.0\.0|0)$/.test(tokens[1]) && /^(0\.0\.0\.0|0)$/.test(tokens[2]) : tokens[1] === '::/0';
+      if (tokens[0] === 'http') httpNameifs.add(nameif);
+      recordLine(nameif, tokens[0], isIpv6 ? 'ipv6' : 'ipv4', isAny, source);
+      continue;
+    }
+    const isIpv6Icmp = tokens[0] === 'ipv6' && tokens[1] === 'icmp';
+    const head = isIpv6Icmp ? 2 : tokens[0] === 'icmp' ? 1 : -1;
+    if (head === -1 || !['permit', 'deny'].includes(tokens[head])) continue;
+    // [ipv6] icmp permit|deny {any|any4|any6|host <ip>|<ip> <mask>|<prefix>/<len>} [type] <nameif>
+    const sourceStart = head + 1;
+    const sourceLength = tokens[sourceStart] === 'host' ? 2 : /^(any4?|any6|::\/0)$/.test(tokens[sourceStart]) || isIpv6Icmp ? 1 : 2;
+    const source = tokens.slice(sourceStart, sourceStart + sourceLength).join(' ');
+    const rest = tokens.slice(sourceStart + sourceLength);
+    if (rest.length === 0) continue;
+    const icmpType = rest.length > 1 ? rest[0] : '';
+    const family = isIpv6Icmp ? 'ipv6' : 'ipv4';
+    (icmpEntries[`${rest[rest.length - 1]} ${family}`] ??= []).push({
+      permit: tokens[head] === 'permit',
+      anySource: (sourceLength === 1 && ASA_ANY_SOURCE.test(tokens[sourceStart]))
+        || (sourceLength === 2 && /^(0\.0\.0\.0|0)$/.test(tokens[sourceStart]) && /^(0\.0\.0\.0|0)$/.test(tokens[sourceStart + 1])),
+      pingRelevant: icmpType === '' || ['echo', 'echo-request', isIpv6Icmp ? '128' : '8'].includes(icmpType),
+      source,
+    });
+  }
+
+  if (httpNameifs.size > 0 && !httpServerEnabled) {
+    warnings.push(createWarning('warning', 'interfaces/http',
+      `ASDM http access on ${[...httpNameifs].join(', ')} is ignored: "http server enable" is not in the config, so the ASA does not serve it`,
+      'Add host-inbound-traffic https manually if HTTPS management is wanted'));
+  }
+
+  if (httpNameifs.size > 0 && httpServerEnabled && httpServerPort !== '443') {
+    warnings.push(createWarning('warning', 'interfaces/http',
+      `ASDM http access on ${[...httpNameifs].join(', ')} uses custom port ${httpServerPort} and was not converted: host-inbound-traffic https means port 443`,
+      'Configure HTTPS management on that port on the SRX manually'));
+  }
+
+  // Per-family state of one service: { allowed: boolean, sources: string[] } (sources = source-restricted lines).
+  const lineState = (nameif, service, family) => {
+    if (service === 'http' && (!httpServerEnabled || httpServerPort !== '443')) return { allowed: false, sources: [] };
+    const entry = lineSources[`${nameif} ${service} ${family}`];
+    return entry ? { allowed: entry.any, sources: entry.any ? [] : entry.sources } : { allowed: false, sources: [] };
+  };
+  const pingState = (nameif, family) => {
+    const entries = icmpEntries[`${nameif} ${family}`];
+    if (!entries) return { allowed: true, sources: [] }; // ASA default: ICMP to an interface is permitted
+    const restrictedSources = [];
+    for (const entry of entries.filter(candidate => candidate.pingRelevant)) {
+      if (entry.permit && entry.anySource) return { allowed: restrictedSources.length === 0, sources: restrictedSources };
+      if (!entry.permit && entry.anySource) return { allowed: false, sources: restrictedSources };
+      restrictedSources.push(`${entry.permit ? 'permit' : 'deny'} ${entry.source}`);
+    }
+    return { allowed: false, sources: restrictedSources };
+  };
+
+  // access-group <acl> in interface <nameif> control-plane filters sources to the ASA itself; host-inbound cannot, so fail closed.
+  const controlPlaneAcl = {};
+  for (const line of lines) {
+    const tokens = line.trim().split(/\s+/);
+    if (tokens[0] === 'access-group' && tokens[2] === 'in' && tokens[3] === 'interface' && tokens[5] === 'control-plane') {
+      controlPlaneAcl[tokens[4]] = tokens[1];
+    }
+  }
+
+  const services = {};
+  for (const iface of interfaces) {
+    const nameif = iface.nameif;
+    if (controlPlaneAcl[nameif]) {
+      services[nameif] = [];
+      warnings.push(createWarning('warning', `interfaces/${nameif}`,
+        `Control-plane ACL ${controlPlaneAcl[nameif]} restricts management access to ${nameif}; ssh, telnet, https and ping on it were not converted because SRX host-inbound-traffic cannot restrict sources`,
+        'Allow the services with a lo0 firewall filter or a junos-host security policy'));
+      continue;
+    }
+    const families = [...(iface.ip || !iface.ipv6 ? ['ipv4'] : []), ...(iface.ipv6 ? ['ipv6'] : [])];
+    services[nameif] = [];
+    for (const service of ['ping', 'ssh', 'telnet', 'http']) {
+      const srxService = service === 'http' ? 'https' : service;
+      const states = families.map(family => ({
+        family,
+        ...(service === 'ping' ? pingState(nameif, family) : lineState(nameif, service, family)),
+      }));
+      if (states.every(state => state.allowed)) {
+        services[nameif].push(srxService);
+        continue;
+      }
+      const allowedFamilies = states.filter(state => state.allowed).map(state => state.family);
+      const restrictedSources = states.flatMap(state => state.sources);
+      if (allowedFamilies.length > 0) {
+        warnings.push(createWarning('warning', `interfaces/${nameif}`,
+          `${srxService} on ${nameif} is allowed from any source over ${allowedFamilies.join(' and ')} only and was not converted; SRX host-inbound-traffic applies to both address families`,
+          'Allow it with a lo0 firewall filter or a junos-host security policy'));
+      } else if (restrictedSources.length > 0) {
+        warnings.push(createWarning('warning', `interfaces/${nameif}`,
+          `${srxService} on ${nameif} is restricted to ${restrictedSources.join(', ')} and was not converted; SRX host-inbound-traffic cannot restrict sources`,
+          'Allow it with a lo0 firewall filter or a junos-host security policy'));
+      }
+    }
+  }
+  return services;
+}
+
+function buildZones(interfaces, services = {}) {
   return interfaces
     .filter(iface => !iface.shutdown)
     .map(iface => ({
       name: iface.nameif,
       description: iface.description || `Security Level ${iface.securityLevel}`,
       interfaces: [iface.hardware],
+      interface_host_inbound_traffic: { [iface.hardware]: { system_services: [...(services[iface.nameif] || [])], protocols: [] } },
       _cisco: {
         securityLevel: iface.securityLevel,
         hardware: iface.hardware,
