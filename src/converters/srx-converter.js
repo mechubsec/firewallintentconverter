@@ -261,10 +261,11 @@ export function convertToSrxSetCommands(config, interfaceMappings = {}, targetCo
 
   commands.push(...policyCommands);
 
-  // Fix 1: When global policies exist, Junos requires a default-policy statement
+  // Junos does not require a default-policy. We emit an explicit deny-all so the output fails closed,
+  // even when loaded with `load merge`/`load set` onto a device whose existing config has permit-all.
   const hasGlobalPolicy = policyCommands.some(cmd => cmd.includes('security policies global policy'));
   if (hasGlobalPolicy) {
-    commands.push('set security policies default-policy permit-all');
+    commands.push('set security policies default-policy deny-all');
   }
 
   convertNatRules(

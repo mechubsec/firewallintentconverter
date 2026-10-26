@@ -636,6 +636,13 @@ function buildPoliciesXml(policies, lines, warnings, profileMaps = {}, appGroups
     lines.push(pair.isGlobal ? '      </global>' : '      </policy>');
   }
 
+  // Fail closed when a global catch-all is removed or the config is merged onto a permit-all device; matches the set output.
+  if ([...zonePairs.values()].some(pair => pair.isGlobal)) {
+    lines.push('      <default-policy>');
+    lines.push('        <deny-all/>');
+    lines.push('      </default-policy>');
+  }
+
   lines.push('    </policies>');
 }
 

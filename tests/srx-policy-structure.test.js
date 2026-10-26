@@ -61,7 +61,7 @@ describe('global policy structure (default)', () => {
     expect(joined).not.toMatch(/from-zone \S+ to-zone \S+ policy/);
     // default-policy present for global
     const allText = Array.isArray(out.commands) ? out.commands.join('\n') : String(out);
-    expect(allText).toContain('set security policies default-policy permit-all');
+    expect(allText).toContain('set security policies default-policy deny-all');
   });
 
   it('preserves source rule order in the single global list', () => {
