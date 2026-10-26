@@ -589,6 +589,13 @@ function hierarchicalToSet(lines) {
 // Build config tree from set commands
 // ---------------------------------------------------------------------------
 
+// `set a b [ x y ]` (hand-written, or a hierarchical `b [ x y ];` leaf) → `set a b x`, `set a b y`.
+function expandBracketList(cmd) {
+  const match = cmd.trim().match(/^(.*?)\s+\[\s*([^\]"]+?)\s*\]$/);
+  if (!match) return [cmd];
+  return match[2].split(/\s+/).map(value => `${match[1]} ${value}`);
+}
+
 /**
  * Builds a nested object tree from flat set commands.
  * Each path segment becomes a key, leaf values are stored as arrays.
@@ -596,7 +603,7 @@ function hierarchicalToSet(lines) {
 function buildConfigTree(setCommands) {
   const tree = {};
 
-  for (const cmd of setCommands) {
+  for (const cmd of setCommands.flatMap(expandBracketList)) {
     // Remove "set " or "deactivate " prefix
     let path;
     let isDeactivate = false;
@@ -684,6 +691,24 @@ function tokenize(path) {
 // Zone Parser
 // ---------------------------------------------------------------------------
 
+// Reads a host-inbound-traffic node into the intermediate access shape.
+// Tree form: system-services -> { ssh: true, telnet: { except: true } }.
+// Deactivated statements (and everything under them) allow nothing.
+function parseHostInbound(node) {
+  const access = { system_services: [], protocols: [], system_services_except: [], protocols_except: [] };
+  if (!isActiveStatement(node)) return access;
+  const collect = (children, allowed, excepted) => {
+    if (!isActiveStatement(children)) return;
+    for (const [name, child] of Object.entries(children)) {
+      if (name.startsWith('_') || !isActiveStatement(child)) continue;
+      (isActiveStatement(child?.except) ? excepted : allowed).push(name);
+    }
+  };
+  collect(node?.['system-services'], access.system_services, access.system_services_except);
+  collect(node?.protocols, access.protocols, access.protocols_except);
+  return access;
+}
+
 function parseZones(tree, warnings) {
   const zonesNode = tree?.security?.zones?.['security-zone'];
   if (!zonesNode) return [];
@@ -693,10 +718,18 @@ function parseZones(tree, warnings) {
     if (zoneName.startsWith('_')) continue;
 
     const interfaces = [];
+    const interfaceHostInbound = {};
+    // Host-inbound under a deactivated zone or interface allows nothing.
+    const zoneActive = isActiveStatement(zoneData);
     if (zoneData?.interfaces) {
       for (const ifName of Object.keys(zoneData.interfaces)) {
         if (!ifName.startsWith('_')) {
           interfaces.push(ifName);
+          const ifaceNode = zoneData.interfaces[ifName];
+          if (zoneActive && isActiveStatement(zoneData.interfaces) && isActiveStatement(ifaceNode)
+              && isActiveStatement(ifaceNode?.['host-inbound-traffic'])) {
+            interfaceHostInbound[ifName] = parseHostInbound(ifaceNode['host-inbound-traffic']);
+          }
         }
       }
     }
@@ -707,6 +740,8 @@ function parseZones(tree, warnings) {
       name: zoneName,
       description,
       interfaces,
+      host_inbound_traffic: parseHostInbound(zoneActive ? zoneData?.['host-inbound-traffic'] : undefined),
+      interface_host_inbound_traffic: interfaceHostInbound,
     });
   }
 
