@@ -892,6 +892,37 @@ describe('Junos identifier catalog', () => {
     expect(() => planJunosIdentifiers(config)).not.toThrow();
   });
 
+  it('gives each VIP ingress interface in a shared zone its own destination rule set', () => {
+    const vip = (name, ingress) => ({
+      name, type: 'destination', src_zones: ['WAN'], dst_zones: ['any'],
+      ingress_interface: ingress, translated_dst: { address: '10.0.0.1' },
+    });
+    const config = {
+      zones: [{ name: 'WAN', interfaces: ['port1', 'port3'] }],
+      nat_rules: [vip('vip a', 'port1'), vip('vip b', 'port3'), vip('vip c', 'port1')],
+    };
+    const symbols = collectJunosIdentifierSymbols(config);
+    const ruleSets = symbols.definitions.filter(item => item.role?.startsWith('destination-nat-rule-set'));
+    expect(ruleSets.map(item => item.sourceName).sort()).toEqual(['WAN-to-any-port1', 'WAN-to-any-port3']);
+    expect(new Set(ruleSets.map(item => item.role)).size).toBe(2);
+    expect(() => planJunosIdentifiers(config)).not.toThrow();
+  });
+
+  it('plans 500 shared-zone VIPs without quadratic rescans', () => {
+    const count = 500;
+    const interfaces = Array.from({ length: count }, (_, index) => `port${index}`);
+    const config = {
+      zones: [{ name: 'WAN', interfaces }],
+      nat_rules: interfaces.map((name, index) => ({
+        name: `vip ${index}`, type: 'destination', src_zones: ['WAN'], dst_zones: ['any'],
+        ingress_interface: name, translated_dst: { address: '10.0.0.1' },
+      })),
+    };
+    const ruleSets = collectJunosIdentifierSymbols(config).definitions
+      .filter(item => item.role?.startsWith('destination-nat-rule-set'));
+    expect(new Set(ruleSets.map(item => item.sourceName)).size).toBe(count);
+  });
+
   it('catalogs every source and destination NAT Cartesian zone pair', () => {
     const config = {
       zones: ['s1', 's2', 'd1', 'd2'].map(name => ({ name })),

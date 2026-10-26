@@ -10,6 +10,7 @@ import {
   encodeJunosIdentifierTuple,
   encodeJunosZonePair,
 } from './junos-identifier-identity.js';
+import { planInterfaceScopedIngress } from '../parsers/parser-utils.js';
 import { getJunosEmission } from '../utils/app-mappings.js';
 
 export const JUNOS_IDENTIFIER_CATALOG = Object.freeze({
@@ -83,8 +84,8 @@ function zonePairContext(device, fromZone, toZone) {
   return `${device}/zone-pair:${encodeJunosZonePair(fromZone, toZone)}`;
 }
 
-function natRuleSetContext(device, type, fromZone, toZone) {
-  return `${device}/nat:${type}/rule-set:${encodeJunosZonePair(fromZone, toZone)}`;
+function natRuleSetContext(device, type, fromZone, toZone, scopeInterface = null) {
+  return `${device}/nat:${type}/rule-set:${encodeJunosZonePair(fromZone, toZone, scopeInterface)}`;
 }
 
 function routingInstanceContext(device, instance) {
@@ -161,8 +162,9 @@ function natZonePairs(rule, type) {
   ));
 }
 
-function preferredNatRuleSetName(type, fromZone, toZone) {
-  return type === 'static' ? `STATIC-NAT-${fromZone}` : `${fromZone}-to-${toZone}`;
+function preferredNatRuleSetName(type, fromZone, toZone, scopeInterface = null) {
+  if (type === 'static') return `STATIC-NAT-${fromZone}`;
+  return scopeInterface ? `${fromZone}-to-${toZone}-${scopeInterface}` : `${fromZone}-to-${toZone}`;
 }
 
 function natMissingZoneRole(sourceName) {
@@ -1386,6 +1388,7 @@ function collectNat(config, state) {
     });
   }
 
+  const interfaceScopes = planInterfaceScopedIngress(config.nat_rules, config.zones);
   for (let index = 0; index < (config.nat_rules || []).length; index += 1) {
     const rule = config.nat_rules[index];
     const types = rule.type === 'source-and-destination'
@@ -1394,13 +1397,15 @@ function collectNat(config, state) {
     let occurrence = 0;
     for (const type of types) {
       const zonePairs = natZonePairs(rule, type);
+      // Must match the NAT plan: a VIP on a shared-zone interface gets its own `from interface` rule-set.
+      const scopeInterface = type === 'destination' ? (interfaceScopes.get(rule) ?? null) : null;
       for (const { fromZone, toZone } of zonePairs) {
-        const ruleSetName = preferredNatRuleSetName(type, fromZone, toZone);
+        const ruleSetName = preferredNatRuleSetName(type, fromZone, toZone, scopeInterface);
         const ruleSetPath = joinedPath(prefix, `nat_rules[${index}]`);
-        const ruleSetKey = encodeJunosIdentifierTuple(device, type, fromZone, toZone);
+        const ruleSetKey = encodeJunosIdentifierTuple(device, type, fromZone, toZone, scopeInterface ?? '');
         if (!natRuleSets.has(ruleSetKey)) {
           natRuleSets.add(ruleSetKey);
-          const role = `${type}-nat-rule-set:${encodeJunosZonePair(fromZone, toZone)}`;
+          const role = `${type}-nat-rule-set:${encodeJunosZonePair(fromZone, toZone, scopeInterface)}`;
           collector.addGenerated({
             catalogKey: JUNOS_IDENTIFIER_CATALOG.NAT_RULE_SET,
             context: `${device}/nat:${type}`,
@@ -1409,13 +1414,13 @@ function collectNat(config, state) {
             sourceName: ruleSetName,
             definitionPath: ruleSetPath,
             role,
-            stableParentKey: `${type}-zone-pair:${encodeJunosZonePair(fromZone, toZone)}`,
+            stableParentKey: `${type}-zone-pair:${encodeJunosZonePair(fromZone, toZone, scopeInterface)}`,
           });
         }
         occurrence += 1;
         collector.addDefinition({
           catalogKey: JUNOS_IDENTIFIER_CATALOG.NAT_RULE,
-          context: natRuleSetContext(device, type, fromZone, toZone),
+          context: natRuleSetContext(device, type, fromZone, toZone, scopeInterface),
           namespace: 'nat-rule',
           kind: `${type}-nat-rule`,
           sourceName: rule.name,

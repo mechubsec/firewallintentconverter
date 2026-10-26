@@ -6,6 +6,9 @@ export function encodeJunosIdentifierTuple(...parts) {
   return JSON.stringify(parts);
 }
 
-export function encodeJunosZonePair(fromZone, toZone) {
-  return encodeJunosIdentifierTuple(fromZone, toZone);
+/** Zone pair key; a rule-set scoped `from interface` appends that interface so it stays distinct. */
+export function encodeJunosZonePair(fromZone, toZone, scopeInterface = null) {
+  return scopeInterface === null
+    ? encodeJunosIdentifierTuple(fromZone, toZone)
+    : encodeJunosIdentifierTuple(fromZone, toZone, scopeInterface);
 }

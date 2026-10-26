@@ -7,7 +7,7 @@
  * they cannot drift apart.
  */
 
-import { createWarning, planIngressScopeAdvice } from '../parsers/parser-utils.js';
+import { createWarning, planIngressScopeAdvice, planInterfaceScopedIngress } from '../parsers/parser-utils.js';
 import { encodeJunosZonePair } from '../security/junos-identifier-identity.js';
 
 const IPV4_ADDRESS = /^\d+\.\d+\.\d+\.\d+(\/\d+)?$/;
@@ -72,15 +72,20 @@ function natMissingZoneRole(sourceName) {
   return `nat-missing-zone:${sourceName}`;
 }
 
-/** Groups NAT rules by source-zone to destination-zone pair (one SRX rule-set each). */
-function groupByZonePair(rules) {
+/**
+ * Groups NAT rules by source-zone to destination-zone pair (one SRX rule-set each).
+ * `scopeOf(rule)` names an ingress interface that splits the pair into its own rule-set.
+ */
+function groupByZonePair(rules, scopeOf = () => null) {
   const groups = [];
   for (const rule of rules) {
+    const scopeInterface = scopeOf(rule);
     for (const fromZone of natSourceZones(rule)) {
       for (const toZone of natDestinationZones(rule)) {
-        let group = groups.find(item => item.fromZone === fromZone && item.toZone === toZone);
+        let group = groups.find(item => item.fromZone === fromZone && item.toZone === toZone
+          && item.scopeInterface === scopeInterface);
         if (!group) {
-          group = { fromZone, toZone, rules: [] };
+          group = { fromZone, toZone, scopeInterface, rules: [] };
           groups.push(group);
         }
         group.rules.push(rule);
@@ -148,7 +153,8 @@ const oneLine = value => String(value).replace(/[\r\n]+/g, ' ');
  * Plan shape (resolved decisions only, no output syntax):
  * - missingZones: generated names of NAT zones absent from config.zones
  * - source / destination / static: rule-set arrays, or null when no rule has that type
- * - rule-set: { type, name, fromZones, toZones, comments, skipped, rules }
+ * - rule-set: { type, name, fromZones, toZones, fromInterfaces?, comments, skipped, rules }
+ *   (a destination rule-set has fromInterfaces instead of fromZones when its VIP interface shares a zone)
  * - rule: { name, comments, skipped, match: { source, destination, protocol, destinationPort },
  *           then, persistent }; match entries are { kind: 'prefix' | 'address-name', value };
  *           destinationPort is { name, high? } ("high" for a start-end range);
@@ -267,13 +273,17 @@ export function planNat({
       : `nat_rules[${ruleIndex}]#effective-${direction}-zone`;
     return naming.reference(localPath);
   };
-  const ruleSetName = (type, fromZone, toZone) => {
+  // A VIP whose interface shares its zone gets a `from interface` rule-set; null keeps the zone scope.
+  const interfaceScopes = planInterfaceScopedIngress(natRules, zones);
+  const destinationScope = rule => interfaceScopes.get(rule) ?? null;
+  const ruleSetName = (type, fromZone, toZone, scopeInterface = null) => {
     const ownerIndex = natRules.findIndex(rule => (
       effectiveNatTypes(rule).includes(type)
       && natSourceZones(rule).includes(fromZone)
       && (type === 'static' || natDestinationZones(rule).includes(toZone))
+      && (type !== 'destination' || destinationScope(rule) === scopeInterface)
     ));
-    return naming.generated(`nat_rules[${ownerIndex}]`, `${type}-nat-rule-set:${encodeJunosZonePair(fromZone, toZone)}`);
+    return naming.generated(`nat_rules[${ownerIndex}]`, `${type}-nat-rule-set:${encodeJunosZonePair(fromZone, toZone, scopeInterface)}`);
   };
   const ruleNameFor = (ruleIndex, rule, type, fromZone, toZone) => {
     let occurrence = 0;
@@ -568,11 +578,11 @@ export function planNat({
 
   const planDestinationRuleSets = destinationRules => {
     const ruleSets = [];
-    for (const { fromZone, toZone, rules } of groupByZonePair(destinationRules)) {
+    for (const { fromZone, toZone, scopeInterface, rules } of groupByZonePair(destinationRules, destinationScope)) {
       const zoneRule = rules[0];
       const zoneRuleIndex = natRuleIndex.get(zoneRule);
-      const name = ruleSetName('destination', fromZone, toZone);
-      const ruleSet = { type: 'destination', name, fromZones: [], toZones: [], comments: [], skipped: false, rules: [] };
+      const name = ruleSetName('destination', fromZone, toZone, scopeInterface);
+      const ruleSet = { type: 'destination', name, fromZones: [], toZones: [], fromInterfaces: [], comments: [], skipped: false, rules: [] };
       ruleSets.push(ruleSet);
       if (fromZone === 'any') {
         if (actualZones.length === 0) {
@@ -585,10 +595,14 @@ export function planNat({
         }
         ruleSet.fromZones = actualZones;
       } else {
-        ruleSet.fromZones = [zoneReference(zoneRuleIndex, zoneRule, 'source', fromZone)];
+        // The zone stays referenced for naming; Junos scopes the rule-set by interface instead.
+        const zoneName = zoneReference(zoneRuleIndex, zoneRule, 'source', fromZone);
+        if (scopeInterface) ruleSet.fromInterfaces = [mapInterface(scopeInterface)];
+        else ruleSet.fromZones = [zoneName];
       }
 
-      for (const advice of planIngressScopeAdvice(rules, zones, mapInterface)) {
+      // An interface-scoped rule-set is already exact; only zone-scoped ones need advice.
+      for (const advice of scopeInterface ? [] : planIngressScopeAdvice(rules, zones, mapInterface)) {
         ruleSet.comments.push(`CAVEAT: ${oneLine(advice.caveat)}`);
         const adviceTarget = advice.grouped
           ? name

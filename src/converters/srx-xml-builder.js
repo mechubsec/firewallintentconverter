@@ -711,6 +711,9 @@ function buildNatXml(config, lines, warnings, identifierNames, interfaceMappings
     lines.push(`${indent}<rule-set>`);
     lines.push(`${indent}  <name>${xmlText(ruleSet.name)}</name>`);
     if (ruleSet.fromZones.length > 0) lines.push(`${indent}  ${zoneElements('from', ruleSet.fromZones)}`);
+    if (ruleSet.fromInterfaces?.length > 0) {
+      lines.push(`${indent}  <from>${ruleSet.fromInterfaces.map(ifl => `<interface>${xmlText(ifl)}</interface>`).join('')}</from>`);
+    }
     if (ruleSet.toZones.length > 0) lines.push(`${indent}  ${zoneElements('to', ruleSet.toZones)}`);
   };
   const poolsOf = ruleSets => {

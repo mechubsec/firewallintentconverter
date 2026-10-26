@@ -888,6 +888,38 @@ export function findWidenedIngressScope(rule, zones) {
 }
 
 /**
+ * Decides, once for all rules, which destination NAT rules can be scoped with
+ * `rule-set ... from interface`: a single-source-zone rule whose VIP interface
+ * sits in a shared zone (`widened`).
+ *
+ * Junos evaluates only the most specific matching rule-set (interface over zone),
+ * so a zone is split by interface only when EVERY destination rule entering from
+ * it qualifies; one broader rule (any interface, several zones, not a member)
+ * keeps the whole zone on the zone-scoped rule-set.
+ *
+ * @param {Object[]} natRules - All NAT rules
+ * @param {Object[]} zones - Current config.zones entries
+ * @returns {Map<Object, string>} Rule -> source interface name, only for scoped rules
+ */
+export function planInterfaceScopedIngress(natRules, zones) {
+  const candidates = new Map();
+  const blockedZones = new Set();
+  for (const rule of natRules || []) {
+    const isDestination = (rule.type || 'source') === 'destination' || rule.type === 'source-and-destination';
+    if (!isDestination) continue;
+    const scope = rule.src_zones?.length === 1 ? findWidenedIngressScope(rule, zones) : null;
+    if (scope?.kind === 'widened') {
+      candidates.set(rule, scope.interfaceName);
+      continue;
+    }
+    const entering = rule.src_zones ?? rule.source_zones;
+    for (const zone of Array.isArray(entering) && entering.length > 0 ? entering : ['any']) blockedZones.add(zone);
+  }
+  if (blockedZones.has('any')) return new Map();
+  return new Map([...candidates].filter(([rule]) => !blockedZones.has(rule.src_zones[0])));
+}
+
+/**
  * Plans the ingress-scope advice for the rules of ONE destination NAT rule-set.
  * A rule-set's `from` applies to all its rules, so when the flagged rules need
  * different ingress interfaces a single "split the rule-set" item is returned;

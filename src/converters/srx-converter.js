@@ -2404,6 +2404,7 @@ function convertNatRules(
     }
     const ruleSetPath = `security nat destination rule-set ${ruleSet.name}`;
     for (const zone of ruleSet.fromZones) commands.push(`set ${ruleSetPath} from zone ${zone}`);
+    for (const ifl of ruleSet.fromInterfaces) commands.push(`set ${ruleSetPath} from interface ${ifl}`);
     ruleSet.comments.forEach(comment);
     for (const rule of ruleSet.rules) {
       rule.comments.forEach(comment);

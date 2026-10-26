@@ -121,27 +121,36 @@ config firewall address`);
     const parse = (text) => parseFortigateConfig(text).intermediateConfig;
     const run = (config) => convertToSrxSetCommands(config, {}, null, {});
     const isWidening = (warning) => JSON.stringify(warning).includes('limited to interface');
-    const CAVEAT = '# CAVEAT: VIP vip-web-01 was limited to interface port1; this rule-set matches all of zone WAN — scope it with "from interface ge-0/0/0.0"';
+    const natLines = (commands) => commands.filter((line) => line.includes('security nat destination rule-set'));
 
-    it('uses the zone as from-zone and flags a multi-member zone in set output', () => {
+    it('scopes the rule-set to the VIP interface when its zone has other members', () => {
       const { commands, warnings } = run(parse(withZone(['port1', 'port3'])));
-      expect(commands.filter((line) => line.includes('nat destination') && / from zone WAN$/.test(line))).toHaveLength(1);
-      expect(commands).toContain(CAVEAT);
-      expect(warnings.some(isWidening)).toBe(true);
+      expect(commands).toContain('set security nat destination rule-set WAN-to-any-port1 from interface ge-0/0/0.0');
+      expect(natLines(commands).some((line) => / from zone /.test(line))).toBe(false);
+      expect(commands.some((line) => line.startsWith('# CAVEAT: VIP'))).toBe(false);
+      expect(warnings.some(isWidening)).toBe(false);
     });
 
-    it('returns the same warning from the XML builder', () => {
-      const { warnings } = buildSrxXml(parse(withZone(['port1', 'port3'])));
-      expect(warnings.some(isWidening)).toBe(true);
+    it('emits the same interface-scoped rule-set in XML, without a warning', () => {
+      const { xml, warnings } = buildSrxXml(parse(withZone(['port1', 'port3'])));
+      expect(xml).toContain('<name>WAN-to-any-port1</name>\n          <from><interface>port1</interface></from>');
+      expect(xml).not.toMatch(/<rule-set>\s*<name>WAN-to-any-port1<\/name>\s*<from><zone>/);
+      expect(warnings.some(isWidening)).toBe(false);
+    });
+
+    it('keeps the zone-scoped rule-set when the VIP interface is alone in its zone', () => {
+      const { commands } = run(parse(withZone(['port1'])));
+      expect(commands).toContain('set security nat destination rule-set WAN-to-any from zone WAN');
+      expect(natLines(commands).some((line) => / from interface /.test(line))).toBe(false);
     });
 
     it('evaluates membership at conversion time, not parse time', () => {
       const config = parse(withZone(['port1']));
-      expect(run(config).warnings.some(isWidening)).toBe(false);
+      expect(natLines(run(config).commands).some((line) => / from interface /.test(line))).toBe(false);
       const zone = config.zones.find((candidate) => candidate.name === 'WAN');
       zone.interfaces = [...zone.interfaces, 'port3'];
-      expect(run(config).warnings.some(isWidening)).toBe(true);
-      expect(buildSrxXml(config).warnings.some(isWidening)).toBe(true);
+      expect(natLines(run(config).commands).some((line) => / from interface /.test(line))).toBe(true);
+      expect(buildSrxXml(config).xml).toContain('<from><interface>port1</interface></from>');
     });
 
     const withMapping = { port1: 'ge-0/0/5', port3: 'ge-0/0/7' };
@@ -171,34 +180,30 @@ config firewall policy`));
       expect(run(config).warnings.some((warning) => JSON.stringify(warning).includes('not in zone WAN'))).toBe(true);
     });
 
-    it('suggests the mapped SRX interface name in set and XML', () => {
+    it('uses the mapped SRX interface name in set and XML', () => {
       const config = parse(withZone(['port1', 'port3']));
       const set = runMapped(config);
-      expect(set.commands.some((line) => line.startsWith('# CAVEAT: ') && line.includes('"from interface ge-0/0/5.0"'))).toBe(true);
-      expect(set.warnings.some((warning) => JSON.stringify(warning).includes('from interface ge-0/0/5.0'))).toBe(true);
+      expect(set.commands).toContain('set security nat destination rule-set WAN-to-any-port1 from interface ge-0/0/5.0');
       expect(set.commands.some((line) => line.includes('from interface port1'))).toBe(false);
-      const xml = buildSrxXml(config, withMapping);
-      expect(xml.warnings.some((warning) => JSON.stringify(warning).includes('from interface ge-0/0/5.0'))).toBe(true);
-      expect(xml.warnings.some((warning) => JSON.stringify(warning).includes('from interface port1'))).toBe(false);
+      const { xml } = buildSrxXml(config, withMapping);
+      expect(xml).toContain('<from><interface>ge-0/0/5.0</interface></from>');
     });
 
-    it('advises splitting the rule-set when VIPs in it widen from different interfaces', () => {
+    it('gives VIPs on different interfaces of one zone separate interface rule-sets', () => {
       const config = twoVips('port3');
       const set = runMapped(config);
-      const caveats = set.commands.filter((line) => line.startsWith('# CAVEAT: '));
-      expect(caveats).toHaveLength(1);
-      expect(caveats[0]).toContain('split');
-      expect(caveats[0]).toContain('vip-web-01');
-      expect(caveats[0]).toContain('vip-web-02');
-      expect(caveats[0]).toContain('ge-0/0/5.0');
-      expect(caveats[0]).toContain('ge-0/0/7.0');
-      expect(set.commands.some((line) => line.includes('scope it with'))).toBe(false);
-      const widening = set.warnings.filter((warning) => /split/i.test(JSON.stringify(warning)));
-      expect(widening).toHaveLength(1);
-      expect(set.warnings.some((warning) => JSON.stringify(warning).includes('scope the rule-set with'))).toBe(false);
-      const xmlWarnings = buildSrxXml(config, withMapping).warnings;
-      expect(xmlWarnings.filter((warning) => /split/i.test(JSON.stringify(warning)))).toHaveLength(1);
-      expect(xmlWarnings.some((warning) => JSON.stringify(warning).includes('Scope the rule-set with'))).toBe(false);
+      const headers = set.commands.filter((line) => / from interface /.test(line));
+      expect(headers).toEqual([
+        'set security nat destination rule-set WAN-to-any-port1 from interface ge-0/0/5.0',
+        'set security nat destination rule-set WAN-to-any-port3 from interface ge-0/0/7.0',
+      ]);
+      expect(set.commands.some((line) => line.startsWith('# CAVEAT: VIP') || line.includes('split'))).toBe(false);
+      expect(set.commands.some((line) => line.startsWith('set security nat destination rule-set WAN-to-any-port3 rule vip-web-02 '))).toBe(true);
+      const { xml } = buildSrxXml(config, withMapping);
+      expect(xml.match(/<from><interface>[^<]+<\/interface><\/from>/g)).toEqual([
+        '<from><interface>ge-0/0/5.0</interface></from>',
+        '<from><interface>ge-0/0/7.0</interface></from>',
+      ]);
     });
 
     it('advises splitting, not scoping, when a zone edit flags only one of two VIP interfaces', () => {
@@ -216,13 +221,24 @@ config firewall policy`));
       expect(xmlWarnings.some((warning) => JSON.stringify(warning).includes('Scope the rule-set with'))).toBe(false);
     });
 
-    it('keeps per-interface advice when VIPs in a rule-set share the same interface', () => {
-      const config = twoVips('port1');
+    it('keeps one zone rule-set with the caveat when another VIP in the zone is not interface-bound', () => {
+      const config = twoVips('port3');
+      // A zone-wide VIP: same zone, no specific interface.
+      config.nat_rules.find((rule) => rule.name === 'vip-web-02').ingress_interface = null;
       const set = runMapped(config);
-      const caveats = set.commands.filter((line) => line.startsWith('# CAVEAT: '));
-      expect(caveats).toHaveLength(2);
-      expect(caveats.every((line) => line.includes('"from interface ge-0/0/5.0"'))).toBe(true);
-      expect(buildSrxXml(config, withMapping).warnings.filter((warning) => JSON.stringify(warning).includes('from interface ge-0/0/5.0'))).toHaveLength(2);
+      const natHeaders = set.commands.filter((line) => /^set security nat destination rule-set \S+ from /.test(line));
+      expect(natHeaders).toHaveLength(1);
+      expect(natHeaders[0]).toMatch(/ from zone WAN$/);
+      const ruleSetName = natHeaders[0].split(' ')[5];
+      expect(set.commands.filter((line) => line.startsWith(`set security nat destination rule-set ${ruleSetName} rule `) && line.includes(' match destination-address '))).toHaveLength(2);
+      expect(set.commands.some((line) => line.startsWith('# CAVEAT: VIP vip-web-01') && line.includes('from interface ge-0/0/5.0'))).toBe(true);
+      expect(buildSrxXml(config, withMapping).xml).not.toContain('<from><interface>');
+    });
+
+    it('shares one interface rule-set when VIPs use the same interface', () => {
+      const set = runMapped(twoVips('port1'));
+      expect(set.commands.filter((line) => / from interface /.test(line))).toHaveLength(1);
+      expect(set.commands.some((line) => line.startsWith('# CAVEAT: VIP'))).toBe(false);
     });
 
     it('stays silent for a single-member zone and for a zone-less interface', () => {
