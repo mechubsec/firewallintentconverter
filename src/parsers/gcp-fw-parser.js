@@ -194,6 +194,8 @@ export function parseGcpFirewallRules(configText) {
   const serviceObjects = [];
   const serviceObjectSet = new Set();
   const securityPolicies = [];
+  // Networks with an enabled explicit egress deny rule (drives the inter-network warning).
+  const egressDenyNetworks = new Set();
 
   for (let idx = 0; idx < rules.length; idx++) {
     const rule = rules[idx];
@@ -343,7 +345,8 @@ export function parseGcpFirewallRules(configText) {
         dst_addresses: dstAddresses.length > 0 ? dstAddresses : ['any'],
         services: serviceNames,
         applications: ['any'],
-        action: 'permit',
+        action: 'allow',
+        _gcp_order: { phase: isIngress ? 1 : 2, priority, deny: false },
         logging: rule.logConfig ? (rule.logConfig.enable === true) : false,
         disabled: isDisabled,
         description: description || `GCP firewall rule (priority ${priority}, ${direction})`,
@@ -352,6 +355,8 @@ export function parseGcpFirewallRules(configText) {
         _rule_index: securityPolicies.length,
       });
     }
+
+    if (!isIngress && !isDisabled && deniedEntries.length > 0) egressDenyNetworks.add(networkName);
 
     // Build policies for denied entries
     for (let dIdx = 0; dIdx < deniedEntries.length; dIdx++) {
@@ -370,6 +375,7 @@ export function parseGcpFirewallRules(configText) {
         services: serviceNames,
         applications: ['any'],
         action: 'deny',
+        _gcp_order: { phase: isIngress ? 1 : 2, priority, deny: true },
         logging: rule.logConfig ? (rule.logConfig.enable === true) : false,
         disabled: isDisabled,
         description: description || `GCP firewall rule (priority ${priority}, ${direction})`,
@@ -385,6 +391,66 @@ export function parseGcpFirewallRules(configText) {
         'Rule has no "allowed" or "denied" entries — skipped',
         'Verify the rule definition in GCP'));
     }
+  }
+
+  // GCP implied rules (priority 65535, below every explicit rule): allow egress, deny ingress.
+  // Final order is set by the comparator below.
+  const impliedBase = zoneName => ({
+    src_addresses: ['any'],
+    dst_addresses: ['any'],
+    services: ['any'],
+    applications: ['any'],
+    logging: false,
+    disabled: false,
+    tags: [`gcp-network:${zoneName.slice('net-'.length)}`, 'priority:65535'],
+    source_users: ['any'],
+    _implicit: true,
+  });
+  for (const zoneName of zoneSet) {
+    securityPolicies.push({
+      ...impliedBase(zoneName),
+      name: `Implicit: GCP deny ingress (${zoneName.slice('net-'.length)})`,
+      src_zones: ['any'],
+      dst_zones: [zoneName],
+      action: 'deny',
+      _gcp_order: { phase: 1, priority: 65535, deny: true },
+      description: 'GCP implied deny ingress rule (priority 65535)',
+      _rule_index: securityPolicies.length,
+    });
+  }
+  for (const zoneName of zoneSet) {
+    securityPolicies.push({
+      ...impliedBase(zoneName),
+      name: `Implicit: GCP allow egress (${zoneName.slice('net-'.length)})`,
+      src_zones: [zoneName],
+      dst_zones: ['any'],
+      action: 'allow',
+      _gcp_order: { phase: 2, priority: 65535, deny: false },
+      description: 'GCP implied allow egress rule (priority 65535)',
+      _rule_index: securityPolicies.length,
+    });
+  }
+
+  // GCP needs both the source's egress and the destination's ingress check to pass, but the SRX
+  // stops at the first match. Phases, each sorted by priority then deny before allow (GCP's
+  // same-priority tie-break; the sort is stable, so explicit precedes implied on ties):
+  //   1: ingress policies, ending in a catch-all deny per imported zone, so every flow into an
+  //      imported zone is decided here;
+  //   2: egress policies, reached only by flows to non-imported destinations (exact order).
+  securityPolicies.sort((a, b) => (
+    a._gcp_order.phase - b._gcp_order.phase
+    || a._gcp_order.priority - b._gcp_order.priority
+    || Number(b._gcp_order.deny) - Number(a._gcp_order.deny)
+  ));
+  securityPolicies.forEach((policy, index) => {
+    policy._rule_index = index;
+    delete policy._gcp_order;
+  });
+
+  if (egressDenyNetworks.size > 0) {
+    warnings.push(createWarning('warning', 'networks',
+      `Egress deny rules in network(s) ${[...egressDenyNetworks].join(', ')} are enforced only for traffic leaving to non-imported destinations; for traffic between or within the imported networks the destination network's ingress rules decide (GCP also applies the source's egress denies)`,
+      'Add explicit inter-network deny policies if that traffic crosses the SRX'));
   }
 
   const intermediateConfig = {

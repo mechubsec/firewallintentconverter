@@ -412,7 +412,7 @@ export const AnalysisEngine = {
   _loggingOff(config) {
     const policies = config.security_policies || [];
     // OUR SCHEMA: p.disabled (inverted), p.log_end / p.log_start
-    const noLog = policies.filter(p => !p.disabled && !p.log_end && !p.log_start);
+    const noLog = policies.filter(p => !p.disabled && !p._implicit && !p.log_end && !p.log_start);
     const count = noLog.length;
     if (!count) return { id: 'logging_off', count: 0, items: [], description: 'All enabled policies have logging enabled.' };
     const pKey = (p) => p._rule_index != null ? String(p._rule_index) : p.name;
@@ -430,7 +430,8 @@ export const AnalysisEngine = {
     const policies = config.security_policies || [];
     // OUR SCHEMA: p.disabled, p.action ('allow'|'deny'|'reject'), p.src_addresses, p.dst_addresses
     const permissive = policies.filter(p => {
-      if (p.disabled || p.action !== 'allow') return false;
+      // Implicit rules model the source platform's defaults (e.g. GCP implied allow-egress); removing them changes behaviour.
+      if (p.disabled || p._implicit || p.action !== 'allow') return false;
       const srcAny = !p.negate_source && (p.src_addresses || []).some(a => a === 'any' || a === 'all');
       const dstAny = !p.negate_destination && (p.dst_addresses || []).some(a => a === 'any' || a === 'all');
       return srcAny && dstAny;

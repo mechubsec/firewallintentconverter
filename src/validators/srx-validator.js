@@ -131,6 +131,7 @@ function checkUnresolvedReferences(config, warnings) {
  */
 function checkPolicyQuality(config, warnings) {
   for (const policy of (config.security_policies || [])) {
+    if (policy._implicit) continue; // source-platform default, not a user rule
     // Flag permit-any rules
     const allAnySrc = (policy.src_addresses || []).length === 0 ||
       (policy.src_addresses.length === 1 && policy.src_addresses[0] === 'any');
