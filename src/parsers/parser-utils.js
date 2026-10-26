@@ -135,7 +135,8 @@ export function buildStaticNatFields({
   let reason = null;
   // Junos static NAT translates both ways on every port, so a narrower source mapping must not widen.
   if (scopedServices.length > 0) reason = `it is scoped to service ${scopedServices.join(', ')}`;
-  else if ((destinationFilter || []).some((address) => address !== 'any')) reason = 'it matches a specific destination';
+  // A one-way rule is a source rule, and Junos source NAT matches a destination, so only bidirectional rejects it.
+  else if (bidirectional && (destinationFilter || []).some((address) => address !== 'any')) reason = 'it matches a specific destination';
   else if (privateAddresses.length !== 1 || publicAddresses.length !== 1) reason = 'it maps more than one address';
   // Identity NAT exempts traffic from other NAT rules; as static NAT it would proxy ARP for an inside host.
   else if (privateAddresses[0] === publicAddresses[0]) reason = 'it maps an address to itself (identity NAT)';
@@ -154,7 +155,7 @@ export function buildStaticNatFields({
       src_zones: insideZones,
       dst_zones: outsideZones,
       src_addresses: privateAddresses,
-      dst_addresses: ['any'],
+      dst_addresses: (destinationFilter || []).length > 0 ? destinationFilter : ['any'],
       translated_src: { type: 'static', address: publicAddresses[0], addresses: [publicAddresses[0]], one_way: true },
     };
   }

@@ -130,6 +130,14 @@ describe('PAN-OS static-ip NAT', () => {
     expect(output).toContain('<destination-address>::/0</destination-address>');
   });
 
+  it('a one-way rule with a specific destination keeps it as the source rule destination match', () => {
+    const { intermediateConfig, commands } = convert(panosStatic({ bidirectional: 'no', destination: 'srv-pub' }));
+    expect(intermediateConfig.nat_rules[0]).toMatchObject({ type: 'source', dst_addresses: ['srv-pub'] });
+    const lines = natLines(commands);
+    expect(lines.some((line) => /source pool \S+ port no-translation$/.test(line))).toBe(true);
+    expect(lines.some((line) => line.endsWith('match destination-address 203.0.113.10/32'))).toBe(true);
+  });
+
   it('a one-way rule scoped to a service is skipped with a warning', () => {
     const xml = panosStatic({ bidirectional: 'no' }).replace('<source-translation>', '<service>service-https</service>\n                  <source-translation>');
     const result = parsePanosConfig(xml);

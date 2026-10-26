@@ -22,7 +22,7 @@
  *   3. JSON + Gaia clish text separated by "--- GAIA CLISH ---"
  */
 
-import { createWarning, safeJsonParse, detectIpVersion } from './parser-utils.js';
+import { createWarning, safeJsonParse, detectIpVersion, buildStaticNatFields } from './parser-utils.js';
 
 // ---------------------------------------------------------------------------
 // Main Parser Entry Point
@@ -393,6 +393,15 @@ function resolveUid(uidOrObj, uidMap) {
   const uid = typeof uidOrObj === 'string' ? uidOrObj : (uidOrObj.uid || null);
   if (!uid) return null;
   return uidMap.get(uid) || null;
+}
+
+/**
+ * True when a NAT cell is the built-in "Original" object (type CpmiOriginal), i.e. not translated.
+ */
+function isOriginalObject(uidOrObj, uidMap) {
+  const obj = resolveUid(uidOrObj, uidMap);
+  if (obj) return obj.type === 'CpmiOriginal' || obj.name === 'Original';
+  return extractUidString(uidOrObj) === 'Original';
 }
 
 /**
@@ -1139,14 +1148,16 @@ function parseNatRulebase(configJson, uidMap, warnings) {
   }
 
   for (const rulebase of natRulebases) {
+    const built = [];
     const flatRules = flattenNatRulebase(rulebase);
     for (const rule of flatRules) {
       const natRule = buildNatRule(rule, uidMap, ruleIndex, warnings);
       if (natRule) {
-        natRules.push(natRule);
+        built.push(natRule);
         ruleIndex++;
       }
     }
+    natRules.push(...resolveDirectionalStaticNat(built, warnings, uidMap));
   }
 
   if (natRules.length > 0) {
@@ -1183,6 +1194,311 @@ function flattenNatRulebase(rules) {
 }
 
 /**
+ * Returns the IPv4 [first, last] range of a host or network object, or null when it can't be read
+ * as one (groups, ranges, IPv6), so callers treat the object as possibly overlapping anything.
+ */
+function ipv4RangeOf(obj) {
+  const toInt = (address) => {
+    const octets = String(address).split('.').map(Number);
+    if (octets.length !== 4 || octets.some((octet) => !(octet >= 0 && octet <= 255))) return null;
+    return octets.reduce((total, octet) => total * 256 + octet, 0);
+  };
+  if (obj?.['ipv4-address']) {
+    const address = toInt(obj['ipv4-address']);
+    return address === null ? null : [address, address];
+  }
+  const base = obj?.subnet4 ? toInt(obj.subnet4) : null;
+  const length = Number(obj?.['mask-length4']);
+  if (base === null || !(length >= 0 && length <= 32)) return null;
+  const size = 2 ** (32 - length);
+  const first = Math.floor(base / size) * size;
+  return [first, first + size - 1];
+}
+
+/**
+ * Converts directional Check Point static rows. An outbound row (translates the source) and an inbound
+ * row (translates the destination) over the same objects collapse into one bidirectional Junos static
+ * rule; a lone row converts one-way (source pool without port translation, or destination NAT), so a
+ * single row never opens a translation direction the source did not have.
+ *
+ * Check Point is one first-match list; Junos runs static, destination, then source NAT in stages, so
+ * a single forward sweep keeps the earlier rules that stay in force and:
+ * - keeps a pair one-way when an earlier rule could match its private host (source side) or public
+ *   address (destination side), and skips the inbound half when the latter would let a Junos
+ *   destination rule steal traffic Check Point gives to the earlier rule;
+ * - warns, once per pair, when a later destination-NAT rule could also translate a claimed host.
+ * Rows that translate the service/port are skipped: Junos static NAT cannot translate ports.
+ *
+ * shortcut: rules between the two rows of a pair that are themselves undecided pair rows are not
+ * counted as blockers; upgrade if interleaved auto-NAT pairs show up.
+ */
+function resolveDirectionalStaticNat(rules, warnings, uidMap) {
+  const isUnchanged = (value, original) => !value || value === 'any' || value === original;
+  const isUnscoped = (meta) => (!meta.origSvc || meta.origSvc === 'any') && isUnchanged(meta.transSvc, meta.origSvc);
+  const rangeByName = new Map();
+  for (const [uid, obj] of uidMap) {
+    if (obj?.name) rangeByName.set(formatObjectReferenceName(obj, uid), ipv4RangeOf(obj));
+  }
+  const rangesOverlap = (left, right) => left[0] <= right[1] && left[1] >= right[0];
+  const singleAddressNames = new Set();
+  for (const [uid, obj] of uidMap) {
+    if (!obj?.name) continue;
+    const isSingleNetwork = Number(obj['mask-length4']) === 32 || Number(obj['mask-length6']) === 128;
+    if (obj['ipv4-address'] || obj['ipv6-address'] || (obj.type === 'network' && isSingleNetwork)) {
+      singleAddressNames.add(formatObjectReferenceName(obj, uid));
+    }
+  }
+
+  // Index inbound rows by the (public, private) objects an outbound row must mirror; first in config order wins.
+  const inboundByMirror = new Map();
+  for (const rule of rules) {
+    const meta = rule._static;
+    if (meta?.direction !== 'inbound' || !isUnscoped(meta) || meta.origSrc !== 'any') continue;
+    const key = `${meta.origDst}|${meta.transDst}`;
+    if (!inboundByMirror.has(key)) inboundByMirror.set(key, []);
+    inboundByMirror.get(key).push(rule);
+  }
+  const partnerOf = new Map();
+  for (const rule of rules) {
+    const meta = rule._static;
+    if (meta?.direction !== 'outbound' || !isUnscoped(meta) || meta.origDst !== 'any') continue;
+    const inbound = inboundByMirror.get(`${meta.transSrc}|${meta.origSrc}`)?.shift();
+    if (!inbound) continue;
+    partnerOf.set(rule, inbound);
+    partnerOf.set(inbound, rule);
+  }
+  const positionOf = new Map(rules.map((rule, position) => [rule, position]));
+
+  // Earlier rules still in force, per side, with the position they sit at. Resolvable addresses live in
+  // a sorted list of disjoint intervals (merged on insert, keeping the earliest position and rule), so
+  // an overlap check is a binary search.
+  // shortcut: a merged interval answers with its earliest member's position, so a decision made before
+  // a later row can over-block; that only keeps a pair one-way. Upgrade if that bites.
+  const newFacet = () => ({ any: null, unknown: null, intervals: [], earliest: null });
+  const facets = { destination: newFacet(), source: newFacet() };
+  const firstIntervalEnding = (intervals, first) => {
+    let low = 0;
+    let high = intervals.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (intervals[middle].last < first) low = middle + 1;
+      else high = middle;
+    }
+    return low;
+  };
+  const addToFacet = (facet, name, at, rule) => {
+    const entry = { at, rule: rule.name };
+    if (name === 'any') {
+      facet.any ??= entry;
+      return;
+    }
+    const range = rangeByName.get(name);
+    if (!range) {
+      facet.unknown ??= entry;
+      return;
+    }
+    const { intervals } = facet;
+    if (!facet.earliest || at < facet.earliest.at) facet.earliest = entry;
+    const start = firstIntervalEnding(intervals, range[0]);
+    let end = start;
+    let merged = { first: range[0], last: range[1], ...entry };
+    while (end < intervals.length && intervals[end].first <= merged.last) {
+      const other = intervals[end];
+      merged = {
+        first: Math.min(merged.first, other.first),
+        last: Math.max(merged.last, other.last),
+        ...(other.at < merged.at ? { at: other.at, rule: other.rule } : { at: merged.at, rule: merged.rule }),
+      };
+      end++;
+    }
+    intervals.splice(start, end - start, merged);
+  };
+  // Earliest generic rule with a specific source and destination "any": it wins for that source's traffic
+  // to a public address on Check Point, while a collapsed static rule translates it on the SRX.
+  let hairpinRule = null;
+  const addBlocker = (rule, at) => {
+    const sourceName = rule.src_addresses?.[0] ?? 'any';
+    const destinationName = rule.dst_addresses?.[0] ?? 'any';
+    addToFacet(facets.source, sourceName, at, rule);
+    // Inbound traffic comes from arbitrary sources. A rule limited to a known host or network that matches
+    // destination "any" only affects hairpin traffic from that source (residual difference: on the SRX the
+    // static rule translates that hairpin traffic instead); one that names the destination is a real rule about it.
+    if (sourceName === 'any' || !rangeByName.get(sourceName) || destinationName !== 'any') {
+      addToFacet(facets.destination, destinationName, at, rule);
+    }
+  };
+  /** Returns the name of an earlier rule (before position `before`) that could match `name`, else null. */
+  const findBlocker = (facet, name, before) => {
+    if (facet.any && facet.any.at < before) return facet.any.rule;
+    if (facet.unknown && facet.unknown.at < before) return facet.unknown.rule;
+    const { intervals } = facet;
+    if (intervals.length === 0) return null;
+    const range = rangeByName.get(name);
+    // An address range or group could overlap any interval, so the earliest rule decides.
+    if (!range) return facet.earliest.at < before ? facet.earliest.rule : null;
+    const index = firstIntervalEnding(intervals, range[0]);
+    const hit = intervals[index];
+    return hit && hit.first <= range[1] && hit.at < before ? hit.rule : null;
+  };
+
+  // Hosts a collapsed pair or one-way outbound row claims; a later destination NAT rule may also hit them.
+  let claimed = [];
+  const claimHost = (name, privateName) => claimed.push({ name, privateName });
+  const warnLaterDestinationNat = (rule) => {
+    if (claimed.length === 0) return;
+    const sourceName = rule.src_addresses?.[0] ?? 'any';
+    const sourceRange = rangeByName.get(sourceName);
+    const remaining = [];
+    for (const entry of claimed) {
+      const hostRange = rangeByName.get(entry.privateName);
+      const overlaps = sourceName === 'any' || sourceName === entry.privateName || !sourceRange || !hostRange
+        || rangesOverlap(sourceRange, hostRange);
+      if (!overlaps) {
+        remaining.push(entry);
+        continue;
+      }
+      warnings.push(createWarning('warning', `nat/static/${entry.name}`,
+        `Traffic from ${entry.privateName} to ${rule.dst_addresses?.[0] ?? 'any'} is also destination-translated on the SRX by rule "${rule.name}", which Check Point evaluates after "${entry.name}"`,
+        'Review the destination NAT rule; on Check Point the earlier rule wins, on the SRX both apply'));
+    }
+    claimed = remaining;
+  };
+
+  const skipped = (rule, element, message, suggestion) => {
+    warnings.push(createWarning('warning', `${element}/${rule.name}`, message, suggestion));
+  };
+  const oneWayOutbound = (rule, meta) => {
+    const staticFields = buildStaticNatFields({
+      name: rule.name,
+      privateAddresses: [meta.origSrc],
+      publicAddresses: [meta.transSrc],
+      destinationFilter: [meta.origDst],
+      insideZones: [],
+      outsideZones: [],
+      bidirectional: false,
+      services: [meta.origSvc],
+      warnings,
+    });
+    if (!staticFields) return null;
+    claimHost(rule.name, meta.origSrc);
+    return { ...rule, translated_src: null, ...staticFields };
+  };
+  const inboundDestination = (rule, meta, earlierRule) => {
+    if (earlierRule) {
+      skipped(rule, 'nat/destination',
+        `Destination NAT rule "${rule.name}" skipped — earlier rule "${earlierRule}" could match ${meta.origDst} first on Check Point, but Junos runs destination NAT before source NAT and would translate that traffic here`,
+        'Build the destination NAT rule manually after checking rule order');
+      return null;
+    }
+    // The destination NAT plan carries no source match, and a service name is not a port, so it would widen.
+    if (meta.origSrc !== 'any' || !isUnscoped(meta)) {
+      skipped(rule, 'nat/destination',
+        `Destination NAT rule "${rule.name}" skipped — it is limited to a specific source or service, which would be lost in the SRX destination rule`,
+        'Build the destination NAT rule manually with match source-address / destination-port');
+      return null;
+    }
+    // A destination pool maps every address to one, so a subnet or range mapping would lose its host offsets.
+    if (!singleAddressNames.has(meta.origDst) || !singleAddressNames.has(meta.transDst)) {
+      skipped(rule, 'nat/destination',
+        `Destination NAT rule "${rule.name}" skipped — it maps ${meta.origDst} to ${meta.transDst}, and only host-to-host mappings convert to an SRX destination pool`,
+        'Build the destination NAT rule manually');
+      return null;
+    }
+    const destinationRule = { ...rule, type: 'destination' };
+    warnLaterDestinationNat(destinationRule);
+    return destinationRule;
+  };
+
+  const converted = [];
+  const pending = new Map(); // first-seen row of an undecided pair -> its output slot
+  for (const rule of rules) {
+    const position = positionOf.get(rule);
+    const meta = rule._static;
+    delete rule._static;
+    if (!meta) {
+      const ruleSource = rule.src_addresses?.[0] ?? 'any';
+      if (!hairpinRule && ruleSource !== 'any' && rangeByName.get(ruleSource) && (rule.dst_addresses?.[0] ?? 'any') === 'any') {
+        hairpinRule = { name: rule.name, source: ruleSource, at: position };
+      }
+      if (rule.translated_dst) warnLaterDestinationNat(rule);
+      addBlocker(rule, position);
+      converted.push(rule);
+      continue;
+    }
+    if (!isUnchanged(meta.transSvc, meta.origSvc)) {
+      skipped(rule, 'nat/static',
+        `Static NAT rule "${rule.name}" skipped — it translates the service/port, which Junos static NAT cannot do`,
+        'Build a destination NAT rule manually for port translation');
+      addBlocker(rule, position);
+      continue;
+    }
+
+    const partner = partnerOf.get(rule);
+    if (partner && !pending.has(partner)) {
+      // Decide when the second row is reached; keep the first row's output slot until then.
+      pending.set(rule, { slot: converted.length, meta });
+      converted.push(null);
+      continue;
+    }
+    if (partner) {
+      const first = pending.get(partner);
+      pending.delete(partner);
+      const outbound = meta.direction === 'outbound' ? rule : partner;
+      const inbound = outbound === rule ? partner : rule;
+      const outboundMeta = outbound === rule ? meta : first.meta;
+      const inboundMeta = outbound === rule ? first.meta : meta;
+      const outboundPosition = positionOf.get(outbound);
+      const inboundPosition = positionOf.get(inbound);
+      const privateBlocker = findBlocker(facets.source, outboundMeta.origSrc, outboundPosition);
+      const publicBlocker = findBlocker(facets.destination, outboundMeta.transSrc, inboundPosition);
+      if (!privateBlocker && !publicBlocker) {
+        const staticFields = buildStaticNatFields({
+          name: outbound.name,
+          privateAddresses: [outboundMeta.origSrc],
+          publicAddresses: [outboundMeta.transSrc],
+          destinationFilter: [outboundMeta.origDst],
+          insideZones: [],
+          outsideZones: [],
+          bidirectional: true,
+          services: [outboundMeta.origSvc],
+          warnings,
+        });
+        if (staticFields) {
+          converted[first.slot] = { ...outbound, translated_src: null, ...staticFields };
+          claimHost(outbound.name, outboundMeta.origSrc);
+          if (hairpinRule && hairpinRule.at < inboundPosition) {
+            warnings.push(createWarning('warning', `nat/static/${outbound.name}`,
+              `Earlier NAT rule "${hairpinRule.name}" (source ${hairpinRule.source}, destination any) takes precedence on Check Point for traffic from ${hairpinRule.source} to ${outboundMeta.transSrc}; on the SRX static NAT translates it`,
+              'Review the static NAT rule; security policy still controls access'));
+          }
+        }
+        continue;
+      }
+      // Demoted: each half converts one-way, and both stay in force for later pairs.
+      const outboundOutput = oneWayOutbound(outbound, outboundMeta);
+      const inboundOutput = inboundDestination(inbound, inboundMeta, publicBlocker);
+      addBlocker(outbound, outboundPosition);
+      addBlocker(inbound, inboundPosition);
+      const firstIsOutbound = outbound === partner;
+      converted[first.slot] = firstIsOutbound ? outboundOutput : inboundOutput;
+      converted.push(firstIsOutbound ? inboundOutput : outboundOutput);
+      continue;
+    }
+
+    if (meta.direction === 'inbound') {
+      const output = inboundDestination(rule, meta, null);
+      addBlocker(rule, position);
+      converted.push(output);
+      continue;
+    }
+    const output = oneWayOutbound(rule, meta);
+    addBlocker(rule, position);
+    converted.push(output);
+  }
+  return converted.filter(Boolean);
+}
+
+/**
  * Builds a NAT rule from a Check Point nat-rule object.
  */
 function buildNatRule(rule, uidMap, ruleIndex, warnings) {
@@ -1199,9 +1515,13 @@ function buildNatRule(rule, uidMap, ruleIndex, warnings) {
   const origSrc = resolveUidToName(rule['original-source'], uidMap, warnings, 'nat/orig-src');
   const origDst = resolveUidToName(rule['original-destination'], uidMap, warnings, 'nat/orig-dst');
   const origSvc = resolveUidToName(rule['original-service'], uidMap, warnings, 'nat/orig-svc');
-  const transSrc = resolveUidToName(rule['translated-source'], uidMap, warnings, 'nat/trans-src');
-  const transDst = resolveUidToName(rule['translated-destination'], uidMap, warnings, 'nat/trans-dst');
-  const transSvc = resolveUidToName(rule['translated-service'], uidMap, warnings, 'nat/trans-svc');
+  // R80/R81 exports mark an untouched translated cell with the built-in "Original" object.
+  const resolveTranslated = (cell, original, context) => (
+    isOriginalObject(cell, uidMap) ? original : resolveUidToName(cell, uidMap, warnings, context)
+  );
+  const transSrc = resolveTranslated(rule['translated-source'], origSrc, 'nat/trans-src');
+  const transDst = resolveTranslated(rule['translated-destination'], origDst, 'nat/trans-dst');
+  const transSvc = resolveTranslated(rule['translated-service'], origSvc, 'nat/trans-svc');
 
   // Determine NAT type from method field
   const method = (rule.method || '').toLowerCase();
@@ -1228,9 +1548,19 @@ function buildNatRule(rule, uidMap, ruleIndex, warnings) {
     }
   }
 
+  // A static row translates one direction only; resolveDirectionalStaticNat pairs or converts it.
+  const isChanged = (translated, original) => translated && translated !== 'any' && translated !== original;
+  const translatesSource = isChanged(transSrc, origSrc);
+  const translatesDestination = isChanged(transDst, origDst);
+  let staticDirection = null;
+  if (method === 'static' && translatesSource !== translatesDestination) {
+    staticDirection = translatesSource ? 'outbound' : 'inbound';
+  }
+
   return {
     name: rule.name || `NAT-${ruleIndex}`,
     type,
+    ...(staticDirection ? { _static: { direction: staticDirection, origSrc, origDst, transSrc, transDst, origSvc, transSvc } } : {}),
     src_zones: [],
     dst_zones: [],
     src_addresses: [origSrc],
