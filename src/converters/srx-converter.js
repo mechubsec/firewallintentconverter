@@ -18,7 +18,7 @@
  * (clean / warning / unsupported) for the warnings panel.
  */
 
-import { sanitizeJunosName, mapAppToJunos, mapProfileToSrx, createWarning, isPredefEquivalent, JUNOS_PREDEFINED_APPS } from '../parsers/parser-utils.js';
+import { sanitizeJunosName, mapAppToJunos, hasSpecificService, mapProfileToSrx, createWarning, isPredefEquivalent, JUNOS_PREDEFINED_APPS } from '../parsers/parser-utils.js';
 import { hostInboundEntries, warnZonesWithoutHostInbound } from './srx-host-inbound.js';
 import { getJunosEmission } from '../utils/app-mappings.js';
 import {
@@ -2215,6 +2215,7 @@ function prepareApplicationGroupApplications(groups, warnings, sourceVendor, ide
  */
 function resolveApplications(applications, services, warnings, policyName, appGroups = [], sourceVendor = '', policyIndex, identifiers, identifierPath) {
   const resolved = [];
+  const servicesRestrict = hasSpecificService(services);
 
   // Helper to map a single app name to Junos using three-tier emission logic
   const mapSingleApp = (appName, localReferencePath) => {
@@ -2234,6 +2235,7 @@ function resolveApplications(applications, services, warnings, policyName, appGr
     for (let appIndex = 0; appIndex < applications.length; appIndex += 1) {
       const app = applications[appIndex];
       if (app === 'any') {
+        if (servicesRestrict) continue;
         resolved.push(identifiers.nameForReference(
           identifierPath(`security_policies[${policyIndex}].applications[${appIndex}]`),
         ));

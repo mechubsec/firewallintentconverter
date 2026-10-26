@@ -10,7 +10,7 @@
  * Phase 2+: Full XML with NAT, routing, VPN, UTM.
  */
 
-import { sanitizeJunosName, mapAppToJunos, mapProfileToSrx, createWarning, isPredefEquivalent } from '../parsers/parser-utils.js';
+import { sanitizeJunosName, mapAppToJunos, hasSpecificService, mapProfileToSrx, createWarning, isPredefEquivalent } from '../parsers/parser-utils.js';
 import {
   setEnum,
   setInteger,
@@ -1464,6 +1464,7 @@ function prepareXmlApplicationGroupApplications(groups, identifierNames) {
 
 function resolveApps(applications, services, warnings, policyName, appGroups = [], sourceVendor = '', policyIndex, identifierNames) {
   const resolved = [];
+  const servicesRestrict = hasSpecificService(services);
   const isSrxSource = sourceVendor === 'srx' || sourceVendor === 'greenfield' || sourceVendor === 'srx_healthcheck';
 
   // Helper to map a single app name to Junos (with Customfwic fallback)
@@ -1494,6 +1495,7 @@ function resolveApps(applications, services, warnings, policyName, appGroups = [
     for (let appIndex = 0; appIndex < applications.length; appIndex += 1) {
       const app = applications[appIndex];
       if (app === 'any') {
+        if (servicesRestrict) continue;
         resolved.push(identifierNames.reference(`security_policies[${policyIndex}].applications[${appIndex}]`));
         continue;
       }

@@ -539,6 +539,17 @@ const APP_MAP = {
   'lpd': 'junos-lpr',
 };
 
+/**
+ * True when a policy's services restrict the match: at least one entry that is
+ * not a vendor wildcard/keyword. An `application any` beside such a service
+ * must not widen the policy back to any (PAN-OS: application any AND service S = S).
+ * @param {string[]} [services]
+ * @returns {boolean}
+ */
+export function hasSpecificService(services) {
+  return (services || []).some(svc => svc !== 'any' && svc !== 'application-default' && svc !== 'service-set');
+}
+
 export function mapAppToJunos(appName, sourceVendor = '') {
   if (!appName) return null;
 
