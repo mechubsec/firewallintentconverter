@@ -222,7 +222,7 @@ export const JUNOS_PREDEFINED_APPS = new Set([
   'junos-sun-rpc-program-status', 'junos-sun-rpc-program-walld',
   'junos-sun-rpc-program-ypbind',
   // Security & Tunnel
-  'junos-ike', 'junos-ike-nat', 'junos-l2tp', 'junos-pptp',
+  'junos-ike', 'junos-ike-nat', 'junos-l2tp', 'junos-pptp', 'junos-gre',
   // IP catch-all
   'junos-tcp-any', 'junos-udp-any',
   // IM / P2P
@@ -418,6 +418,7 @@ const APP_MAP = {
   'syslog-ng': 'junos-syslog',
   'citrix': 'junos-winframe',
   'citrix-online': 'junos-winframe',
+  'gre': 'junos-gre',  // IP protocol 47 (junos-defaults: application junos-gre term t1 protocol 47)
   // Misc management
   'finger': 'junos-finger',
   'gopher': 'junos-gopher',
@@ -487,6 +488,7 @@ const APP_MAP = {
   'BGP': 'junos-bgp',
   'OSPF': 'junos-ospf',
   'RIP': 'junos-rip',
+  'GRE': 'junos-gre',
   'STUN': 'junos-stun',
   'QUIC': 'junos-quic',
   'FINGER': 'junos-finger',

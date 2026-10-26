@@ -48,12 +48,14 @@ describe('built-in services in policy reference integrity', () => {
     expect(xmlOutput(config)).not.toContain('inactive="inactive"');
   });
 
-  it('keeps GRE flagged: it has no equivalent Junos predefined application', () => {
+  it('maps GRE to junos-gre (IP protocol 47), never junos-udp-any', () => {
     const config = buildConfig(['GRE']);
-    expect(findPolicyReferenceIssues(config).get(0).services).toEqual(['GRE']);
+    expect(findPolicyReferenceIssues(config).size).toBe(0);
     const set = setOutput(config);
-    expect(set).toMatch(/^deactivate .*policy p1/m);
+    expect(set).not.toMatch(/^deactivate /m);
+    expect(set).toContain('match application junos-gre');
     expect(set).not.toContain('junos-udp-any');
+    expect(xmlOutput(config)).toContain('junos-gre');
   });
 
   it('still deactivates an unknown service name', () => {
