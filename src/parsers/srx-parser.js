@@ -1061,7 +1061,7 @@ function parseSinglePolicy(name, data, srcZones, dstZones, ruleIndex, warnings) 
   // Action
   let action = 'deny';
   const thenNode = data.then || {};
-  if (thenNode.permit !== undefined) action = 'permit';
+  if (thenNode.permit !== undefined) action = 'allow';
   else if (thenNode.deny !== undefined) action = 'deny';
   else if (thenNode.reject !== undefined) action = 'reject';
 

@@ -287,7 +287,7 @@ export function parseAzureNsg(configText) {
     const uniqueServices = [...new Set(serviceNames)];
 
     const isInbound = direction === 'inbound';
-    const action = access === 'allow' ? 'permit' : 'deny';
+    const action = access === 'allow' ? 'allow' : 'deny';
 
     securityPolicies.push({
       name: ruleName,

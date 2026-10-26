@@ -407,7 +407,7 @@ function buildRulesFromPermission(perm, ctx) {
       dst_addresses: isInbound ? ['any'] : [addressRef],
       services: [serviceName],
       applications: ['any'],
-      action: 'permit',
+      action: 'allow',
       logging: true,
       disabled: false,
       description: description || `${direction} rule from SG ${sgName} (${groupId})`,
