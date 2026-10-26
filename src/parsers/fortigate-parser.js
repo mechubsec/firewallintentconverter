@@ -1464,6 +1464,13 @@ function parseZones(tree, warnings) {
 }
 
 // --- Interfaces ---
+// FortiOS allowaccess tokens with an SRX host-inbound system-service equivalent.
+const ALLOWACCESS_TO_SRX_SERVICE = {
+  ping: 'ping', https: 'https', http: 'http', ssh: 'ssh', telnet: 'telnet', snmp: 'snmp',
+};
+
+const accessTokens = value => ensureArray(value).flatMap(token => String(token).split(/\s+/)).filter(Boolean);
+
 function parseInterfaces(tree, warnings) {
   const ifaceSection = tree['system interface'] || {};
   const interfaces = [];
@@ -1471,23 +1478,56 @@ function parseInterfaces(tree, warnings) {
   for (const [name, entry] of Object.entries(ifaceSection)) {
     if (typeof entry !== 'object') continue;
     // Extract IPv6 address from FortiGate ipv6 block
-    const ipv6Block = entry['ipv6'];
-    const ipv6 = (ipv6Block && typeof ipv6Block === 'object')
-      ? getString(ipv6Block['ip6-address']) || ''
-      : '';
+    const ipv6Block = entry['ipv6'] && typeof entry['ipv6'] === 'object' ? entry['ipv6'] : {};
+    const ipv6 = getString(ipv6Block['ip6-address']) || '';
+    const ipv4 = ipMaskToCidr(entry['ip']);
+    const ipv4Access = accessTokens(entry['allowaccess']);
+    const ipv6Access = accessTokens(ipv6Block['ip6-allowaccess']);
+    const mode = getString(entry['mode']) || 'static';
+    const ipv6Mode = getString(ipv6Block['ip6-mode']) || '';
+    const hasIpv4 = (ipv4 !== '' && !ipv4.startsWith('0.0.0.0')) || mode === 'dhcp' || mode === 'pppoe';
+    // Full-config exports default ip6-address to ::/0, which means "no IPv6 address".
+    const hasIpv6 = (ipv6 !== '' && !/^::(\/0)?$/.test(ipv6)) || ['dhcp', 'pppoe', 'delegated'].includes(ipv6Mode);
+    // SRX host-inbound-traffic isn't per address family: an IPv6-only interface uses ip6-allowaccess, others allowaccess.
+    const allowaccess = !hasIpv4 && hasIpv6 ? ipv6Access : ipv4Access;
+    if (hasIpv4 && hasIpv6 && [...ipv4Access].sort().join(' ') !== [...ipv6Access].sort().join(' ')) {
+      warnings.push(createWarning('warning', `interfaces/${name}`,
+        `Interface ${name}: allowaccess (${ipv4Access.join(' ') || 'none'}) and ip6-allowaccess (${ipv6Access.join(' ') || 'none'}) differ; SRX host-inbound-traffic applies to both address families, so the IPv4 list was used`,
+        'Review host-inbound-traffic on this interface; SRX cannot restrict it per address family'));
+    }
+    const unmapped = allowaccess.filter(token => !ALLOWACCESS_TO_SRX_SERVICE[token]);
+    if (unmapped.length > 0) {
+      warnings.push(createWarning('warning', `interfaces/${name}`,
+        `allowaccess ${unmapped.join(', ')} on interface ${name} has no SRX host-inbound-traffic equivalent and was dropped`,
+        'Configure equivalent management access on the SRX manually if needed'));
+    }
     interfaces.push({
       name,
+      allowaccess: allowaccess.filter(token => ALLOWACCESS_TO_SRX_SERVICE[token]).map(token => ALLOWACCESS_TO_SRX_SERVICE[token]),
       alias: getString(entry['alias']) || '',
-      ip: ipMaskToCidr(entry['ip']),
+      ip: ipv4,
       ipv6,
       type: getString(entry['type']) || 'physical',
       vdom: getString(entry['vdom']) || 'root',
-      mode: getString(entry['mode']) || 'static',
+      mode,
       dedicated_to: getString(entry['dedicated-to']) || '',
       fortilink: getString(entry['fortilink']) === 'enable',
       status: getString(entry['status']) || 'up',
       zone: '', // will be filled by zone data
     });
+  }
+  const daemonServices = [...new Set(interfaces.flatMap(iface => iface.allowaccess))].filter(service => service !== 'ping');
+  if (daemonServices.length > 0) {
+    warnings.push(createWarning('warning', 'interfaces/allowaccess',
+      `allowaccess ${daemonServices.join(', ')} is converted to host-inbound-traffic only; the SRX service configuration (system services ssh/telnet, web-management http/https, snmp) is not generated`,
+      'Enable the matching services on the SRX, or management access on these interfaces will not work'));
+  }
+  const hasLocalIn = ['firewall local-in-policy', 'firewall local-in-policy6']
+    .some(section => Object.keys(tree[section] || {}).length > 0);
+  if (hasLocalIn && interfaces.some(iface => iface.allowaccess.length > 0)) {
+    warnings.push(createWarning('warning', 'interfaces/local-in-policy',
+      'config firewall local-in-policy restricts management access on the FortiGate but is not translated: the SRX host-inbound-traffic allows the converted allowaccess services from any source',
+      'Restrict them on the SRX with a lo0 firewall filter or junos-host security policies'));
   }
   return interfaces;
 }
@@ -1529,6 +1569,24 @@ function mergeZonesAndInterfaces(zones, interfaces, policies, natRules = [], lag
   }
 
   zoneAllL3InterfacesForAny({ zoneMap, ifaceToZone, interfaces, policies, natRules, lagMemberNames, warnings });
+
+  // Empty allowaccess is recorded too: it means nothing is allowed, not "unknown".
+  const zonedInterfaces = new Set();
+  for (const zone of Object.values(zoneMap)) {
+    for (const ifaceName of zone.interfaces) {
+      zonedInterfaces.add(ifaceName);
+      const iface = interfaces.find(candidate => candidate.name === ifaceName);
+      if (!iface) continue;
+      zone.interface_host_inbound_traffic ??= {};
+      zone.interface_host_inbound_traffic[ifaceName] = { system_services: [...iface.allowaccess], protocols: [] };
+    }
+  }
+  const unzonedAccess = interfaces.filter(iface => iface.allowaccess.length > 0 && !zonedInterfaces.has(iface.name));
+  if (unzonedAccess.length > 0) {
+    warnings.push(createWarning('warning', 'interfaces/allowaccess',
+      `allowaccess on ${unzonedAccess.map(iface => iface.name).join(', ')} was not converted: these interfaces are in no zone and no policy`,
+      'Add each interface to a security zone on the SRX with the host-inbound-traffic it needs (e.g. a management zone)'));
+  }
 
   return Object.values(zoneMap);
 }

@@ -30,6 +30,7 @@ import {
 import { canonicalizeJunosSecurityFeatures } from '../security/junos-identifier-catalog.js';
 import { validateXmlOutput } from '../security/junos-output-validation.js';
 import { versionStamp } from '../version.js';
+import { hostInboundEntries, warnZonesWithoutHostInbound } from './srx-host-inbound.js';
 import { planNat } from './nat-plan.js';
 
 /**
@@ -135,7 +136,7 @@ export function buildSrxXml(config, interfaceMappings = {}, targetContext = null
   lines.push(`${indent}<security>`);
 
   // Zones
-  buildZonesXml(config.zones, lines, interfaceMappings, identifierNames);
+  buildZonesXml(config.zones, lines, interfaceMappings, identifierNames, warnings);
 
   // Address book
   buildAddressBookXml(config.address_objects, config.address_groups, lines, identifierNames);
@@ -255,7 +256,24 @@ function mapZoneInterfaceName(iface, interfaceMappings = {}) {
   return iface;
 }
 
-function buildZonesXml(zones, lines, interfaceMappings = {}, identifierNames) {
+function hostInboundXml(access, element, warnings, pad) {
+  const { services, protocols } = hostInboundEntries(access, element, warnings);
+  if (services.length === 0 && protocols.length === 0) return [];
+  const entry = (tag, { name, except }) => [
+    `${pad}  <${tag}>`,
+    `${pad}    <name>${xmlText(name)}</name>`,
+    ...(except ? [`${pad}    <except/>`] : []),
+    `${pad}  </${tag}>`,
+  ];
+  return [
+    `${pad}<host-inbound-traffic>`,
+    ...services.flatMap(item => entry('system-services', item)),
+    ...protocols.flatMap(item => entry('protocols', item)),
+    `${pad}</host-inbound-traffic>`,
+  ];
+}
+
+function buildZonesXml(zones, lines, interfaceMappings = {}, identifierNames, warnings = []) {
   if (!zones || zones.length === 0) return;
 
   lines.push('    <zones>');
@@ -268,14 +286,17 @@ function buildZonesXml(zones, lines, interfaceMappings = {}, identifierNames) {
     if (zone.description) {
       lines.push(`        <description>${xmlText(zone.description)}</description>`);
     }
+    lines.push(...hostInboundXml(zone.host_inbound_traffic, `zones/${name}`, warnings, '        '));
     for (const iface of zone.interfaces || []) {
       const srxIface = mapZoneInterfaceName(iface, interfaceMappings);
       lines.push(`        <interfaces>`);
       lines.push(`          <name>${xmlText(srxIface)}</name>`);
+      lines.push(...hostInboundXml(zone.interface_host_inbound_traffic?.[iface], `zones/${name}/${srxIface}`, warnings, '          '));
       lines.push(`        </interfaces>`);
     }
     lines.push(`      </security-zone>`);
   }
+  warnZonesWithoutHostInbound(zones, warnings);
   lines.push('    </zones>');
 }
 

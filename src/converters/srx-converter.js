@@ -19,6 +19,7 @@
  */
 
 import { sanitizeJunosName, mapAppToJunos, mapProfileToSrx, createWarning, isPredefEquivalent, JUNOS_PREDEFINED_APPS } from '../parsers/parser-utils.js';
+import { hostInboundEntries, warnZonesWithoutHostInbound } from './srx-host-inbound.js';
 import { getJunosEmission } from '../utils/app-mappings.js';
 import {
   setAddressOrPrefix,
@@ -428,10 +429,11 @@ function convertZones(zones, commands, warnings, summary, interfaceMappings = {}
       }
       assignedInterfaces.set(srxIface, zoneName);
       commands.push(`set security zones security-zone ${zoneName} interfaces ${srxIface}`);
+      pushHostInbound(commands, warnings, `set security zones security-zone ${zoneName} interfaces ${srxIface}`,
+        zone.interface_host_inbound_traffic?.[iface], `zones/${zoneName}/${srxIface}`);
     }
 
-    // Allow host-inbound traffic defaults (common SRX requirement)
-    commands.push(`set security zones security-zone ${zoneName} host-inbound-traffic system-services ping`);
+    pushHostInbound(commands, warnings, `set security zones security-zone ${zoneName}`, zone.host_inbound_traffic, `zones/${zoneName}`);
 
     if (zone.description) {
       commands.push(`set security zones security-zone ${zoneName} description ${setQuoted(zone.description, 'zones.description')}`);
@@ -440,7 +442,18 @@ function convertZones(zones, commands, warnings, summary, interfaceMappings = {}
     summary.zones_converted++;
   }
 
+  warnZonesWithoutHostInbound(zones, warnings);
   commands.push('');
+}
+
+function pushHostInbound(commands, warnings, prefix, access, element) {
+  const { services, protocols } = hostInboundEntries(access, element, warnings);
+  for (const { name, except } of services) {
+    commands.push(`${prefix} host-inbound-traffic system-services ${name}${except ? ' except' : ''}`);
+  }
+  for (const { name, except } of protocols) {
+    commands.push(`${prefix} host-inbound-traffic protocols ${name}${except ? ' except' : ''}`);
+  }
 }
 
 /**
