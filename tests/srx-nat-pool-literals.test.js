@@ -6,9 +6,42 @@
 
 import { describe, it, expect } from 'vitest';
 import { convertToSrxSetCommands } from '../src/converters/srx-converter.js';
+import { buildSrxXml } from '../src/converters/srx-xml-builder.js';
 import { validateSetOutput } from '../src/security/junos-output-validation.js';
 
 describe('NAT Pool Literal Addresses (Issue #35)', () => {
+  it.each([
+    ['source', { src_addresses: ['ghost', '192.0.2.0/24'] }, 'not a known address object'],
+    ['source', { src_addresses: ['fqdn', '192.0.2.0/24'] }, 'resolves to FQDN'],
+    ['source', { translated_src: { type: 'static', address: 'ghost' } }, 'fell back to interface NAT'],
+    ['source', { translated_src: { type: 'dynamic-ip-pool', addresses: ['ghost'] } }, 'not a known address object'],
+    ['destination', { translated_dst: { address: 'ghost' } }, 'Destination NAT rule'],
+    ['static', { translated_src: { address: 'ghost' } }, 'Static NAT rule'],
+  ])('reports usable %s NAT warnings for %j', (type, overrides, message) => {
+    const config = {
+      zones: [{ name: 'trust' }, { name: 'untrust' }],
+      address_objects: [{ name: 'fqdn', value: 'host.example.invalid' }],
+      nat_rules: [{
+        name: 'warning-case', type, enabled: true,
+        src_zones: ['trust'], dst_zones: ['untrust'],
+        src_addresses: ['192.0.2.0/24'], dst_addresses: ['203.0.113.10'],
+        ...overrides,
+      }],
+    };
+    for (const result of [convertToSrxSetCommands(config), buildSrxXml(config)]) {
+      const natWarnings = result.warnings.filter(w => w.element?.startsWith('nat/'));
+      expect(natWarnings.length).toBeGreaterThan(0);
+      expect(natWarnings.some(w => w.message?.includes(message))).toBe(true);
+      for (const warning of natWarnings) {
+        expect(warning.severity).toBe('warning');
+        expect(warning.element).toBe(`nat/${type}/warning-case`);
+        expect(typeof warning.message).toBe('string');
+        expect(warning.message.length).toBeGreaterThan(0);
+        expect(typeof warning.suggestion).toBe('string');
+      }
+    }
+  });
+
   describe('Static Source NAT', () => {
     it('should fall back to interface NAT when translated address is undefined', () => {
       const config = {

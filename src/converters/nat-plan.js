@@ -205,41 +205,41 @@ export function planNat({
   const groupNames = new Set((addressGroups || []).map(group => group.name));
 
   // Junos NAT match/pool addresses must be IPs, not address-book names.
-  const resolveNatAddress = addr => {
+  const resolveNatAddress = (addr, element) => {
     if (!addr || addr === 'any') return null;
     if (isLiteralAddress(addr)) return addr;
     const resolved = addrLookup[addr];
     if (!resolved) {
-      warnings.push(createWarning('warning', `nat/address/${addr}`,
+      warnings.push(createWarning('warning', element,
         `NAT match address "${addr}" is not a known address object — skipped`,
         'Define the address object, or use an IP/prefix in the NAT rule'));
       return null;
     }
     // Skip FQDN / dns-name values (not usable in NAT match)
     if (!/^\d+\.\d+\.\d+\.\d+/.test(resolved) && !/^[0-9a-fA-F:]+/.test(resolved)) {
-      warnings.push(createWarning('warning', `nat/address/${addr}`,
+      warnings.push(createWarning('warning', element,
         `NAT match address "${addr}" resolves to FQDN "${resolved}" — skipped (Junos NAT requires IP)`,
         'Replace the FQDN with an IP/prefix in the NAT rule'));
       return null;
     }
     return resolved;
   };
-  const matchAddress = (ruleIndex, field, addressIndex, rawAddress) => {
+  const matchAddress = (ruleIndex, field, addressIndex, rawAddress, element) => {
     const plannedName = naming.reference(`nat_rules[${ruleIndex}].${field}[${addressIndex}]`);
     // A defined object wins over a name that merely looks like an address.
     const literal = isLiteralAddress(rawAddress) && !rawAddressNames.has(rawAddress);
-    return resolveNatAddress(literal ? rawAddress : plannedName);
+    return resolveNatAddress(literal ? rawAddress : plannedName, element);
   };
   // Object names carry no colon, so the wildcard family follows the address each name resolves to.
   const natAnyAddress = rule => natAnyAddressWith(rule, addr => addrLookup[rawAddressNames.get(addr) || addr] || addr);
-  const translatedAddress = rawAddress => (
-    resolveNatAddress(rawAddressNames.get(rawAddress) || rawAddress)
+  const translatedAddress = (rawAddress, element) => (
+    resolveNatAddress(rawAddressNames.get(rawAddress) || rawAddress, element)
   );
   // A "start-end" source pool range (FortiGate ippool) is Junos "A/32 to B/32".
   // A range object (ASA `range A B`) resolves to the same "A-B" form.
-  const sourcePoolAddress = rawAddress => {
+  const sourcePoolAddress = (rawAddress, element) => {
     const literal = String(rawAddress || '');
-    const resolved = IPV4_RANGE.test(literal) ? literal : translatedAddress(rawAddress);
+    const resolved = IPV4_RANGE.test(literal) ? literal : translatedAddress(rawAddress, element);
     if (!resolved) return null;
     const range = resolved.match(IPV4_RANGE);
     return range ? { prefix: `${range[1]}/32`, to: `${range[2]}/32` } : { prefix: withPrefix(resolved) };
@@ -338,7 +338,7 @@ export function planNat({
    * Plans one match field. A field that listed addresses but resolved none
    * must not become "match anything", so it reports `unresolved`.
    */
-  const planMatchField = (ruleIndex, rule, field, { anyAddress, allowGroups, keepAny, limit = Infinity }) => {
+  const planMatchField = (ruleIndex, rule, field, { anyAddress, allowGroups, keepAny, limit = Infinity, element }) => {
     const addresses = rule[field];
     if (!Array.isArray(addresses)) return { entries: keepAny ? [{ kind: 'prefix', value: anyAddress }] : [], unresolved: false };
     const entries = [];
@@ -354,7 +354,7 @@ export function planNat({
         entries.push({ kind: 'address-name', value: naming.reference(referencePath) });
         succeeded += 1;
       } else {
-        const resolved = matchAddress(ruleIndex, field, addressIndex, addr);
+        const resolved = matchAddress(ruleIndex, field, addressIndex, addr, element);
         if (!resolved) continue;
         // Junos NAT match fields take prefixes, not "start-end", so a range becomes its covering prefixes.
         const range = resolved.match(IPV4_RANGE);
@@ -471,7 +471,7 @@ export function planNat({
     }
   };
 
-  const planSourceThen = (ruleIndex, rule, comments, sourceEntries) => {
+  const planSourceThen = (ruleIndex, rule, comments, sourceEntries, element) => {
     const translated = rule.translated_src;
     const interfaceThen = { kind: 'interface' };
     if (!translated) return interfaceThen;
@@ -498,7 +498,7 @@ export function planNat({
     }
     if (translated.type === 'dynamic-ip-pool') {
       const poolName = naming.generated(`nat_rules[${ruleIndex}]`, 'source-nat-pool');
-      const addresses = (translated.addresses || []).map(sourcePoolAddress);
+      const addresses = (translated.addresses || []).map(address => sourcePoolAddress(address, element));
       if (addresses.length > 0 && addresses.every(Boolean)) {
         // A pool range the source disabled ARP replies for is left to the user's own ARP setup.
         const arpDisabled = translated.arp_reply_disabled || [];
@@ -513,7 +513,7 @@ export function planNat({
     }
     if (translated.type === 'static') {
       const poolName = naming.generated(`nat_rules[${ruleIndex}]`, 'static-source-nat-pool');
-      const resolved = translatedAddress(translated.address);
+      const resolved = translatedAddress(translated.address, element);
       if (resolved) {
         const publicPrefix = withPrefix(resolved);
         const pool = { name: poolName, addresses: [{ prefix: publicPrefix }] };
@@ -528,7 +528,7 @@ export function planNat({
       }
       if (translated.one_way) return { kind: 'skip', reason: `its translated address "${oneLine(translated.address)}" could not be resolved to an IP/prefix` };
       comments.push(`NAT: translated source "${translated.address}" is not a resolvable IP/prefix — using interface NAT`);
-      warnings.push(createWarning('warning', `nat/source/${rule.name || ruleIndex}`,
+      warnings.push(createWarning('warning', element,
         `Source NAT translated address "${translated.address}" could not be resolved to an IP/prefix — fell back to interface NAT`,
         'Check the translated address; interface NAT may not match the source rule'));
       return interfaceThen;
@@ -578,7 +578,7 @@ export function planNat({
         ruleSet.rules.push(planned);
 
         const anyAddress = natAnyAddress(rule);
-        const options = { anyAddress, allowGroups: true, keepAny: true, limit: NAT_MATCH_ADDRESS_LIMIT };
+        const options = { anyAddress, allowGroups: true, keepAny: true, limit: NAT_MATCH_ADDRESS_LIMIT, element: `nat/source/${name}` };
         const source = planMatchField(ruleIndex, rule, 'src_addresses', options);
         const destination = planMatchField(ruleIndex, rule, 'dst_addresses', options);
         const unresolvedField = source.unresolved ? 'src_addresses' : (destination.unresolved ? 'dst_addresses' : null);
@@ -593,7 +593,7 @@ export function planNat({
           protocol: planProtocol(rule),
           destinationPorts: planPorts(rule),
         };
-        planned.then = planSourceThen(ruleIndex, rule, planned.thenComments, source.entries);
+        planned.then = planSourceThen(ruleIndex, rule, planned.thenComments, source.entries, options.element);
         if (planned.then.kind === 'skip') {
           planned.skipped = true;
           comments.push(`WARNING: Static NAT rule ${name} skipped — ${planned.then.reason}`);
@@ -656,7 +656,7 @@ export function planNat({
           const rawDestination = typeof rule.translated_dst === 'string'
             ? rule.translated_dst : rule.translated_dst.address || '';
           if (rawDestination) {
-            resolvedDestination = translatedAddress(rawDestination);
+            resolvedDestination = translatedAddress(rawDestination, `nat/destination/${ruleName}`);
             if (!resolvedDestination) {
               planned.skipped = true;
               comments.push(`NAT: destination rule "${ruleName}" skipped — translated destination "${rawDestination}" is not a resolvable IP/prefix`);
@@ -669,7 +669,7 @@ export function planNat({
         }
 
         const destination = planMatchField(ruleIndex, rule, 'dst_addresses',
-          { anyAddress: natAnyAddress(rule), allowGroups: false, keepAny: true });
+          { anyAddress: natAnyAddress(rule), allowGroups: false, keepAny: true, element: `nat/destination/${ruleName}` });
         if (destination.unresolved) {
           planned.skipped = true;
           comments.push(skipUnresolved('destination', ruleName, 'dst_addresses', rule));
@@ -747,7 +747,7 @@ export function planNat({
         }
 
         const destination = planMatchField(ruleIndex, rule, 'dst_addresses',
-          { anyAddress: natAnyAddress(rule), allowGroups: false, keepAny: false });
+          { anyAddress: natAnyAddress(rule), allowGroups: false, keepAny: false, element: `nat/static/${ruleName}` });
         if (destination.unresolved) {
           planned.skipped = true;
           comments.push(skipUnresolved('static', ruleName, 'dst_addresses', rule));
@@ -755,7 +755,7 @@ export function planNat({
         }
         let prefix = null;
         if (rule.translated_src && rule.translated_src.address) {
-          prefix = translatedAddress(rule.translated_src.address);
+          prefix = translatedAddress(rule.translated_src.address, `nat/static/${ruleName}`);
           if (!prefix) {
             planned.skipped = true;
             comments.push(`NAT: static rule "${ruleName}" skipped — translated address "${rule.translated_src.address}" is not a resolvable IP/prefix`);
