@@ -47,6 +47,25 @@ export function computeSummaryPure(policies, appSessions = []) {
 }
 
 /**
+ * Build a lookup from config policy to its device stats entry. SRX policy names
+ * repeat across zone pairs, so entries that carry from_zone/to_zone only match
+ * a policy whose zones include them; entries without zones match by name.
+ *
+ * @param {Array} statsPolicies - statsData.policies
+ * @returns {Function} (configPolicy) => stats entry | undefined
+ */
+export function buildPolicyStatsLookup(statsPolicies) {
+  const statsByName = new Map();
+  for (const entry of statsPolicies) {
+    if (!statsByName.has(entry.name)) statsByName.set(entry.name, []);
+    statsByName.get(entry.name).push(entry);
+  }
+  return (policy) => (statsByName.get(policy.name) || []).find(entry =>
+    (!entry.from_zone || (policy.src_zones || []).includes(entry.from_zone))
+    && (!entry.to_zone || (policy.dst_zones || []).includes(entry.to_zone)));
+}
+
+/**
  * Annotate config policies with stats data (pure, no React/dispatch).
  *
  * @param {Array} configPolicies - security_policies array from intermediateConfig
@@ -58,10 +77,7 @@ export function annotateConfigPure(configPolicies, statsData) {
     return { annotatedPolicies: configPolicies || [], matchCount: 0, matchRate: 1 };
   }
 
-  const statsByName = new Map();
-  for (const policy of statsData.policies) {
-    statsByName.set(policy.name, policy);
-  }
+  const findPolicyStats = buildPolicyStatsLookup(statsData.policies);
 
   const appSessionMap = new Map();
   for (const appEntry of (statsData.app_sessions || [])) {
@@ -72,7 +88,7 @@ export function annotateConfigPure(configPolicies, statsData) {
   const timestamp = new Date().toISOString();
 
   const annotatedPolicies = configPolicies.map(policy => {
-    const policyStats = statsByName.get(policy.name);
+    const policyStats = findPolicyStats(policy);
     if (!policyStats) return policy;
 
     matchCount++;
@@ -298,10 +314,7 @@ export default function useDay2Ops() {
     const activeStats = overrideStats || stats;
     if (!activeStats || !intermediateConfig?.security_policies) return;
 
-    const statsByName = new Map();
-    for (const policy of activeStats.policies) {
-      statsByName.set(policy.name, policy);
-    }
+    const findPolicyStats = buildPolicyStatsLookup(activeStats.policies);
 
     // Build app session lookup: application → sessions
     const appSessionMap = new Map();
@@ -313,7 +326,7 @@ export default function useDay2Ops() {
     const timestamp = new Date().toISOString();
 
     const annotatedPolicies = intermediateConfig.security_policies.map(policy => {
-      const policyStats = statsByName.get(policy.name);
+      const policyStats = findPolicyStats(policy);
       if (!policyStats) return policy;
 
       matchCount++;

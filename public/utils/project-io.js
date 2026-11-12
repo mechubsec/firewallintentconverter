@@ -27,7 +27,7 @@ const STATE_KEYS = [
   'conversionSummary', 'outputFormat', 'targetContext', 'greenfieldMode',
   'greenfieldTemplate', 'editTab', 'platformView', 'bottomTab',
   'mergeMode', 'configSlots', 'activeSlotIndex', 'crossLsLinks',
-  'ruleGroups',
+  'ruleGroups', 'sectionAcceptance',
 ];
 
 const STATE_DEFAULTS = {
@@ -63,6 +63,7 @@ const STATE_DEFAULTS = {
   activeSlotIndex: 0,
   crossLsLinks: [],
   ruleGroups: [],
+  sectionAcceptance: {},
 };
 
 /**

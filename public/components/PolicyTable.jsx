@@ -336,7 +336,7 @@ export default function PolicyTable({
         className="bulk-checkbox"
         checked={allSelected}
         ref={el => { if (el) el.indeterminate = someSelected && !allSelected; }}
-        onChange={() => onSelectAllRules && onSelectAllRules(!allSelected)}
+        onChange={() => onSelectAllRules && onSelectAllRules(!allSelected, displayPolicies)}
         onClick={(e) => e.stopPropagation()}
       />
     </th>
@@ -350,7 +350,7 @@ export default function PolicyTable({
         checked={selectedRuleKeys.has(makeKey(policy))}
         onChange={(ev) => {
           ev.stopPropagation();
-          onToggleRuleSelect && onToggleRuleSelect(policy, ev.nativeEvent);
+          onToggleRuleSelect && onToggleRuleSelect(policy, ev.nativeEvent, displayPolicies);
         }}
         onClick={(ev) => ev.stopPropagation()}
       />
@@ -359,7 +359,7 @@ export default function PolicyTable({
 
   const handleRowClick = (policy, isSelected, e) => {
     if (e.ctrlKey || e.metaKey || e.shiftKey) {
-      onToggleRuleSelect && onToggleRuleSelect(policy, e);
+      onToggleRuleSelect && onToggleRuleSelect(policy, e, displayPolicies);
     } else {
       onSelectRule(isSelected ? null : policy);
     }
