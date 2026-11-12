@@ -9,18 +9,23 @@
  * interface generation.
  */
 
+import { createWarning } from '../../src/parsers/parser-utils.js';
+
 /**
  * Splits a single intermediateConfig with multiple routing contexts
  * into an array of config slot objects, one per vsys/VDOM/logical-system.
  *
  * @param {Object} intermediateConfig - Parsed intermediate JSON with routing_contexts.length > 1
- * @returns {Array<{lsName: string, intermediateConfig: Object}>|null} Null if no split needed
+ * @returns {Array<{lsName: string, intermediateConfig: Object, warnings: Array}>|null} Null if no split needed
  */
 export function autoSplitRoutingContexts(intermediateConfig) {
   const contexts = intermediateConfig.routing_contexts || [];
   if (contexts.length <= 1) return null;
 
   const slots = [];
+  const usedLsNames = new Set();
+  const policySlotCount = new Map();
+  const routeSlotCount = new Map();
 
   for (const ctx of contexts) {
     // Skip default routing context (it has no zone ownership data)
@@ -42,6 +47,8 @@ export function autoSplitRoutingContexts(intermediateConfig) {
       const dstMatch = (p.dst_zones || []).some(z => z === 'any' || ctxZoneNames.has(z));
       return srcMatch || dstMatch;
     });
+
+    for (const p of policies) policySlotCount.set(p, (policySlotCount.get(p) || 0) + 1);
 
     // Filter NAT rules similarly
     const natRules = (intermediateConfig.nat_rules || []).filter(r => {
@@ -120,12 +127,18 @@ export function autoSplitRoutingContexts(intermediateConfig) {
       r => !r.routing_context || r.routing_context === ctx.name
     );
 
+    for (const r of staticRoutes) routeSlotCount.set(r, (routeSlotCount.get(r) || 0) + 1);
+
     // Schedules, screen config, etc. — include all (shared)
     const schedules = intermediateConfig.schedules || [];
     const screenConfig = intermediateConfig.screen_config || [];
 
     // Sanitize LS name for Junos compatibility
-    const lsName = sanitizeLsName(ctx.name);
+    const baseLsName = sanitizeLsName(ctx.name);
+    let lsName = baseLsName;
+    // 'a b' and 'a-b' sanitize identically; keep slot names unique
+    for (let suffix = 2; usedLsNames.has(lsName); suffix++) lsName = `${baseLsName}-${suffix}`;
+    usedLsNames.add(lsName);
 
     slots.push({
       lsName,
@@ -170,7 +183,32 @@ export function autoSplitRoutingContexts(intermediateConfig) {
     });
   }
 
-  return slots.length > 0 ? slots : null;
+  if (slots.length === 0) return null;
+
+  const warnings = collectSplitWarnings(intermediateConfig, policySlotCount, routeSlotCount);
+  for (const slot of slots) slot.warnings = warnings;
+  return slots;
+}
+
+/**
+ * Warns about items the split silently dropped or copied into several slots.
+ */
+function collectSplitWarnings(intermediateConfig, policySlotCount, routeSlotCount) {
+  const warnings = [];
+  const describe = (items) => items.slice(0, 5).map(item => item.name || item.destination || '(unnamed)').join(', ')
+    + (items.length > 5 ? `, +${items.length - 5} more` : '');
+  const report = (items, element, message, suggestion) => {
+    if (items.length > 0) warnings.push(createWarning('warning', element, `${items.length} ${message}: ${describe(items)}`, suggestion));
+  };
+
+  const policies = (intermediateConfig.security_policies || []).filter(p => !p._implicit);
+  report(policies.filter(p => !policySlotCount.has(p)), 'auto-split',
+    'policies match no routing context and were dropped', 'Add them to a logical system manually');
+  report(policies.filter(p => (policySlotCount.get(p) || 0) > 1), 'auto-split',
+    'policies match several routing contexts (e.g. zone "any") and were copied into each', 'Remove the copies that do not belong');
+  report((intermediateConfig.static_routes || []).filter(r => (routeSlotCount.get(r) || 0) > 1), 'auto-split',
+    'static routes have no routing context and were copied into each logical system', 'Remove the copies that do not belong');
+  return warnings;
 }
 
 /**

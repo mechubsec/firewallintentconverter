@@ -890,10 +890,12 @@ export function detectVendor(configText) {
     if (trimmed.startsWith('{') || trimmed.startsWith('[')) {
       const probe = trimmed.slice(0, 2000);
       const probeLarge = trimmed.slice(0, 8000);
-      if (probe.includes('"objects-dictionary"') && probeLarge.includes('"rulebase"')) {
+      // show-access-rulebase lists the rulebase first, so the dictionary can sit far past the probe
+      const hasObjectsDictionary = trimmed.includes('"objects-dictionary"');
+      if (hasObjectsDictionary && probeLarge.includes('"rulebase"')) {
         return { vendor: 'checkpoint', format: 'json', confidence: 0.95 };
       }
-      if (probe.includes('"objects-dictionary"') && (probeLarge.includes('"access-section"') || probeLarge.includes('"access-rule"'))) {
+      if (hasObjectsDictionary && (probeLarge.includes('"access-section"') || probeLarge.includes('"access-rule"'))) {
         return { vendor: 'checkpoint', format: 'json', confidence: 0.90 };
       }
       if (probe.includes('"access_rules"') && probe.includes('"address_objects"')) {
