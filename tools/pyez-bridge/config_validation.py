@@ -127,7 +127,12 @@ def validate_set_config(config_text):
         if not line or line.startswith("#"):
             continue
 
-        tokens = _tokenize_set_line(line, line_number)
+        # The CLI reads "root-authentication" as root-authentication, so the
+        # hierarchy checks compare tokens with quoting and escapes removed.
+        tokens = [
+            re.sub(r'["\\]', "", token)
+            for token in _tokenize_set_line(line, line_number)
+        ]
         if len(tokens) < 2 or tokens[0] not in {"set", "deactivate"}:
             raise ConfigurationValidationError(
                 "Unsupported command verb.", line=line_number

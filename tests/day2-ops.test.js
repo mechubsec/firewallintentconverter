@@ -322,6 +322,22 @@ test('mixed policies — only eligible ones are tightened', () => {
   assert(result[2].applications.includes('junos-dns'), 'p3 unchanged');
 });
 
+test('same policy name in different zone pairs keeps separate hit counts', () => {
+  const stats = { policies: [
+    { name: 'allow-web', from_zone: 'trust', to_zone: 'dmz', hit_count: 5000 },
+    { name: 'allow-web', from_zone: 'guest', to_zone: 'untrust', hit_count: 0 },
+  ] };
+  const configPolicies = [
+    { name: 'allow-web', src_zones: ['trust'], dst_zones: ['dmz'] },
+    { name: 'allow-web', src_zones: ['guest'], dst_zones: ['untrust'] },
+  ];
+  const { annotatedPolicies } = annotateConfigPure(configPolicies, stats);
+  assert(annotatedPolicies[0]._hit_count === 5000, 'trust->dmz keeps 5000 hits');
+  assert(annotatedPolicies[1]._hit_count === 0, 'guest->untrust has 0 hits');
+  const disabled = disableNeverHitRulesPure(annotatedPolicies);
+  assert(!disabled[0].disabled && disabled[1].disabled, 'only the never-hit rule is disabled');
+});
+
 // ---------------------------------------------------------------------------
 // Summary
 // ---------------------------------------------------------------------------
