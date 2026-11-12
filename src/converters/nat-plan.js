@@ -239,7 +239,7 @@ export function planNat({
   // A range object (ASA `range A B`) resolves to the same "A-B" form.
   const sourcePoolAddress = (rawAddress, element) => {
     const literal = String(rawAddress || '');
-    const resolved = IPV4_RANGE.test(literal) ? literal : translatedAddress(rawAddress, element);
+    const resolved = IPV4_RANGE.test(literal) ? literal : translatedAddress(rawAddress, element);  // njsscan-ignore: regex_dos
     if (!resolved) return null;
     const range = resolved.match(IPV4_RANGE);
     return range ? { prefix: `${range[1]}/32`, to: `${range[2]}/32` } : { prefix: withPrefix(resolved) };

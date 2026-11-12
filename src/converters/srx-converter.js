@@ -1529,7 +1529,8 @@ function convertSchedules(schedules, commands, warnings, identifiers, identifier
     if (sched.type === 'recurring' && sched.days && sched.days.length > 0) {
       for (const day of sched.days) {
         const junosDay = DAY_NAME_MAP[day.toLowerCase()] || day.toLowerCase();
-        commands.push(`set schedulers scheduler ${name} ${junosDay} start-time ${sched.start} stop-time ${sched.end}`);
+        const dayTime = sched.day_times?.[day] || sched;
+        commands.push(`set schedulers scheduler ${name} ${junosDay} start-time ${dayTime.start} stop-time ${dayTime.end}`);
       }
     } else if (sched.type === 'onetime') {
       commands.push(`set schedulers scheduler ${name} start-date ${setQuoted(sched.start, 'schedules.start')} stop-date ${setQuoted(sched.end, 'schedules.end')}`);
@@ -1695,7 +1696,8 @@ function emitPolicyBody(commands, policyPath, policyName, ctx) {
     commands.push(`# set ${policyPath} then permit application-services ssl-proxy profile-name ${sslProfile}`);
   }
 
-  if (policy.schedule) {
+  // A schedule that was not emitted is flagged in policyReferenceIssues and the policy is deactivated below
+  if (policy.schedule && !policyReferenceIssues?.get(pIdx)?.schedules?.length) {
     const scheduleName = identifiers.nameForReference(identifierPath(`security_policies[${pIdx}].schedule`));
     commands.push(`set ${policyPath} scheduler-name ${scheduleName}`);
   }
@@ -1728,6 +1730,9 @@ function emitPolicyBody(commands, policyPath, policyName, ctx) {
         for (const svc of issue.services) {
           undefinedItems.push(`service "${svc}"`);
         }
+      }
+      for (const schedule of issue.schedules || []) {
+        undefinedItems.push(`schedule "${schedule}"`);
       }
       const caveatMsg = `# CAVEAT: policy deactivated — undefined reference(s): ${undefinedItems.join(', ')}`;
       deactivateCaveats.push(caveatMsg);
@@ -1849,6 +1854,10 @@ function convertSecurityPolicies(policies, commands, warnings, summary, profileM
             ? `security policies global policy ${policyName}`
             : `security policies from-zone ${fromZone} to-zone ${toZone} policy ${policyName}`;
 
+          // A global policy has no zone pair in its path, so keep the non-any zone as a match
+          if (isGlobal && fromZone !== 'any') commands.push(`set ${policyPath} match from-zone ${fromZone}`);
+          if (isGlobal && toZone !== 'any') commands.push(`set ${policyPath} match to-zone ${toZone}`);
+
           emitPolicyBody(commands, policyPath, policyName, {
             policy, pIdx, srcAddrs, dstAddrs, dstZones, appGroups, sourceVendor,
             utmPolicyMap, idpPolicyMap, secIntelEnabled, secIntelPolicyName,
@@ -1957,6 +1966,9 @@ function convertSecurityPolicies(policies, commands, warnings, summary, profileM
         }
         for (const svc of issue.services || []) {
           items.push(`service "${svc}"`);
+        }
+        for (const schedule of issue.schedules || []) {
+          items.push(`schedule "${schedule}"`);
         }
         commands.push(`#   - ${policyName}: ${items.join(', ')}`);
       }
@@ -2174,19 +2186,26 @@ function resolveApplications(applications, services, warnings, policyName, appGr
 }
 
 /**
- * Maps PAN-OS action to SRX policy action.
+ * Maps an intermediate policy action to an SRX policy action. Shared with the
+ * XML builder so both outputs agree; anything unrecognised fails closed to deny.
  *
- * PAN-OS actions: allow, deny, drop, reset-client, reset-server, reset-both
+ * Actions: allow/permit/accept, deny/drop/discard, reject/reset-*
  * SRX actions: permit, deny, reject
+ *
+ * @param {string} panosAction - Intermediate policy action
+ * @returns {'permit'|'deny'|'reject'} SRX action
  */
-function mapAction(panosAction) {
+export function mapAction(panosAction) {
   switch (panosAction) {
     case 'allow':
+    case 'permit':
+    case 'accept':
       return 'permit';
     case 'deny':
-      return 'deny';
     case 'drop':
+    case 'discard':
       return 'deny';
+    case 'reject':
     case 'reset-client':
     case 'reset-server':
     case 'reset-both':

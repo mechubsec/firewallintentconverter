@@ -10,6 +10,7 @@ import { useCallback, useState, useRef } from 'react';
 import { useConfigContext } from '../contexts/ConfigContext.jsx';
 import { useUIContext } from '../contexts/UIContext.jsx';
 import { useMergeContext } from '../contexts/MergeContext.jsx';
+import useConfig from './useConfig.js';
 import { translatePolicies, getLLMStatus, groupPolicies } from '../utils/llm-client.js';
 
 // ---------------------------------------------------------------------------
@@ -26,6 +27,8 @@ export default function useLLM() {
   const { state: configState, dispatch: configDispatch } = useConfigContext();
   const { state: uiState, dispatch: uiDispatch } = useUIContext();
   const { state: mergeState } = useMergeContext();
+  // Merge-aware config updater (routes to the active slot in merge mode)
+  const { updateConfig } = useConfig();
 
   const {
     intermediateConfig,
@@ -249,12 +252,13 @@ export default function useLLM() {
   // Bulk selection operations
   // -----------------------------------------------------------------------
 
-  const handleToggleRuleSelect = useCallback((policy, event) => {
+  // `visiblePolicies` is the filtered/sorted list the user sees; ranges and select-all must stay inside it
+  const handleToggleRuleSelect = useCallback((policy, event, visiblePolicies) => {
     const key = makeRuleKey(policy);
     const newKeys = new Set(selectedRuleKeys);
 
     if (event?.shiftKey && lastClickedKeyRef.current) {
-      const policies = getCurrentPolicies();
+      const policies = visiblePolicies || getCurrentPolicies();
       const lastIdx = policies.findIndex(p => makeRuleKey(p) === lastClickedKeyRef.current);
       const curIdx = policies.findIndex(p => makeRuleKey(p) === key);
       if (lastIdx >= 0 && curIdx >= 0) {
@@ -271,9 +275,9 @@ export default function useLLM() {
     configDispatch({ type: 'SET_FIELD', field: 'lastClickedKey', value: key });
   }, [selectedRuleKeys, getCurrentPolicies, configDispatch]);
 
-  const handleSelectAllRules = useCallback((selectAll) => {
+  const handleSelectAllRules = useCallback((selectAll, visiblePolicies) => {
     if (selectAll) {
-      configDispatch({ type: 'SET_SELECTED_KEYS', keys: getCurrentPolicies().map(makeRuleKey) });
+      configDispatch({ type: 'SET_SELECTED_KEYS', keys: (visiblePolicies || getCurrentPolicies()).map(makeRuleKey) });
     } else {
       configDispatch({ type: 'SET_SELECTED_KEYS', keys: [] });
     }
@@ -287,19 +291,16 @@ export default function useLLM() {
       );
       configDispatch({ type: 'SET_TRANSLATED_POLICIES', policies: updated });
     } else {
-      configDispatch({
-        type: 'UPDATE_CONFIG',
-        updater: prev => ({
-          ...prev,
-          security_policies: prev.security_policies.map(p =>
-            selectedRuleKeys.has(makeRuleKey(p)) ? { ...p, _review_status: 'accepted' } : p,
-          ),
-        }),
-      });
+      updateConfig(prev => ({
+        ...prev,
+        security_policies: prev.security_policies.map(p =>
+          selectedRuleKeys.has(makeRuleKey(p)) ? { ...p, _review_status: 'accepted' } : p,
+        ),
+      }));
     }
     configDispatch({ type: 'SET_SELECTED_KEYS', keys: [] });
     uiDispatch({ type: 'SET_FIELD', field: 'selectedRule', value: null });
-  }, [selectedRuleKeys, uiState.platformView, srxTranslatedPolicies, configDispatch, uiDispatch]);
+  }, [selectedRuleKeys, uiState.platformView, srxTranslatedPolicies, updateConfig, configDispatch, uiDispatch]);
 
   const handleBulkDelete = useCallback(() => {
     const isTranslated = uiState.platformView === 'srx' && srxTranslatedPolicies;
@@ -309,17 +310,14 @@ export default function useLLM() {
         .map((p, i) => ({ ...p, _rule_index: i }));
       configDispatch({ type: 'SET_TRANSLATED_POLICIES', policies: filtered });
     } else {
-      configDispatch({
-        type: 'UPDATE_CONFIG',
-        updater: prev => ({
-          ...prev,
-          security_policies: prev.security_policies.filter(p => !selectedRuleKeys.has(makeRuleKey(p))),
-        }),
-      });
+      updateConfig(prev => ({
+        ...prev,
+        security_policies: prev.security_policies.filter(p => !selectedRuleKeys.has(makeRuleKey(p))),
+      }));
     }
     configDispatch({ type: 'SET_SELECTED_KEYS', keys: [] });
     uiDispatch({ type: 'SET_FIELD', field: 'selectedRule', value: null });
-  }, [selectedRuleKeys, uiState.platformView, srxTranslatedPolicies, configDispatch, uiDispatch]);
+  }, [selectedRuleKeys, uiState.platformView, srxTranslatedPolicies, updateConfig, configDispatch, uiDispatch]);
 
   const handleBulkToggleDisable = useCallback(() => {
     const isTranslated = uiState.platformView === 'srx' && srxTranslatedPolicies;
@@ -329,20 +327,19 @@ export default function useLLM() {
       );
       configDispatch({ type: 'SET_TRANSLATED_POLICIES', policies: updated });
     } else {
-      configDispatch({
-        type: 'UPDATE_CONFIG',
-        updater: prev => ({
-          ...prev,
-          security_policies: prev.security_policies.map(p =>
-            selectedRuleKeys.has(makeRuleKey(p)) ? { ...p, disabled: !p.disabled } : p,
-          ),
-        }),
-      });
+      updateConfig(prev => ({
+        ...prev,
+        security_policies: prev.security_policies.map(p =>
+          selectedRuleKeys.has(makeRuleKey(p)) ? { ...p, disabled: !p.disabled } : p,
+        ),
+      }));
     }
     configDispatch({ type: 'SET_SELECTED_KEYS', keys: [] });
-  }, [selectedRuleKeys, uiState.platformView, srxTranslatedPolicies, configDispatch]);
+  }, [selectedRuleKeys, uiState.platformView, srxTranslatedPolicies, updateConfig, configDispatch]);
 
   const handleBulkMove = useCallback((direction) => {
+    // Parsers number source rules from 1; the LLM translator numbers translated rules from 0
+    const firstIndex = uiState.platformView === 'srx' && srxTranslatedPolicies ? 0 : 1;
     const mutate = (policies) => {
       const result = [...policies];
       const selectedIndices = result
@@ -363,7 +360,7 @@ export default function useLLM() {
           [result[idx], result[idx + 1]] = [result[idx + 1], result[idx]];
         }
       }
-      return result.map((p, i) => ({ ...p, _rule_index: i }));
+      return result.map((p, i) => ({ ...p, _rule_index: i + firstIndex }));
     };
 
     const isTranslated = uiState.platformView === 'srx' && srxTranslatedPolicies;
@@ -373,12 +370,9 @@ export default function useLLM() {
         policies: srxTranslatedPolicies ? mutate(srxTranslatedPolicies) : null,
       });
     } else {
-      configDispatch({
-        type: 'UPDATE_CONFIG',
-        updater: prev => ({ ...prev, security_policies: mutate(prev.security_policies) }),
-      });
+      updateConfig(prev => ({ ...prev, security_policies: mutate(prev.security_policies) }));
     }
-  }, [selectedRuleKeys, uiState.platformView, srxTranslatedPolicies, configDispatch]);
+  }, [selectedRuleKeys, uiState.platformView, srxTranslatedPolicies, updateConfig, configDispatch]);
 
   // -----------------------------------------------------------------------
   // Return public API

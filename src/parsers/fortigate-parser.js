@@ -41,6 +41,18 @@ export function parseFortigateConfig(configText) {
   // Parse config text into a structured tree
   const tree = buildConfigTree(configText);
 
+  // Objects and policies under "config global" / "config vdom" / "edit <vdom>" are not read.
+  const vdomSections = Object.values(tree['vdom'] || {});
+  if (Object.keys(tree['global'] || {}).length > 0
+    || vdomSections.some((vdomEntry) => typeof vdomEntry === 'object' && Object.keys(vdomEntry).length > 0)) {
+    warnings.push(createWarning(
+      'error',
+      'config/vdom',
+      'Multi-VDOM backup: objects, policies and interfaces inside "config global" and "config vdom" are not parsed, so this conversion is incomplete',
+      'Export each VDOM as a single-VDOM configuration and convert them separately'
+    ));
+  }
+
   // Extract each config section
   const zones = parseZones(tree, warnings);
   const interfaces = parseInterfaces(tree, warnings);
@@ -1126,7 +1138,8 @@ function entriesInConfigOrder(section) {
  */
 function buildConfigTree(configText) {
   const lines = configText.split('\n');
-  const root = {};
+  // Null-prototype nodes: "edit __proto__" must not reach Object.prototype.
+  const root = Object.create(null);
   const stack = []; // stack of { node, type: 'config'|'edit' }
   let current = root;
 
@@ -1137,7 +1150,7 @@ function buildConfigTree(configText) {
     if (line.startsWith('config ')) {
       const sectionName = line.slice(7).trim();
       if (!current[sectionName]) {
-        current[sectionName] = {};
+        current[sectionName] = Object.create(null);
       }
       stack.push({ node: current, type: 'config' });
       current = current[sectionName];
@@ -1146,7 +1159,7 @@ function buildConfigTree(configText) {
       const rawId = line.slice(5).trim();
       const entryId = unquote(rawId);
       if (!current[entryId]) {
-        current[entryId] = {};
+        current[entryId] = Object.create(null);
         (current[EDIT_ORDER] ||= []).push(entryId);
       }
       stack.push({ node: current, type: 'edit' });
@@ -1961,7 +1974,7 @@ function parseServiceObjects(tree, warnings, splitGroups = []) {
           name: serviceName,
           protocol: proto,
           port_range: normalizePortRange(range),
-          source_port: '',
+          source_port: normalizeSourcePort(range),
           description,
         });
       }
@@ -2000,6 +2013,19 @@ function parseServiceGroups(tree, warnings) {
   }
 
   return groups;
+}
+
+
+// Match criteria the converter ignores; a policy using any of them must not convert as written.
+function unmodeledSelectorsOf(entry) {
+  const selectors = [];
+  if (getString(entry['service-negate']) === 'enable') selectors.push('service-negate');
+  const internetServiceKeys = Object.keys(entry).filter((key) => key.startsWith('internet-service'));
+  if (internetServiceKeys.some((key) => getString(entry[key]) !== 'disable')) selectors.push('internet-service');
+  for (const side of ['srcaddr', 'dstaddr']) {
+    if (ensureArray(entry[side]).length === 0 && ensureArray(entry[`${side}6`]).length > 0) selectors.push(`${side}6`);
+  }
+  return selectors;
 }
 
 
@@ -2079,6 +2105,18 @@ function parseSecurityPolicies(tree, warnings) {
         uuid: getString(entry['uuid']) || '',
       },
     };
+
+    const unmodeledSelectors = unmodeledSelectorsOf(entry);
+    if (unmodeledSelectors.length > 0) {
+      // Dropping these would widen the match (empty address list becomes "any"), so fail closed.
+      policy.disabled = true;
+      warnings.push(createWarning(
+        'warning',
+        `security-rule/${policy.name}`,
+        `Policy "${policy.name}" deactivated: uses ${unmodeledSelectors.join(', ')}, which the converter does not model`,
+        'Rewrite the policy with explicit address and service objects before enabling it'
+      ));
+    }
 
     if (policy.source_users.length > 0) {
       warnings.push(createWarning(
@@ -2914,7 +2952,7 @@ function mapAction(fortiAction) {
     case 'deny': return 'deny';
     case 'ipsec': return 'allow'; // IPsec tunnel action
     case 'learn': return 'allow';
-    default: return 'allow';
+    default: return 'deny'; // FortiOS omits the default (deny) from backups
   }
 }
 
@@ -2942,6 +2980,12 @@ function normalizePortRange(portStr) {
     const colonIdx = p.indexOf(':');
     return colonIdx >= 0 ? p.slice(0, colonIdx) : p;
   }).join(',');
+}
+
+function normalizeSourcePort(portStr) {
+  // "443:1024-2000" (dst:src) -> "1024-2000"
+  const colonIdx = (portStr || '').indexOf(':');
+  return colonIdx >= 0 ? portStr.slice(colonIdx + 1) : '';
 }
 
 function getProfileLabel(profileType) {

@@ -591,7 +591,7 @@ function parseObjectGroupProtocols(blocks, warnings) {
 // ---------------------------------------------------------------------------
 
 function parseAccessLists(lines, warnings) {
-  const aclMap = {}; // aclName → [entries]
+  const aclMap = Object.create(null); // aclName → [entries]; no prototype so names like "constructor" are safe
 
   for (const line of lines) {
     const trimmed = line.trim();
@@ -663,6 +663,11 @@ function parseAclEntry(tokens, aclName, warnings) {
   // Protocol
   if (i < tokens.length) {
     entry.protocol = tokens[i++];
+  }
+
+  // `object-group <name>` / `object <name>` here is a service or protocol reference, not an address
+  if ((entry.protocol === 'object-group' || entry.protocol === 'object') && i < tokens.length) {
+    entry.serviceRef = tokens[i++];
   }
 
   // User / user-group identity (ASA Identity Firewall — between protocol and source address)
@@ -744,8 +749,13 @@ function parseAclAddress(tokens, i) {
 
   const tok = tokens[i];
 
-  if (tok === 'any' || tok === 'any4' || tok === 'any6') {
+  if (tok === 'any') {
     return { addr: 'any', nextIndex: i + 1 };
+  }
+
+  // Family-specific any matches only that family, so it must not widen to plain any
+  if (tok === 'any4' || tok === 'any6') {
+    return { addr: tok === 'any4' ? '0.0.0.0/0' : '::/0', nextIndex: i + 1 };
   }
 
   if (tok === 'host') {
@@ -1330,6 +1340,14 @@ function parseTimeRanges(blocks) {
 function buildSecurityPolicies(accessLists, accessGroups, interfaces, warnings) {
   const policies = [];
   let ruleIndex = 1;
+  const usedPolicyNames = new Set();
+
+  // Remark text is reused when an ACL is bound to several interfaces; suffix repeats with the rule index
+  const uniquePolicyName = (name) => {
+    const unique = usedPolicyNames.has(name) ? `${name}-${ruleIndex}` : name;
+    usedPolicyNames.add(unique);
+    return unique;
+  };
 
   // Map interfaces by nameif for security-level lookup
   const ifaceMap = {};
@@ -1358,8 +1376,8 @@ function buildSecurityPolicies(accessLists, accessGroups, interfaces, warnings) 
       const dstZone = ag.direction === 'out' ? ag.interface : '';
 
       const policy = {
-        name: remarkAccum || `${ag.aclName}-${ruleIndex}`,
-        src_zones: srcZone ? [srcZone] : [],
+        name: uniquePolicyName(remarkAccum || `${ag.aclName}-${ruleIndex}`),
+        src_zones: srcZone && srcZone !== 'global' ? [srcZone] : [], // a global ACL applies to every zone
         dst_zones: dstZone ? [dstZone] : [],
         src_addresses: entry.srcAddr === 'any' ? ['any'] : [entry.srcAddr],
         dst_addresses: entry.dstAddr === 'any' ? ['any'] : [entry.dstAddr],
@@ -1419,7 +1437,7 @@ function buildSecurityPolicies(accessLists, accessGroups, interfaces, warnings) 
       }
 
       const policy = {
-        name: remarkAccum || `${aclName}-${ruleIndex}`,
+        name: uniquePolicyName(remarkAccum || `${aclName}-${ruleIndex}`),
         src_zones: [],
         dst_zones: [],
         src_addresses: entry.srcAddr === 'any' ? ['any'] : [entry.srcAddr],
@@ -1552,9 +1570,8 @@ function buildSecurityPolicies(accessLists, accessGroups, interfaces, warnings) 
 
 function buildServiceFromAcl(entry) {
   const proto = (entry.protocol || 'ip').toLowerCase();
-  if (proto === 'ip' || proto === 'object-group') {
-    return [entry.protocol === 'object-group' ? entry.srcAddr : 'any'];
-  }
+  if (entry.serviceRef) return [entry.serviceRef];
+  if (proto === 'ip') return ['any'];
   if (proto === 'icmp' || proto === 'icmp6') {
     if (entry.icmpType) {
       return [`icmp/${entry.icmpType}${entry.icmpCode ? '/' + entry.icmpCode : ''}`];
@@ -1565,6 +1582,16 @@ function buildServiceFromAcl(entry) {
   const port = entry.dstPort || 'any';
   if (port === 'any' || port === '') {
     return [`${proto}`];
+  }
+
+  // neq/gt/lt match whole port ranges, not the single port that follows the operator
+  const operatorMatch = /^([!<>])(.+)$/.exec(port);
+  if (operatorMatch) {
+    const limit = Number(mapWellKnownPort(operatorMatch[2]));
+    const ranges = { '>': [[limit + 1, 65535]], '<': [[1, limit - 1]], '!': [[1, limit - 1], [limit + 1, 65535]] }[operatorMatch[1]];
+    const services = ranges.filter(([low, high]) => low <= high).map(([low, high]) => `${proto}/${low === high ? low : `${low}-${high}`}`);
+    // An empty list would read as "any service"; keep the raw operator form for unresolvable ports
+    if (services.length > 0) return services;
   }
 
   // Map well-known port names

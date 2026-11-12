@@ -596,12 +596,32 @@ function expandBracketList(cmd) {
   return match[2].split(/\s+/).map(value => `${match[1]} ${value}`);
 }
 
+const KEY_ORDER = Symbol('keyOrder');
+
+// Null-prototype so names like `__proto__` are plain keys; KEY_ORDER records config
+// order because object iteration puts integer-like keys (policy `2`) first.
+function newTreeNode(initial = {}) {
+  const node = Object.assign(Object.create(null), initial);
+  node[KEY_ORDER] = Object.keys(initial);
+  return node;
+}
+
+function setTreeKey(node, key, value) {
+  if (!(key in node)) node[KEY_ORDER].push(key);
+  node[key] = value;
+}
+
+/** Object.entries in config order for tree nodes (policy and NAT names). */
+function orderedEntries(node) {
+  return (node[KEY_ORDER] || Object.keys(node)).filter(key => key in node).map(key => [key, node[key]]);
+}
+
 /**
  * Builds a nested object tree from flat set commands.
  * Each path segment becomes a key, leaf values are stored as arrays.
  */
 function buildConfigTree(setCommands) {
-  const tree = {};
+  const tree = newTreeNode();
 
   for (const cmd of setCommands.flatMap(expandBracketList)) {
     // Remove "set " or "deactivate " prefix
@@ -624,13 +644,13 @@ function buildConfigTree(setCommands) {
     let node = tree;
     for (let i = 0; i < tokens.length - 1; i++) {
       const token = tokens[i];
-      if (!node[token]) node[token] = {};
+      if (!node[token]) setTreeKey(node, token, newTreeNode());
       if (typeof node[token] === 'string') {
         // Convert leaf to branch
-        node[token] = { _value: node[token] };
+        setTreeKey(node, token, newTreeNode({ _value: node[token] }));
       } else if (node[token] === true) {
         // A flag statement (e.g. `set ... security-zone trust`) that later gains children
-        node[token] = {};
+        setTreeKey(node, token, newTreeNode());
       }
       node = node[token];
     }
@@ -638,12 +658,12 @@ function buildConfigTree(setCommands) {
     // Set leaf value
     const lastToken = tokens[tokens.length - 1];
     if (node[lastToken] === undefined) {
-      node[lastToken] = true; // flag-style value
+      setTreeKey(node, lastToken, true); // flag-style value
     }
     // Mark the deactivated statement itself (a flag leaf becomes an object)
     if (isDeactivate) {
       if (typeof node[lastToken] !== 'object') {
-        node[lastToken] = node[lastToken] === true ? {} : { _value: node[lastToken] };
+        setTreeKey(node, lastToken, newTreeNode(node[lastToken] === true ? {} : { _value: node[lastToken] }));
       }
       node[lastToken]._deactivated = true;
     }
@@ -753,14 +773,14 @@ function parseZones(tree, warnings) {
 // ---------------------------------------------------------------------------
 
 function parseAddressObjects(tree, warnings) {
-  const addrBook = tree?.security?.['address-book']?.global;
-  if (!addrBook) return [];
+  // Global, named and zone-attached address-books all feed one address list.
+  const addressNodes = [
+    ...Object.values(tree?.security?.['address-book'] || {}).map(book => book?.address),
+    ...Object.values(tree?.security?.zones?.['security-zone'] || {}).map(zone => zone?.['address-book']?.address),
+  ].filter(node => node && typeof node === 'object');
 
   const objects = [];
-  const addressNode = addrBook.address;
-  if (!addressNode) return [];
-
-  for (const [name, data] of Object.entries(addressNode)) {
+  for (const [name, data] of addressNodes.flatMap(node => Object.entries(node))) {
     if (name.startsWith('_')) continue;
 
     let type = 'unknown';
@@ -1000,7 +1020,7 @@ function parseSecurityPolicies(tree, warnings) {
       // Global policies
       const policyNode = value?.policy;
       if (policyNode) {
-        for (const [policyName, policyData] of Object.entries(policyNode)) {
+        for (const [policyName, policyData] of orderedEntries(policyNode)) {
           if (policyName.startsWith('_')) continue;
           ruleIndex++;
           policies.push(parseSinglePolicy(policyName, policyData, ['any'], ['any'], ruleIndex, warnings));
@@ -1026,7 +1046,7 @@ function parseSecurityPolicies(tree, warnings) {
           const policyNode = dstData.policy;
           if (!policyNode) continue;
 
-          for (const [policyName, policyData] of Object.entries(policyNode)) {
+          for (const [policyName, policyData] of orderedEntries(policyNode)) {
             if (policyName.startsWith('_')) continue;
             ruleIndex++;
             policies.push(parseSinglePolicy(policyName, policyData, [srcZone], [dstZone], ruleIndex, warnings));
@@ -1150,6 +1170,24 @@ function parseSinglePolicy(name, data, srcZones, dstZones, ruleIndex, warnings) 
 // NAT Rules Parser
 // ---------------------------------------------------------------------------
 
+/** True when a NAT rule, its rule-set, or the NAT type statement is deactivated. */
+function isNatRuleDeactivated(natNode, natType, ruleSet, rule) {
+  return [natNode[natType], ruleSet, rule].some(node => !isActiveStatement(node));
+}
+
+/** Reads `security nat destination pool <name> address <ip> [port N]` into { name: { address, port } }. */
+function parseDestinationPools(poolsNode) {
+  const pools = {};
+  for (const [poolName, poolData] of orderedEntries(poolsNode || {})) {
+    if (poolName.startsWith('_') || !poolData || typeof poolData !== 'object') continue;
+    const [address] = Object.keys(poolData.address || {}).filter(key => !key.startsWith('_'));
+    if (!address) continue;
+    const port = Object.keys(poolData.address[address]?.port || {}).filter(key => !key.startsWith('_'))[0];
+    pools[poolName] = { address, port: port || null };
+  }
+  return pools;
+}
+
 function parseNatRules(tree, warnings) {
   const natNode = tree?.security?.nat;
   if (!natNode) return [];
@@ -1161,7 +1199,7 @@ function parseNatRules(tree, warnings) {
   if (natNode.source) {
     const ruleSets = natNode.source['rule-set'];
     if (ruleSets) {
-      for (const [rsName, rsData] of Object.entries(ruleSets)) {
+      for (const [rsName, rsData] of orderedEntries(ruleSets)) {
         if (rsName.startsWith('_') || !rsData || typeof rsData !== 'object') continue;
 
         const srcZones = collectKeys(rsData.from?.zone);
@@ -1170,8 +1208,14 @@ function parseNatRules(tree, warnings) {
         const ruleNode = rsData.rule;
         if (!ruleNode) continue;
 
-        for (const [ruleName, ruleData] of Object.entries(ruleNode)) {
+        for (const [ruleName, ruleData] of orderedEntries(ruleNode)) {
           if (ruleName.startsWith('_') || !ruleData || typeof ruleData !== 'object') continue;
+          if (isNatRuleDeactivated(natNode, 'source', rsData, ruleData)) {
+            warnings.push(createWarning('warning', `nat/${rsName}/${ruleName}`,
+              `NAT rule "${rsName}/${ruleName}" is disabled — not converted`,
+              'Add it to the SRX by hand, deactivated, if you want to keep it'));
+            continue;
+          }
           ruleIndex++;
 
           const matchNode = ruleData.match || {};
@@ -1214,9 +1258,10 @@ function parseNatRules(tree, warnings) {
 
   // Destination NAT
   if (natNode.destination) {
+    const destinationPools = parseDestinationPools(natNode.destination.pool);
     const ruleSets = natNode.destination['rule-set'];
     if (ruleSets) {
-      for (const [rsName, rsData] of Object.entries(ruleSets)) {
+      for (const [rsName, rsData] of orderedEntries(ruleSets)) {
         if (rsName.startsWith('_') || !rsData || typeof rsData !== 'object') continue;
 
         const srcZones = collectKeys(rsData.from?.zone);
@@ -1225,8 +1270,14 @@ function parseNatRules(tree, warnings) {
         const ruleNode = rsData.rule;
         if (!ruleNode) continue;
 
-        for (const [ruleName, ruleData] of Object.entries(ruleNode)) {
+        for (const [ruleName, ruleData] of orderedEntries(ruleNode)) {
           if (ruleName.startsWith('_') || !ruleData || typeof ruleData !== 'object') continue;
+          if (isNatRuleDeactivated(natNode, 'destination', rsData, ruleData)) {
+            warnings.push(createWarning('warning', `nat/${rsName}/${ruleName}`,
+              `NAT rule "${rsName}/${ruleName}" is disabled — not converted`,
+              'Add it to the SRX by hand, deactivated, if you want to keep it'));
+            continue;
+          }
           ruleIndex++;
 
           const matchNode = ruleData.match || {};
@@ -1245,7 +1296,9 @@ function parseNatRules(tree, warnings) {
               const poolNode = dnat.pool;
               const poolName = extractStringValue(poolNode) ||
                 Object.keys(poolNode).filter(k => !k.startsWith('_'))[0] || '';
-              translatedDst = poolName;
+              const pool = destinationPools[poolName];
+              translatedDst = pool?.address || poolName;
+              translatedPort = pool?.port || null;
             }
           }
 
@@ -1259,6 +1312,7 @@ function parseNatRules(tree, warnings) {
             translated_src: null,
             translated_dst: translatedDst,
             translated_port: translatedPort,
+            ...(translatedPort && dstPort ? { match_port: dstPort } : {}),
             description: extractStringValue(ruleData.description) || '',
             _rule_index: ruleIndex,
           });
@@ -1271,7 +1325,7 @@ function parseNatRules(tree, warnings) {
   if (natNode.static) {
     const ruleSets = natNode.static['rule-set'];
     if (ruleSets) {
-      for (const [rsName, rsData] of Object.entries(ruleSets)) {
+      for (const [rsName, rsData] of orderedEntries(ruleSets)) {
         if (rsName.startsWith('_') || !rsData || typeof rsData !== 'object') continue;
 
         const srcZones = collectKeys(rsData.from?.zone);
@@ -1280,8 +1334,14 @@ function parseNatRules(tree, warnings) {
         const ruleNode = rsData.rule;
         if (!ruleNode) continue;
 
-        for (const [ruleName, ruleData] of Object.entries(ruleNode)) {
+        for (const [ruleName, ruleData] of orderedEntries(ruleNode)) {
           if (ruleName.startsWith('_') || !ruleData || typeof ruleData !== 'object') continue;
+          if (isNatRuleDeactivated(natNode, 'static', rsData, ruleData)) {
+            warnings.push(createWarning('warning', `nat/${rsName}/${ruleName}`,
+              `NAT rule "${rsName}/${ruleName}" is disabled — not converted`,
+              'Add it to the SRX by hand, deactivated, if you want to keep it'));
+            continue;
+          }
           ruleIndex++;
 
           const matchNode = ruleData.match || {};

@@ -101,15 +101,28 @@ export function findUnresolvedServiceGroups(config) {
 }
 
 /**
+ * Whether a schedule can be emitted as a Junos scheduler (recurring with days, or one-time).
+ *
+ * @param {Object} schedule - Intermediate schedule
+ * @returns {boolean} True when the converter emits a scheduler for it
+ */
+export function isEmittableSchedule(schedule) {
+  return (schedule.type === 'recurring' && schedule.days?.length > 0) || schedule.type === 'onetime';
+}
+
+/**
  * Finds security policies with undefined address or service references.
- * Returns a map of policy index → { addresses: string[], services: string[] }
+ * Returns a map of policy index → { addresses: string[], services: string[], schedules: string[] }
  * containing ONLY policies that have at least one undefined reference.
  *
  * @param {Object} config - Intermediate JSON config
- * @returns {Map<number, {addresses: string[], services: string[]}>} Map of offending policy indices
+ * @returns {Map<number, {addresses: string[], services: string[], schedules: string[]}>} Map of offending policy indices
  */
 export function findPolicyReferenceIssues(config) {
   const issues = new Map();
+  const emittableScheduleNames = new Set(
+    (config.schedules || []).filter(isEmittableSchedule).map(schedule => schedule.name),
+  );
 
   // Build defined name sets once
   const addressNames = new Set();
@@ -187,11 +200,18 @@ export function findPolicyReferenceIssues(config) {
       if (unresolvedGroups.has(app) && !undefinedServices.includes(app)) undefinedServices.push(app);
     }
 
+    // A schedule restricts when a rule applies, so a policy whose scheduler is
+    // not emitted is deactivated rather than widened to always-on.
+    const undefinedSchedules = policy.schedule && !emittableScheduleNames.has(policy.schedule)
+      ? [policy.schedule]
+      : [];
+
     // Include policy in map only if it has at least one undefined reference
-    if (undefinedAddresses.length > 0 || undefinedServices.length > 0) {
+    if (undefinedAddresses.length > 0 || undefinedServices.length > 0 || undefinedSchedules.length > 0) {
       issues.set(i, {
         addresses: undefinedAddresses,
         services: undefinedServices,
+        schedules: undefinedSchedules,
       });
     }
   }

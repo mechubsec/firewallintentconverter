@@ -154,3 +154,42 @@ describe('consolidation skips negated rules', () => {
     expect(analyze(trio(true)).counts.consolidateCount).toBe(0);
   });
 });
+
+describe('shadow detector respects users and service scope', () => {
+  const openRule = (name, overrides = {}) => rule(name, { services: [], applications: [], ...overrides });
+
+  it('user-restricted earlier rule does not shadow a rule for another user or for everyone', () => {
+    expect(analyze([openRule('a', { source_users: ['alice'] }), openRule('b', { source_users: ['bob'], services: ['tcp-22'] })]).counts.shadowedCount).toBe(0);
+    expect(analyze([openRule('a', { source_users: ['alice'] }), openRule('b', { services: ['tcp-22'] })]).counts.shadowedCount).toBe(0);
+  });
+
+  it('user-restricted earlier rule still shadows a subset of its users', () => {
+    const { counts } = analyze([openRule('a', { source_users: ['alice', 'bob'] }), openRule('b', { source_users: ['bob'], services: ['tcp-22'] })]);
+    expect(counts.shadowedCount).toBe(1);
+  });
+
+  it('redundant, reorder and merge checks account for users', () => {
+    const redundant = analyze([
+      rule('a', { source_users: ['alice'], services: ['tcp-22'] }),
+      rule('b', { services: ['tcp-22'], src_addresses: ['h1'] }),
+    ]);
+    expect(redundant.counts.redundantCount).toBe(0);
+    const reorder = analyze([openRule('a', { source_users: ['alice'] }), openRule('b', { action: 'deny', source_users: ['bob'], services: ['tcp-22'] })]);
+    expect(reorder.counts.reorderCount).toBe(0);
+    const merge = analyze([rule('a', { source_users: ['alice'], services: ['tcp-22'] }), rule('b', { source_users: ['bob'], services: ['tcp-80'] })]);
+    expect(merge.counts.mergeableCount).toBe(0);
+  });
+
+  it('application any with a specific service is not any/any/any', () => {
+    const { counts } = analyze([rule('a', { applications: ['any'], services: ['tcp-443'] }), rule('b', { services: ['tcp-22'] })]);
+    expect(counts.shadowedCount).toBe(0);
+    expect(analyze([rule('a', { applications: ['any'], services: ['application-default'] }), rule('b', { services: ['tcp-22'] })]).counts.shadowedCount).toBe(1);
+  });
+
+  it('application-default is distinct from any port for the same application', () => {
+    const defaults = rule('a', { src_addresses: ['h1'], applications: ['ssl'], services: ['application-default'] });
+    const anyPort = rule('b', { src_addresses: ['h1'], applications: ['ssl'], services: [] });
+    expect(analyze([defaults, anyPort]).counts.shadowedCount).toBe(0);
+    expect(analyze([anyPort, defaults]).counts.redundantCount).toBe(0);
+  });
+});

@@ -206,7 +206,7 @@ describe('PAN-OS NAT parser — service capture (issue #55)', () => {
     expect(rule.match_port).toBeUndefined();
   });
 
-  it('does not crash when service object is missing', () => {
+  it('skips the rule when the service object is missing', () => {
     const xml = `<?xml version="1.0"?>
 <config>
   <devices>
@@ -238,9 +238,32 @@ describe('PAN-OS NAT parser — service capture (issue #55)', () => {
 </config>`;
 
     const result = parsePanosConfig(xml);
-    const rule = result.intermediateConfig.nat_rules[0];
-    // Unresolved service → leave unset (no crash)
-    expect(rule.match_protocol).toBeUndefined();
-    expect(rule.match_port).toBeUndefined();
+    // Unresolved service → rule skipped with a warning (no crash, no all-ports match)
+    expect(result.intermediateConfig.nat_rules).toHaveLength(0);
+  });
+});
+
+describe('PAN-OS NAT parser — predefined services and exemptions', () => {
+  const natXml = (service, translation) => `<config><devices><entry name="localhost.localdomain"><vsys><entry name="vsys1"><rulebase><nat><rules>
+    <entry name="nat1"><from><member>untrust</member></from><to><member>untrust</member></to><source><member>any</member></source><destination><member>203.0.113.10</member></destination>${service}${translation}</entry>
+  </rules></nat></rulebase></entry></vsys></entry></devices></config>`;
+  const dnat = '<destination-translation><translated-address>192.0.2.10</translated-address></destination-translation>';
+
+  it('resolves predefined service-https to tcp/443', () => {
+    const rule = parsePanosConfig(natXml('<service>service-https</service>', dnat)).intermediateConfig.nat_rules[0];
+    expect(rule.match_protocol).toBe('tcp');
+    expect(rule.match_port).toBe('443');
+  });
+
+  it('skips a NAT rule whose service cannot be resolved instead of matching all ports', () => {
+    const result = parsePanosConfig(natXml('<service>svc-missing</service>', dnat));
+    expect(result.intermediateConfig.nat_rules).toHaveLength(0);
+    expect(result.warnings.some(warning => warning.message.includes('svc-missing'))).toBe(true);
+  });
+
+  it('keeps a no-translation rule as source NAT off', () => {
+    const rule = parsePanosConfig(natXml('', '')).intermediateConfig.nat_rules[0];
+    expect(rule.type).toBe('source');
+    expect(rule.translated_src).toEqual({ type: 'no-nat' });
   });
 });
