@@ -98,3 +98,12 @@ describe('FortiGate multi-protocol custom services', () => {
     expect(config.service_groups).toEqual([]);
   });
 });
+
+describe('FortiGate service source ports', () => {
+  it('keeps the source-port restriction of "dst:src" port ranges', () => {
+    const { config } = convert('    edit "SRC"\n        set tcp-portrange 443:1024-2000\n    next', 'SRC');
+    const service = config.service_objects.find((svc) => svc.name === 'SRC');
+    expect(service.port_range).toBe('443');
+    expect(service.source_port).toBe('1024-2000');
+  });
+});

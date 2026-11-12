@@ -91,3 +91,66 @@ end
     expect(names).toEqual(['two', 'one']);
   });
 });
+
+describe('FortiGate policy fail-closed parsing', () => {
+  const rule = (name, body) => `config firewall policy
+    edit 1
+        set name "${name}"
+        set srcintf "port2"
+        set dstintf "port1"
+${body}    next
+end
+`;
+  const find = (config, name) => config.security_policies.find((p) => p.name === name);
+
+  it('defaults a policy without "set action" to deny', () => {
+    const config = parse(rule('no-action', '        set srcaddr "lan-net"\n        set dstaddr "all"\n        set service "ALL"\n'));
+    expect(find(config, 'no-action').action).toBe('deny');
+  });
+
+  it('deactivates a policy with service-negate instead of inverting it', () => {
+    const body = '        set srcaddr "lan-net"\n        set dstaddr "all"\n        set action accept\n        set service "HTTP"\n        set service-negate enable\n';
+    const { intermediateConfig, warnings } = parseFortigateConfig(BASE + rule('neg-svc', body));
+    expect(find(intermediateConfig, 'neg-svc').disabled).toBe(true);
+    expect(warnings.some((w) => w.element === 'security-rule/neg-svc' && /service-negate/.test(w.message))).toBe(true);
+  });
+
+  it.each([
+    ['internet-service', '        set internet-service enable\n        set internet-service-name "Google-Web"\n'],
+    ['internet-service-src', '        set internet-service-src enable\n        set internet-service-src-name "Google-Web"\n'],
+    ['IPv6 destination', '        set srcaddr "lan-net"\n        set dstaddr6 "all"\n'],
+  ])('deactivates a policy that selects traffic with %s', (label, body) => {
+    const { intermediateConfig, warnings } = parseFortigateConfig(BASE + rule('ignored-sel', `${body}        set action accept\n        set service "ALL"\n`));
+    expect(find(intermediateConfig, 'ignored-sel').disabled).toBe(true);
+    expect(warnings.some((w) => w.element === 'security-rule/ignored-sel')).toBe(true);
+  });
+
+  it('warns when a multi-VDOM backup hides its objects under global/vdom', () => {
+    const { warnings } = parseFortigateConfig(`config global
+config system interface
+    edit "port1"
+        set vdom "tenant1"
+    next
+end
+end
+config vdom
+edit tenant1
+config firewall address
+    edit "lan-net"
+        set subnet 192.168.10.0 255.255.255.0
+    next
+end
+end
+`);
+    expect(warnings.some((w) => w.severity === 'error' && /VDOM/.test(w.message))).toBe(true);
+  });
+
+  it('does not let "edit __proto__" write onto Object.prototype', () => {
+    try {
+      parse('config firewall policy\n    edit __proto__\n        set srcintf "evil"\n    next\nend\n');
+      expect({}.srcintf).toBeUndefined();
+    } finally {
+      delete Object.prototype.srcintf;
+    }
+  });
+});
