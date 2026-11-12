@@ -20,7 +20,8 @@ import {
   xmlElementName,
   xmlText,
 } from '../security/junos-serialization.js';
-import { findNegationIssues, findPolicyReferenceIssues, findUnresolvedServiceGroups } from '../security/policy-reference-integrity.js';
+import { findNegationIssues, findPolicyReferenceIssues, findUnresolvedServiceGroups, isEmittableSchedule } from '../security/policy-reference-integrity.js';
+import { mapAction } from './srx-converter.js';
 import { resolveLagInterfaces, lagDeviceCount, resolveLagMemberPort } from './srx-lag-mapping.js';
 import { validateJunosInput } from '../security/junos-input-validation.js';
 import { encodeJunosZonePair } from '../security/junos-identifier-identity.js';
@@ -147,7 +148,7 @@ export function buildSrxXml(config, interfaceMappings = {}, targetContext = null
   buildSystemConfigXml(config.system_config, lines, indent, useContext ? [] : serviceElements);
 
   // Interface addresses (IPv4 + IPv6)
-  buildInterfaceAddressesXml(config.interfaces, lines, interfaceMappings, indent, lagResolution.lagInterfaces);
+  buildInterfaceAddressesXml(config.interfaces, lines, interfaceMappings, indent, lagResolution.lagInterfaces, warnings);
 
   // Security section
   lines.push(`${indent}<security>`);
@@ -475,6 +476,7 @@ function buildPoliciesXml(policies, lines, warnings, profileMaps = {}, appGroups
     const destinationEntries = orderedZoneEntries(dstZones);
     let definitionIndex = 0;
     const definedPairs = new Set();
+    const globalZones = { from: new Map(), to: new Map() };
     for (let sourceOrdinal = 0; sourceOrdinal < sourceEntries.length; sourceOrdinal += 1) {
       const { zone: src, index: sourceIndex } = sourceEntries[sourceOrdinal];
       identifierNames.reference(policy.src_zones.length > 0
@@ -490,6 +492,17 @@ function buildPoliciesXml(policies, lines, warnings, profileMaps = {}, appGroups
         const contextKey = isGlobal ? 'global' : encodeJunosZonePair(src, dst);
         if (!zonePairs.has(contextKey)) {
           zonePairs.set(contextKey, { from: src, to: dst, isGlobal, policies: [] });
+        }
+        // A global policy has no zone pair, so it keeps its non-any zones as <match> elements
+        const sourcePath = policy.src_zones.length > 0
+          ? `security_policies[${policyIndex}].src_zones[${sourceIndex}]`
+          : `security_policies[${policyIndex}]#effective-source-zone`;
+        const destinationPath = policy.dst_zones.length > 0
+          ? `security_policies[${policyIndex}].dst_zones[${destinationIndex}]`
+          : `security_policies[${policyIndex}]#effective-destination-zone`;
+        if (isGlobal) {
+          if (src !== 'any') globalZones.from.set(src, sourcePath);
+          if (dst !== 'any') globalZones.to.set(dst, destinationPath);
         }
         if (definedPairs.has(contextKey)) continue;
         definedPairs.add(contextKey);
@@ -509,6 +522,7 @@ function buildPoliciesXml(policies, lines, warnings, profileMaps = {}, appGroups
             : `security_policies[${policyIndex}].name#zone-pair:${encodeJunosZonePair(src, dst)}`);
         zonePairs.get(contextKey).policies.push({
           policy, policyIndex, sourceIndex, destinationIndex, outputName,
+          globalZones: isGlobal ? globalZones : null,
         });
       }
     }
@@ -569,6 +583,7 @@ function buildPoliciesXml(policies, lines, warnings, profileMaps = {}, appGroups
         const undefinedItems = [
           ...(referenceIssue.addresses || []).map(addr => `address "${addr}"`),
           ...(referenceIssue.services || []).map(svc => `service "${svc}"`),
+          ...(referenceIssue.schedules || []).map(schedule => `schedule "${schedule}"`),
         ];
         lines.push(`        ${xmlComment(`CAVEAT: policy deactivated — undefined reference(s): ${undefinedItems.join(', ')}`, `security_policies[${pIdx}]`)}`);
         warnings.push(createWarning(
@@ -587,6 +602,11 @@ function buildPoliciesXml(policies, lines, warnings, profileMaps = {}, appGroups
 
       // Match
       lines.push('          <match>');
+      for (const [direction, zonePaths] of Object.entries(item.globalZones || {})) {
+        for (const zonePath of zonePaths.values()) {
+          lines.push(`            <${direction}-zone>${xmlText(identifierNames.reference(zonePath))}</${direction}-zone>`);
+        }
+      }
       for (const { index: addressIndex } of (srcAddrs.length > 0 ? srcAddrs : [{ value: 'any', index: null }])) {
         const output = addressIndex === null ? 'any' : identifierNames.reference(`security_policies[${pIdx}].src_addresses[${addressIndex}]`);
         lines.push(`            <source-address>${xmlText(output)}</source-address>`);
@@ -612,7 +632,7 @@ function buildPoliciesXml(policies, lines, warnings, profileMaps = {}, appGroups
       // Then
       lines.push('          <then>');
       const action = xmlElementName(
-        policy.action === 'allow' ? 'permit' : (policy.action === 'drop' || policy.action === 'deny' ? 'deny' : 'reject'),
+        mapAction(policy.action),
         ['permit', 'deny', 'reject'],
         `security_policies[${pIdx}].action`,
       );
@@ -664,7 +684,7 @@ function buildPoliciesXml(policies, lines, warnings, profileMaps = {}, appGroups
       lines.push('          </then>');
 
       // Scheduler
-      if (policy.schedule) {
+      if (policy.schedule && !referenceIssue?.schedules?.length) {
         lines.push(`          <scheduler-name>${xmlText(identifierNames.reference(`security_policies[${pIdx}].schedule`))}</scheduler-name>`);
       }
 
@@ -1067,6 +1087,7 @@ function buildSchedulersXml(schedules, lines, identifierNames) {
   for (let scheduleIndex = 0; scheduleIndex < schedules.length; scheduleIndex += 1) {
     const sched = schedules[scheduleIndex];
     const name = identifierNames.definition(`schedules[${scheduleIndex}].name`);
+    if (!isEmittableSchedule(sched)) continue;
     lines.push('    <scheduler>');
     lines.push(`      <name>${xmlText(name)}</name>`);
 
@@ -3330,14 +3351,14 @@ function buildLagInterfacesXml(lagInterfaces, lines, interfaceMappings, indent) 
   }
 }
 
-function buildInterfaceAddressesXml(interfaces, lines, interfaceMappings = {}, indent = '  ', lagInterfaces = []) {
+function buildInterfaceAddressesXml(interfaces, lines, interfaceMappings = {}, indent = '  ', lagInterfaces = [], warnings = []) {
   const withAddrs = (interfaces || []).filter(i => i.ip || i.ipv6 || i.mode === 'dhcp');
   if (withAddrs.length === 0 && lagInterfaces.length === 0) return;
 
   lines.push(`${indent}<!-- Interface Addresses -->`);
   lines.push(`${indent}<interfaces>`);
 
-  for (const iface of withAddrs) {
+  const resolved = withAddrs.map((iface) => {
     // Map source interface name to SRX name
     let srxName = iface.name || '';
     if (interfaceMappings[srxName]) {
@@ -3350,12 +3371,44 @@ function buildInterfaceAddressesXml(interfaces, lines, interfaceMappings = {}, i
         srxName = `${interfaceMappings[base].split('.')[0]}.${unit || '0'}`;
       }
     }
-
     const [baseName, unitNum = '0'] = srxName.split('.');
+    return { iface, baseName, unitNum };
+  });
+
+  // VLAN tagging pre-pass (mirrors the set converter): tagged sub-units need
+  // flexible-vlan-tagging on the physical base, and an untagged unit-0 IP a native VLAN.
+  const vlanByBase = new Map();
+  const baseHasNativeIp = new Set();
+  for (const { iface, baseName, unitNum } of resolved) {
+    if (iface.vlan) {
+      if (!vlanByBase.has(baseName)) vlanByBase.set(baseName, new Set());
+      vlanByBase.get(baseName).add(Number(iface.vlan));
+    } else if (unitNum === '0') {
+      baseHasNativeIp.add(baseName);
+    }
+  }
+  for (const [baseName, usedTags] of vlanByBase) {
+    lines.push(`${indent}  <interface>`);
+    lines.push(`${indent}    <name>${xmlText(baseName)}</name>`);
+    lines.push(`${indent}    <flexible-vlan-tagging/>`);
+    if (baseHasNativeIp.has(baseName)) {
+      let nativeVlan = 1;
+      while (usedTags.has(nativeVlan) && nativeVlan < 4094) nativeVlan += 1;
+      lines.push(`${indent}    <native-vlan-id>${nativeVlan}</native-vlan-id>`);
+      lines.push(`${indent}    ${xmlComment(`NOTE: native-vlan-id ${nativeVlan} inferred for the untagged parent IP on ${baseName} — verify against your VLAN plan`, 'interfaces.vlan')}`);
+      warnings.push(createWarning('warning', `interfaces/${baseName}`,
+        `native-vlan-id ${nativeVlan} was inferred for the untagged parent IP on ${baseName}`,
+        'PAN-OS does not specify a native VLAN — confirm this id fits your VLAN plan'));
+    }
+    lines.push(`${indent}  </interface>`);
+  }
+
+  for (const { iface, baseName, unitNum } of resolved) {
     lines.push(`${indent}  <interface>`);
     lines.push(`${indent}    <name>${xmlText(baseName)}</name>`);
     lines.push(`${indent}    <unit>`);
     lines.push(`${indent}      <name>${xmlText(unitNum)}</name>`);
+    if (iface.vlan) lines.push(`${indent}      <vlan-id>${xmlText(String(iface.vlan))}</vlan-id>`);
     if (iface.description) {
       lines.push(`${indent}      <description>${xmlText(iface.description)}</description>`);
     }

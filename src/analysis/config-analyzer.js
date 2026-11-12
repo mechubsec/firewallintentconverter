@@ -741,7 +741,7 @@ export const AnalysisEngine = {
     }
 
     const items = [];
-    for (const [policyIndex, { addresses, services }] of issuesMap) {
+    for (const [policyIndex, { addresses, services, schedules = [] }] of issuesMap) {
       const policy = policies[policyIndex];
       if (!policy) continue;
 
@@ -751,6 +751,9 @@ export const AnalysisEngine = {
       }
       if (services.length) {
         parts.push(`service "${services.join('", "')}"${services.length > 1 ? 's' : ''}`);
+      }
+      if (schedules.length) {
+        parts.push(`schedule "${schedules.join('", "')}"`);
       }
       const label = `${pLabel(policy)} — undefined: ${parts.join(', ')}`;
       items.push({ key: pKey(policy), label });
