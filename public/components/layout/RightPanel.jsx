@@ -56,32 +56,38 @@ export default function RightPanel() {
 
   const isTranslated = platformView === 'srx' && !!srxTranslatedPolicies;
 
+  // Locate a rule by identity (rename-proof callers pass the pre-edit rule)
+  const findRuleIndex = (rules, rule) => (rules || []).findIndex(
+    r => r._rule_index === rule._rule_index && r.name === rule.name,
+  );
+
   const handleUpdateRule = useCallback((updatedRule) => {
+    // A rename changes updatedRule.name, so find the row by the pre-edit selection
+    const original = selectedRule || updatedRule;
     if (isTranslated) {
-      const idx = (srxTranslatedPolicies || []).findIndex(
-        r => r._rule_index === updatedRule._rule_index && r.name === updatedRule.name,
-      );
+      const idx = findRuleIndex(srxTranslatedPolicies, original);
       if (idx >= 0) llm.handleUpdateTranslatedRule(idx, updatedRule);
     } else {
-      config.handleUpdateRule(updatedRule);
+      const idx = findRuleIndex(activeConfig?.security_policies, original);
+      if (idx >= 0) config.handleUpdateRule(idx, updatedRule);
     }
     // Keep selectedRule in sync
     uiDispatch({ type: 'SET_FIELD', field: 'selectedRule', value: updatedRule });
-  }, [isTranslated, srxTranslatedPolicies, llm, config, uiDispatch]);
+  }, [isTranslated, selectedRule, srxTranslatedPolicies, activeConfig, llm, config, uiDispatch]);
 
   const handleAcceptRule = useCallback(() => {
     if (!selectedRule) return;
     if (isTranslated) {
-      const idx = (srxTranslatedPolicies || []).findIndex(
-        r => r._rule_index === selectedRule._rule_index && r.name === selectedRule.name,
-      );
+      const idx = findRuleIndex(srxTranslatedPolicies, selectedRule);
       if (idx >= 0) llm.handleAcceptTranslatedRule(idx);
     } else {
+      const idx = findRuleIndex(activeConfig?.security_policies, selectedRule);
+      if (idx < 0) return;
       const accepted = { ...selectedRule, _review_status: 'accepted' };
-      config.handleUpdateRule(accepted);
+      config.handleUpdateRule(idx, accepted);
       uiDispatch({ type: 'SET_FIELD', field: 'selectedRule', value: accepted });
     }
-  }, [selectedRule, isTranslated, srxTranslatedPolicies, llm, config, uiDispatch]);
+  }, [selectedRule, isTranslated, srxTranslatedPolicies, activeConfig, llm, config, uiDispatch]);
 
   if (rightPanelCollapsed) {
     return (

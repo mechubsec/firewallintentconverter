@@ -35,9 +35,18 @@ jobs:
         with:
           fetch-depth: 0
 
+      - name: Set up Python
+        id: python
+        # njsscan's pyo3 dependency does not build on the runner's default Python (3.14).
+        uses: actions/setup-python@6d4fd22b20465ccc0f7354476588e8df7c9ca0e0 # v7
+        with:
+          python-version: '3.12'
+
       - name: Install semgrep + njsscan (pinned, isolated)
         # pipx gives each tool its own venv; semgrep and njsscan have
         # conflicting transitive deps and cannot share one environment.
+        env:
+          PIPX_DEFAULT_PYTHON: ${{ steps.python.outputs.python-path }}
         run: |
           pipx install semgrep==1.170.0
           pipx install njsscan==0.4.3
