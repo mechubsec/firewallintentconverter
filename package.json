@@ -1,6 +1,6 @@
 {
   "name": "firewallintentconverter",
-  "version": "1.4.0",
+  "version": "1.4.1",
   "description": "Browser-based multi-vendor firewall configuration converter for Juniper SRX",
   "license": "MIT",
   "engines": {
