@@ -41,7 +41,8 @@ const xmlParserOptions = {
   ignoreAttributes: false,       // PAN-OS uses name="..." on <entry> elements
   attributeNamePrefix: '@_',     // Access attributes as @_name, @_uuid, etc.
   allowBooleanAttributes: true,
-  parseTagValue: true,
+  // Keep values as written: <member>007</member> must still match name="007".
+  parseTagValue: false,
   trimValues: true,
   // Security: disable entity processing to prevent XXE and entity expansion DoS
   processEntities: false,
@@ -134,10 +135,10 @@ export function parsePanosConfig(configText) {
     const serviceGroups = parseServiceGroups(vsys, warnings);
     const applications = parseApplications(vsys, warnings);
     const applicationGroups = parseApplicationGroups(vsys, warnings);
-    const securityPolicies = parseSecurityRules(vsys, warnings);
+    const securityPolicies = parseSecurityRules(vsys, warnings, zones.map(zone => zone.name));
     const natRules = parseNatRules(vsys, warnings, serviceObjects);
     const externalLists = parseExternalLists(vsys, warnings);
-    const schedules = parseScheduleObjects(vsys);
+    const schedules = parseScheduleObjects(vsys, warnings);
 
     // Resolve profile group references
     const profileGroupDefs = parseProfileGroupDefinitions(vsys);
@@ -169,10 +170,12 @@ export function parsePanosConfig(configText) {
     Object.assign(allSecurityProfileDefinitions, profileDefs);
 
     // Append implicit rules for this vsys
+    // Implicit rule names must be unique across vsys.
+    const vsysSuffix = multiVsys ? ` [${vsysName}]` : '';
     let implicitIndex = securityPolicies.length + 1;
     for (const zone of zones) {
       securityPolicies.push({
-        name: `Implicit: Intra-zone Allow (${zone.name})`,
+        name: `Implicit: Intra-zone Allow (${zone.name})${vsysSuffix}`,
         src_zones: [zone.name],
         dst_zones: [zone.name],
         src_addresses: ['any'],
@@ -195,7 +198,7 @@ export function parsePanosConfig(configText) {
       });
     }
     securityPolicies.push({
-      name: 'Implicit: Interzone Default Deny',
+      name: `Implicit: Interzone Default Deny${vsysSuffix}`,
       src_zones: ['any'],
       dst_zones: ['any'],
       src_addresses: ['any'],
@@ -1244,7 +1247,7 @@ function parseApplicationGroups(vsys, warnings) {
 // Security Rules Parser
 // ---------------------------------------------------------------------------
 
-function parseSecurityRules(vsys, warnings) {
+function parseSecurityRules(vsys, warnings, zoneNames = []) {
   // Rules live under rulebase → security → rules → entry
   const rulebase = vsys.rulebase;
   if (!rulebase) return [];
@@ -1259,7 +1262,7 @@ function parseSecurityRules(vsys, warnings) {
   const rulesContainer = Array.isArray(rulesNode) ? rulesNode[0] : rulesNode;
   const ruleEntries = extractEntries(rulesContainer);
 
-  return ruleEntries.map((entry, index) => {
+  const rules = ruleEntries.flatMap((entry, index) => {
     const name = entry['@_name'] || `rule-${index + 1}`;
     const srcZones = extractMembers(entry.from);
     const dstZones = extractMembers(entry.to);
@@ -1380,7 +1383,7 @@ function parseSecurityRules(vsys, warnings) {
       ));
     }
 
-    return {
+    return applyRuleType(String(entry['rule-type'] || 'universal').trim(), {
       name,
       src_zones: srcZones,
       dst_zones: dstZones,
@@ -1401,8 +1404,47 @@ function parseSecurityRules(vsys, warnings) {
       schedule: entry.schedule ? String(entry.schedule) : '',
       source_users: filteredUsers,
       _rule_index: index + 1,
-    };
+    }, zoneNames, warnings);
   });
+  // Expansion can add rules; keep the indexes sequential.
+  return rules.map((rule, index) => ({ ...rule, _rule_index: index + 1 }));
+}
+
+/**
+ * Applies a PAN-OS rule-type to a parsed security rule. SRX has no rule-type, so
+ * intrazone / interzone are expressed as explicit zone pairs: intrazone is one rule
+ * per zone (src = dst), interzone is one rule per source zone excluding itself.
+ * Without a zone list to expand "any" the rule is deactivated rather than widened.
+ *
+ * @param {string} ruleType - universal (default), intrazone or interzone
+ * @param {Object} rule - Parsed security rule
+ * @param {string[]} zoneNames - Zones known in the vsys
+ * @param {Object[]} warnings - Warning accumulator
+ * @returns {Object[]} The rule, or the rules it expands to
+ */
+function applyRuleType(ruleType, rule, zoneNames, warnings) {
+  if (ruleType !== 'intrazone' && ruleType !== 'interzone') return [rule];
+
+  const expand = zones => (zones.includes('any') ? zoneNames : zones);
+  const srcZones = expand(rule.src_zones);
+  const dstZones = ruleType === 'interzone' ? expand(rule.dst_zones) : srcZones;
+  if (srcZones.length === 0 || dstZones.length === 0) {
+    warnings.push(createWarning(
+      'warning',
+      `security-rule/${rule.name}`,
+      `Rule "${rule.name}" is ${ruleType} but its zones cannot be expanded — deactivated`,
+      'Create explicit zone-pair policies for this rule on the SRX'
+    ));
+    return [{ ...rule, disabled: true }];
+  }
+
+  const expanded = srcZones.map(srcZone => ({
+    ...rule,
+    src_zones: [srcZone],
+    dst_zones: ruleType === 'interzone' ? dstZones.filter(zone => zone !== srcZone) : [srcZone],
+  })).filter(zoneRule => zoneRule.dst_zones.length > 0);
+  if (expanded.length === 1) return [{ ...expanded[0], name: rule.name }];
+  return expanded.map(zoneRule => ({ ...zoneRule, name: `${rule.name}-${zoneRule.src_zones[0]}` }));
 }
 
 /**
@@ -1630,7 +1672,7 @@ function parseProfileGroupDefinitions(vsys) {
  * Parses PAN-OS schedule objects.
  * PAN-OS schedules can be recurring (weekly/daily) or non-recurring (one-time).
  */
-function parseScheduleObjects(vsys) {
+function parseScheduleObjects(vsys, warnings = []) {
   const scheduleContainer = vsys.schedule;
   if (!scheduleContainer) return [];
 
@@ -1645,20 +1687,30 @@ function parseScheduleObjects(vsys) {
       if (weekly) {
         const dayNames = ['sunday', 'monday', 'tuesday', 'wednesday', 'thursday', 'friday', 'saturday'];
         const days = [];
+        const dayTimes = {};
         let start = '', end = '';
         for (const day of dayNames) {
           if (weekly[day]) {
-            days.push(day.charAt(0).toUpperCase() + day.slice(1, 3));
+            const dayShort = day.charAt(0).toUpperCase() + day.slice(1, 3);
+            days.push(dayShort);
             // Time ranges are in "HH:MM-HH:MM" format
-            const timeStr = Array.isArray(weekly[day]) ? weekly[day][0] : String(weekly[day]);
+            const ranges = extractMembers(weekly[day]);
+            if (ranges.length > 1) {
+              warnings.push(createWarning('warning', `schedule/${name}`,
+                `Schedule "${name}" has several time ranges on ${day} — only the first is converted`,
+                'Add the other ranges to the SRX scheduler by hand'));
+            }
+            const timeStr = ranges[0];
             if (timeStr && timeStr.includes('-')) {
               const [s, e] = timeStr.split('-');
+              dayTimes[dayShort] = { start: s, end: e };
               start = start || s;
               end = e;
             }
           }
         }
-        return { name, type: 'recurring', days, start, end };
+        const differs = Object.values(dayTimes).some(t => t.start !== dayTimes[days[0]]?.start || t.end !== dayTimes[days[0]]?.end);
+        return { name, type: 'recurring', days, start, end, ...(differs ? { day_times: dayTimes } : {}) };
       }
       // Daily schedule
       const daily = schedType.recurring.daily;
@@ -1996,6 +2048,12 @@ function parseVpnConfig(config, warnings) {
 
   return vpnTunnels;
 }
+/** PAN-OS predefined service objects, which a config never defines itself. */
+const PANOS_PREDEFINED_SERVICES = {
+  'service-http': { protocol: 'tcp', port: '80' },
+  'service-https': { protocol: 'tcp', port: '443' },
+};
+
 function parseNatRules(vsys, warnings, serviceObjects) {
   const rulebase = vsys.rulebase;
   if (!rulebase) return [];
@@ -2009,8 +2067,8 @@ function parseNatRules(vsys, warnings, serviceObjects) {
   const rulesContainer = Array.isArray(rulesNode) ? rulesNode[0] : rulesNode;
   const ruleEntries = extractEntries(rulesContainer);
 
-  // Build service lookup: name → {protocol, port_range}
-  const serviceLookup = {};
+  // Build service lookup: name → {protocol, port_range}. Predefined services first so a user object can override.
+  const serviceLookup = { ...PANOS_PREDEFINED_SERVICES };
   for (const svc of serviceObjects || []) {
     if (svc.name && svc.protocol && svc.port_range) {
       serviceLookup[svc.name] = { protocol: svc.protocol, port: svc.port_range };
@@ -2039,6 +2097,7 @@ function parseNatRules(vsys, warnings, serviceObjects) {
     let staticBidirectional = false;
     let matchProtocol = null;
     let matchPort = null;
+    let unresolvedService = false;
 
     // Service match (protocol/port)
     // The XML parser turns a numeric name such as <service>443</service> into a number.
@@ -2048,6 +2107,8 @@ function parseNatRules(vsys, warnings, serviceObjects) {
       if (svc) {
         matchProtocol = svc.protocol;
         matchPort = svc.port;
+      } else {
+        unresolvedService = true;
       }
     }
 
@@ -2080,12 +2141,26 @@ function parseNatRules(vsys, warnings, serviceObjects) {
       }
     }
 
+    // No translation at all is a NAT exemption; keep it so it still shadows a later source NAT rule.
+    if (!Object.keys(entry).some(key => key.endsWith('-translation'))) {
+      type = 'source';
+      translatedSrc = { type: 'no-nat' };
+    }
+
     // Destination NAT
     if (entry['destination-translation']) {
       type = type === 'source' ? 'source-and-destination' : 'destination';
       const dstTrans = entry['destination-translation'];
       translatedDst = dstTrans['translated-address'] || '';
       translatedPort = dstTrans['translated-port'] ? String(dstTrans['translated-port']) : null;
+    }
+
+    // Matching every port would widen the rule, so drop it (static NAT warns for itself below).
+    if (unresolvedService && type !== 'static') {
+      warnings.push(createWarning('warning', `nat-rule/${name}`,
+        `NAT rule "${name}" skipped — service "${serviceName}" is not a known service object`,
+        'Build this NAT rule manually with the intended protocol and port'));
+      return null;
     }
 
     let staticFields = null;
