@@ -129,7 +129,8 @@ describe('SRX parser: deactivated policies', () => {
     const { intermediateConfig: cfg } = parseSrxConfig(text);
     const trust = cfg.zones.find(z => z.name === 'trust');
     expect([...trust.interfaces].sort()).toEqual(['ge-0/0/1.0', 'ge-0/0/2.0']);
-    expect(cfg.nat_rules.map(r => r.name)).toEqual(['X/Y']);
+    // A deactivated NAT rule must not come back active, so it is dropped.
+    expect(cfg.nat_rules).toEqual([]);
     expect(JSON.stringify(cfg)).not.toContain('_deactivated');
   });
 });
@@ -162,4 +163,81 @@ describe('SRX round trip', () => {
       expect(p['off-permit']).toMatchObject({ negate_source: false, negate_destination: true, disabled: true });
     });
   }
+});
+
+describe('SRX parser: config order, prototype safety, NAT and address-books', () => {
+  const zones = ['set security zones security-zone trust', 'set security zones security-zone untrust'];
+  const base = 'set security policies from-zone trust to-zone untrust policy';
+  const policyBody = (name, action) => [
+    `${base} ${name} match source-address any`,
+    `${base} ${name} match destination-address any`,
+    `${base} ${name} match application any`,
+    `${base} ${name} then ${action}`,
+  ];
+
+  it('keeps config order for numeric policy names', () => {
+    const config = [...zones, ...policyBody('10', 'deny'), ...policyBody('2', 'permit'), ...policyBody('blockit', 'deny')].join('\n');
+    const { security_policies: policies } = parseSrxConfig(config).intermediateConfig;
+    expect(policies.map(policy => policy.name).slice(0, 3)).toEqual(['10', '2', 'blockit']);
+  });
+
+  it('keeps config order for numeric NAT rules', () => {
+    const rule = (name) => [
+      `set security nat source rule-set sn rule ${name} match source-address 192.0.2.0/24`,
+      `set security nat source rule-set sn rule ${name} then source-nat interface`,
+    ];
+    const config = [...zones, ...rule('10'), ...rule('2'), ...rule('x')].join('\n');
+    const { nat_rules: natRules } = parseSrxConfig(config).intermediateConfig;
+    expect(natRules.map(natRule => natRule.name)).toEqual(['sn/10', 'sn/2', 'sn/x']);
+  });
+
+  it('does not pollute Object.prototype from a __proto__ policy name', () => {
+    parseSrxConfig([
+      `${base.replace('trust to-zone untrust', 'a to-zone b')} __proto__ match source-address evil`,
+      `${base.replace('trust to-zone untrust', 'a to-zone b')} __proto__ then permit`,
+    ].join('\n'));
+    expect(({}).match).toBeUndefined();
+    expect(({}).then).toBeUndefined();
+    expect(Object.prototype.hasOwnProperty.call(Object.prototype, 'match')).toBe(false);
+  });
+
+  it('does not convert a deactivated NAT rule', () => {
+    const config = [
+      ...zones,
+      'set security nat source rule-set sn from zone trust',
+      'set security nat source rule-set sn to zone untrust',
+      'set security nat source rule-set sn rule off match source-address 192.0.2.0/24',
+      'set security nat source rule-set sn rule off then source-nat interface',
+      'deactivate security nat source rule-set sn rule off',
+    ].join('\n');
+    const { intermediateConfig, warnings } = parseSrxConfig(config);
+    expect(intermediateConfig.nat_rules).toEqual([]);
+    expect(warnings.some(warning => /disabled/.test(warning.message))).toBe(true);
+  });
+
+  it('resolves the destination pool address and port of a destination NAT rule', () => {
+    const config = [
+      ...zones,
+      'set security nat destination pool web address 198.51.100.10/32 port 8080',
+      'set security nat destination rule-set dn from zone untrust',
+      'set security nat destination rule-set dn rule r1 match destination-address 192.0.2.50/32',
+      'set security nat destination rule-set dn rule r1 match destination-port 443',
+      'set security nat destination rule-set dn rule r1 then destination-nat pool web',
+    ].join('\n');
+    const [natRule] = parseSrxConfig(config).intermediateConfig.nat_rules;
+    expect(natRule.translated_dst).toBe('198.51.100.10/32');
+    expect(natRule.translated_port).toBe('8080');
+    expect(natRule.match_port).toBe('443');
+  });
+
+  it('reads named and zone-attached address-books', () => {
+    const config = [
+      ...zones,
+      'set security address-book book1 address bk1 198.51.100.0/24',
+      'set security address-book book1 attach zone untrust',
+      'set security zones security-zone trust address-book address za 203.0.113.0/24',
+    ].join('\n');
+    const names = parseSrxConfig(config).intermediateConfig.address_objects.map(address => address.name);
+    expect(names).toEqual(expect.arrayContaining(['bk1', 'za']));
+  });
 });

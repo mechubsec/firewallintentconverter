@@ -87,3 +87,75 @@ describe('PAN-OS interface management profiles', () => {
     expect(parseWarnings.some(w => w.element === 'interfaces/management-profile' && w.message.includes('ethernet1/4'))).toBe(true);
   });
 });
+
+// ---------------------------------------------------------------------------
+// Parser fidelity: rule-type, multi-vsys, numeric-looking names, schedules
+// ---------------------------------------------------------------------------
+
+const zoneXml = (name, iface) =>
+  `<entry name="${name}"><network><layer3><member>${iface}</member></layer3></network></entry>`;
+const ruleXml = (name, { ruleType = '', from = 'any', to = 'any', source = 'any', action = 'allow' } = {}) =>
+  `<entry name="${name}">${ruleType ? `<rule-type>${ruleType}</rule-type>` : ''}<from><member>${from}</member></from><to><member>${to}</member></to><source><member>${source}</member></source><destination><member>any</member></destination><application><member>any</member></application><service><member>any</member></service><action>${action}</action></entry>`;
+const vsysXml = (name, body) => `<entry name="${name}">${body}</entry>`;
+const wrapPanos = vsysEntries =>
+  `<config version="10.1.0"><devices><entry name="localhost.localdomain"><vsys>${vsysEntries}</vsys></entry></devices></config>`;
+const threeZones = `<zone>${zoneXml('trust', 'ethernet1/1')}${zoneXml('dmz', 'ethernet1/2')}${zoneXml('untrust', 'ethernet1/3')}</zone>`;
+const zonePairs = rules => rules.map(rule => `${rule.src_zones}>${rule.dst_zones}`);
+
+describe('PAN-OS parser — rule-type', () => {
+  const parseRules = rules => parsePanosConfig(wrapPanos(vsysXml('vsys1',
+    `${threeZones}<rulebase><security><rules>${rules}</rules></security></rulebase>`)))
+    .intermediateConfig.security_policies.filter(policy => !policy._implicit);
+
+  it('keeps an intrazone rule inside its source zone', () => {
+    const rules = parseRules(ruleXml('intra', { ruleType: 'intrazone', from: 'trust' }));
+    expect(zonePairs(rules)).toEqual(['trust>trust']);
+  });
+
+  it('expands an intrazone any rule to one rule per zone, never a cross-zone pair', () => {
+    const rules = parseRules(ruleXml('intra-any', { ruleType: 'intrazone' }));
+    expect(zonePairs(rules)).toEqual(['trust>trust', 'dmz>dmz', 'untrust>untrust']);
+  });
+
+  it('excludes same-zone pairs from an interzone any-to-any rule', () => {
+    const rules = parseRules(ruleXml('inter', { ruleType: 'interzone', action: 'drop' }));
+    expect(zonePairs(rules)).toEqual(['trust>dmz,untrust', 'dmz>trust,untrust', 'untrust>trust,dmz']);
+  });
+
+  it('leaves universal rules unchanged', () => {
+    const rules = parseRules(ruleXml('uni', { ruleType: 'universal', from: 'trust' }));
+    expect(zonePairs(rules)).toEqual(['trust>any']);
+  });
+});
+
+describe('PAN-OS parser — multi-vsys and numeric-looking names', () => {
+  it('converts a two-vsys config without duplicate implicit rule names', () => {
+    const xml = wrapPanos(
+      vsysXml('vsys1', `<zone>${zoneXml('a', 'ethernet1/1')}</zone>`) +
+      vsysXml('vsys2', `<zone>${zoneXml('b', 'ethernet1/2')}</zone>`));
+    const { intermediateConfig } = parsePanosConfig(xml);
+    expect(() => convertToSrxSetCommands(intermediateConfig, {})).not.toThrow();
+  });
+
+  it('keeps numeric-looking member names as written', () => {
+    const xml = wrapPanos(vsysXml('vsys1',
+      `${threeZones}<address><entry name="007"><ip-netmask>198.51.100.1/32</ip-netmask></entry><entry name="1e3"><ip-netmask>192.0.2.0/24</ip-netmask></entry></address>
+       <rulebase><security><rules>${ruleXml('r1', { from: 'trust', to: 'untrust', source: '007' })}${ruleXml('r2', { from: 'trust', to: 'untrust', source: '1e3' })}</rules></security></rulebase>`));
+    const { intermediateConfig } = parsePanosConfig(xml);
+    const rules = intermediateConfig.security_policies.filter(policy => !policy._implicit);
+    expect(rules.map(rule => rule.src_addresses)).toEqual([['007'], ['1e3']]);
+  });
+});
+
+describe('PAN-OS parser — weekly schedules', () => {
+  it('keeps a separate time window for each day', () => {
+    const xml = wrapPanos(vsysXml('vsys1',
+      `<schedule><entry name="work"><schedule-type><recurring><weekly>
+         <monday><member>08:00-12:00</member></monday><friday><member>13:00-17:00</member></friday>
+       </weekly></recurring></schedule-type></entry></schedule>`));
+    const { intermediateConfig } = parsePanosConfig(xml);
+    const commands = convertToSrxSetCommands(intermediateConfig, {}).commands;
+    expect(commands).toContain('set schedulers scheduler work monday start-time 08:00 stop-time 12:00');
+    expect(commands).toContain('set schedulers scheduler work friday start-time 13:00 stop-time 17:00');
+  });
+});

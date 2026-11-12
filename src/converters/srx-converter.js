@@ -1541,7 +1541,8 @@ function convertSchedules(schedules, commands, warnings, identifiers, identifier
     if (sched.type === 'recurring' && sched.days && sched.days.length > 0) {
       for (const day of sched.days) {
         const junosDay = DAY_NAME_MAP[day.toLowerCase()] || day.toLowerCase();
-        commands.push(`set schedulers scheduler ${name} ${junosDay} start-time ${sched.start} stop-time ${sched.end}`);
+        const dayTime = sched.day_times?.[day] || sched;
+        commands.push(`set schedulers scheduler ${name} ${junosDay} start-time ${dayTime.start} stop-time ${dayTime.end}`);
       }
     } else if (sched.type === 'onetime') {
       commands.push(`set schedulers scheduler ${name} start-date ${setQuoted(sched.start, 'schedules.start')} stop-date ${setQuoted(sched.end, 'schedules.end')}`);

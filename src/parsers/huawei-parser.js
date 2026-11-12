@@ -85,6 +85,21 @@ function huaweiMaskToCidr(mask) {
 }
 
 /**
+ * Converts a bare mask token (no "mask" keyword) to a prefix length: a prefix
+ * length, a wildcard mask (0.0.0.255) or a dotted netmask. Returns null when
+ * the token is not a contiguous mask, so callers can fail closed.
+ */
+function huaweiBareMaskToCidr(token) {
+  if (/^\d+$/.test(token)) return Number(token) <= 32 ? token : null;
+  if (!/^\d+\.\d+\.\d+\.\d+$/.test(token)) return null;
+  const word = token.split('.').reduce((acc, octet) => acc * 256 + Number(octet), 0);
+  // Huawei writes wildcards (leading 0 octet); anything else is read as a netmask.
+  const wildcard = token.startsWith('0.') ? word : (~word >>> 0);
+  if ((wildcard & (wildcard + 1)) !== 0) return null;
+  return String(32 - (wildcard.toString(2).split('1').length - 1));
+}
+
+/**
  * Returns true when a service name matches a Huawei predefined service.
  */
 function isHuaweiPredefinedService(name) {
@@ -308,7 +323,13 @@ function parseAddressSets(sections, warnings) {
         const dottedMatch = line.match(/^address\s+\d+\s+(\d+\.\d+\.\d+\.\d+)\s+(\d+\.\d+\.\d+\.\d+)/i);
         if (dottedMatch) {
           const ip = dottedMatch[1];
-          const cidr = huaweiMaskToCidr(dottedMatch[2]);
+          const cidr = huaweiBareMaskToCidr(dottedMatch[2]);
+          if (cidr === null) {
+            warnings.push(createWarning('warning', `address/${name}`,
+              `Address "${name}" entry "${line}" has a non-contiguous mask and was skipped`,
+              'Define the address by hand on the SRX'));
+            continue;
+          }
           if (cidr === '32') {
             entries.push({ type: 'host', value: `${ip}/32` });
           } else {
@@ -423,45 +444,34 @@ function parseServiceSets(sections, warnings) {
       const entries = [];
 
       for (const line of sec.lines) {
-        // service <n> protocol <proto> destination-port <start> to <end>
-        const rangeMatch = line.match(
-          /^service\s+\d+\s+protocol\s+(\S+)\s+(?:source-port\s+\S+\s+)?destination-port\s+(\d+)\s+to\s+(\d+)/i
-        );
-        if (rangeMatch) {
-          entries.push({
-            protocol: rangeMatch[1].toLowerCase(),
-            port: `${rangeMatch[2]}-${rangeMatch[3]}`,
-            srcPort: '',
-          });
+        // service <n> protocol <proto> [source-port <a> [to <b>]] [destination-port <c> [to <d>]] [icmp-type <t> [code <c>]]
+        const svcMatch = line.match(/^service\s+\d+\s+protocol\s+(\S+)(.*)$/i);
+        if (!svcMatch) continue;
+        let rest = svcMatch[2];
+        const takeMatch = pattern => {
+          const found = rest.match(pattern);
+          if (found) rest = rest.replace(pattern, '');
+          return found;
+        };
+        const srcPortMatch = takeMatch(/\s+source-port\s+(\d+)(?:\s+to\s+(\d+))?/i);
+        const dstPortMatch = takeMatch(/\s+destination-port\s+(\d+)(?:\s+to\s+(\d+))?/i);
+        const icmpMatch = takeMatch(/\s+icmp-type\s+(\d+)(?:\s+code\s+(\d+))?/i);
+        if (rest.trim()) {
+          // Fail closed: an entry we cannot fully read would widen the service
+          warnings.push(createWarning('warning', `service/${name}`,
+            `Service-set "${name}" entry "${line}" has unparsed options and was skipped`,
+            'Define the service by hand on the SRX'));
           continue;
         }
-
-        // service <n> protocol <proto> [source-port <sp>] destination-port <port>
-        const singleMatch = line.match(
-          /^service\s+\d+\s+protocol\s+(\S+)\s+(?:source-port\s+(\S+)\s+)?destination-port\s+(\d+)/i
-        );
-        if (singleMatch) {
-          entries.push({
-            protocol: singleMatch[1].toLowerCase(),
-            port: singleMatch[3],
-            srcPort: singleMatch[2] || '',
-          });
-          continue;
-        }
-
-        // service <n> protocol icmp
-        const icmpMatch = line.match(/^service\s+\d+\s+protocol\s+icmp/i);
-        if (icmpMatch) {
-          entries.push({ protocol: 'icmp', port: '', srcPort: '' });
-          continue;
-        }
-
-        // service <n> protocol <number> — raw IP protocol number
-        const protoNumMatch = line.match(/^service\s+\d+\s+protocol\s+(\d+)/i);
-        if (protoNumMatch) {
-          entries.push({ protocol: protoNumMatch[1], port: '', srcPort: '' });
-          continue;
-        }
+        const portText = match => (!match ? '' : match[2] ? `${match[1]}-${match[2]}` : match[1]);
+        const srcPort = portText(srcPortMatch);
+        entries.push({
+          protocol: svcMatch[1].toLowerCase(),
+          port: portText(dstPortMatch),
+          // A source range of 0-65535 is any source port
+          srcPort: srcPort === '0-65535' ? '' : srcPort,
+          ...(icmpMatch && { icmpType: icmpMatch[1], icmpCode: icmpMatch[2] || '' }),
+        });
       }
 
       if (entries.length === 1) {
@@ -470,6 +480,7 @@ function parseServiceSets(sections, warnings) {
           protocol: entries[0].protocol,
           port_range: entries[0].port || 'any',
           source_port: entries[0].srcPort,
+          ...(entries[0].icmpType && { icmp_type: entries[0].icmpType, icmp_code: entries[0].icmpCode }),
           description: '',
         });
       } else if (entries.length > 1) {
@@ -484,6 +495,7 @@ function parseServiceSets(sections, warnings) {
             protocol: entries[i].protocol,
             port_range: entries[i].port || 'any',
             source_port: entries[i].srcPort,
+            ...(entries[i].icmpType && { icmp_type: entries[i].icmpType, icmp_code: entries[i].icmpCode }),
             description: `Auto-expanded from service-set ${name}`,
           });
         }
@@ -666,12 +678,6 @@ function buildSecurityPolicy(ruleName, lines, ruleIndex, warnings) {
       srcAddrs.push(srcAddrSet[1]);
       continue;
     }
-    const srcAddrInline = trimmed.match(/^source-address\s+(\d+\.\d+\.\d+\.\d+)\s+mask\s+(\S+)/i);
-    if (srcAddrInline) {
-      const cidr = huaweiMaskToCidr(srcAddrInline[2]);
-      srcAddrs.push(`${srcAddrInline[1]}/${cidr}`);
-      continue;
-    }
     if (/^source-address\s+any$/i.test(trimmed)) {
       // 'any' will be handled below — only add if nothing else is present
       continue;
@@ -683,13 +689,24 @@ function buildSecurityPolicy(ruleName, lines, ruleIndex, warnings) {
       dstAddrs.push(dstAddrSet[1]);
       continue;
     }
-    const dstAddrInline = trimmed.match(/^destination-address\s+(\d+\.\d+\.\d+\.\d+)\s+mask\s+(\S+)/i);
-    if (dstAddrInline) {
-      const cidr = huaweiMaskToCidr(dstAddrInline[2]);
-      dstAddrs.push(`${dstAddrInline[1]}/${cidr}`);
+    if (/^destination-address\s+any$/i.test(trimmed)) {
       continue;
     }
-    if (/^destination-address\s+any$/i.test(trimmed)) {
+
+    // Inline <ip> mask <mask|length>, <ip> <length|wildcard>; anything else (range, ...) fails closed
+    const inlineAddr = trimmed.match(/^(source|destination)-address\s+(.+)$/i);
+    if (inlineAddr) {
+      const hostMatch = inlineAddr[2].match(/^(\d+\.\d+\.\d+\.\d+)\s+(?:mask\s+(\S+)|(\S+))$/i);
+      const cidr = hostMatch && (hostMatch[2] ? huaweiMaskToCidr(hostMatch[2]) : huaweiBareMaskToCidr(hostMatch[3]));
+      if (cidr == null) {
+        // Leaving it out would match any, so deactivate the rule instead
+        disabled = true;
+        warnings.push(createWarning('warning', `security-policy/${ruleName}`,
+          `Rule "${ruleName}" has unsupported "${trimmed}" — rule deactivated`,
+          'Define an address-set for it and reference it with address-set'));
+        continue;
+      }
+      (inlineAddr[1].toLowerCase() === 'source' ? srcAddrs : dstAddrs).push(`${hostMatch[1]}/${cidr}`);
       continue;
     }
 

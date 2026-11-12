@@ -13,7 +13,7 @@ globalThis.localStorage = {
   removeItem: key => storage.delete(key),
 };
 
-const { formatJunosSerializationError } = await import('../public/hooks/useConversion.js');
+const { formatJunosSerializationError, getExportPolicies } = await import('../public/hooks/useConversion.js');
 
 function collisionConfig() {
   return {
@@ -167,6 +167,13 @@ describe('conversion fail-closed behavior', () => {
       [],
       'xml',
     )).rejects.toHaveProperty('name', 'JunosSerializationError');
+  });
+
+  it('gates acceptance on the translated policies that are exported', () => {
+    const translated = [{ name: 't', _review_status: 'pending' }];
+    const source = { security_policies: [{ name: 's', _review_status: 'accepted' }] };
+    expect(getExportPolicies(translated, source)).toBe(translated);
+    expect(getExportPolicies(null, source)).toBe(source.security_policies);
   });
 
   it('clears stale output before work and in both error handlers', () => {

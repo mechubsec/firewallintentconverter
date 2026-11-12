@@ -50,3 +50,18 @@ describe('report SSL-VPN section', () => {
     expect(raIdx).toBeLessThan(natIdx);        // before NAT Rules
   });
 });
+
+describe('report escaping', () => {
+  it('escapes remote-access names exactly once', () => {
+    const html = generateReportHtml({
+      ...base,
+      intermediateConfig: {
+        ...base.intermediateConfig,
+        global_protect: { gateways: [{ name: 'a&b<script>', tunnel_interface: 'tunnel.1' }] },
+      },
+    });
+    expect(html).toContain('a&amp;b&lt;script&gt;');
+    expect(html).not.toContain('&amp;amp;');
+    expect(html).not.toContain('<script>');
+  });
+});

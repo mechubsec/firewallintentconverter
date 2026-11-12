@@ -119,6 +119,7 @@ function checkShadow(earlier, later) {
   const earlierUsers = earlier.source_users || [];
   const laterUsers = later.source_users || [];
 
+  if (!usersCover(earlier, later)) return null;
   if (isAnyMatch(earlier)) {
     // If earlier has no identity restriction but later does, later is more specific — not shadowed
     if (earlierUsers.length === 0 && laterUsers.length > 0) return null;
@@ -239,6 +240,8 @@ function detectMergeableRules(zonePairs, warnings) {
       const ruleB = activeRules[i + 1];
 
       if (ruleA.action !== ruleB.action) continue;
+      // Merging rules scoped to different users would widen access.
+      if (!arraysMatchUnordered(userList(ruleA), userList(ruleB))) continue;
       // Unioning negated lists is wrong (not-X + not-Y is not not-(X+Y)), so never suggest it.
       if (hasNegation(ruleA) || hasNegation(ruleB)) continue;
 
@@ -290,16 +293,17 @@ function detectConsolidationOpportunities(zonePairs, warnings) {
     for (const rule of activePermits) {
       const svcKey = getAllServices(rule).sort().join('|');
       if (svcKey === 'any') continue; // skip any/any rules
+      const userKey = userList(rule).sort().join('|');
       if (hasNegation(rule)) continue; // a merged list can't express "except X"
 
       const srcKey = [...(rule.src_addresses || ['any'])].sort().join('|');
       const dstKey = [...(rule.dst_addresses || ['any'])].sort().join('|');
 
-      const srcGroupKey = `svc:${svcKey}|src:${srcKey}`;
+      const srcGroupKey = `svc:${svcKey}|users:${userKey}|src:${srcKey}`;
       if (!bySvcAndSrc[srcGroupKey]) bySvcAndSrc[srcGroupKey] = [];
       bySvcAndSrc[srcGroupKey].push(rule);
 
-      const dstGroupKey = `svc:${svcKey}|dst:${dstKey}`;
+      const dstGroupKey = `svc:${svcKey}|users:${userKey}|dst:${dstKey}`;
       if (!bySvcAndDst[dstGroupKey]) bySvcAndDst[dstGroupKey] = [];
       bySvcAndDst[dstGroupKey].push(rule);
     }
@@ -358,11 +362,24 @@ function isAnyAddresses(addrs, negated) {
 
 function isAnyService(rule) {
   const apps = rule.applications || [];
-  const svcs = rule.services || [];
-  if (apps.length === 1 && apps[0] === 'any') return true;
-  if (svcs.length === 1 && (svcs[0] === 'any' || svcs[0] === 'ALL')) return true;
-  if (apps.length === 0 && svcs.length === 0) return true;
-  return false;
+  // With application any, the service is the match (#163); application-default adds no restriction.
+  const svcs = (rule.services || []).filter(s => s !== 'application-default');
+  const anyApps = apps.length === 0 || (apps.length === 1 && apps[0] === 'any');
+  const anySvcs = svcs.length === 0 || (svcs.length === 1 && (svcs[0] === 'any' || svcs[0] === 'ALL'));
+  return anyApps && anySvcs;
+}
+
+// Identity restriction; an empty list or ['any'] means every user.
+function userList(rule) {
+  return (rule.source_users || []).filter(user => user !== 'any');
+}
+
+// Earlier covers later's users only if earlier is unrestricted, or later is restricted to a subset.
+function usersCover(earlier, later) {
+  const earlierUsers = userList(earlier);
+  if (earlierUsers.length === 0) return true;
+  const laterUsers = userList(later);
+  return laterUsers.length > 0 && arraysSubset(laterUsers, earlierUsers);
 }
 
 function arraysMatchUnordered(a, b) {
@@ -389,8 +406,8 @@ function hasNegation(rule) {
 }
 
 function getAllServices(rule) {
-  return [...(rule.applications || []), ...(rule.services || [])]
-    .filter(s => s !== 'application-default');
+  // application-default stays a token: ['ssl'] on default ports differs from ['ssl'] on any port.
+  return [...(rule.applications || []), ...(rule.services || [])];
 }
 
 function servicesMatch(earlier, later) {
@@ -421,6 +438,7 @@ function isSupersetByAny(earlier, later) {
  * ruleA is a subset of ruleB if every packet matching ruleA also matches ruleB.
  */
 function isSubset(ruleA, ruleB) {
+  if (!usersCover(ruleB, ruleA)) return false;
   const srcOk = isAnyAddresses(ruleB.src_addresses, ruleB.negate_source) ||
     addressesSubset(ruleA.src_addresses, ruleA.negate_source, ruleB.src_addresses, ruleB.negate_source);
   if (!srcOk) return false;
@@ -451,6 +469,7 @@ function servicesSubset(ruleA, ruleB) {
   const aAll = getAllServices(ruleA);
   const bAll = getAllServices(ruleB);
   if (aAll.length === 0) return true;
+  if (bAll.includes('application-default') && !aAll.includes('application-default')) return false;
   const bSet = new Set(bAll);
   return aAll.every(s => bSet.has(s));
 }

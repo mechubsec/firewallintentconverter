@@ -8,6 +8,15 @@
 import React, { createContext, useContext, useReducer } from 'react';
 import { LLM_RISK_ACCEPTANCE_STORAGE_KEY, getLLMRiskAcceptance } from '../utils/llm-risk-acceptance.js';
 
+/** Read localStorage without throwing when storage is blocked. */
+function readStoredItem(key) {
+  try {
+    return localStorage.getItem(key);
+  } catch {
+    return null;
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Initial state
 // ---------------------------------------------------------------------------
@@ -38,7 +47,7 @@ const initialState = {
   showAutoSplitPrompt: null,
   showPushToast: '',
   showPushModal: false,
-  showTour: localStorage.getItem('tour-completed') !== 'true',
+  showTour: readStoredItem('tour-completed') !== 'true',
 
   llmWarningDismissed: false,
 
