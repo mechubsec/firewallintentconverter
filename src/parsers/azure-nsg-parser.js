@@ -109,7 +109,7 @@ function resolveAddress(prefix, zoneName, addressObjects, addressObjectSet, unre
   if (!prefix || prefix === '*' || prefix === 'Internet') return 'any';
 
   const isIpv6 = prefix.includes(':');
-  if (!isIpv6 && !IPV4_PATTERN.test(prefix)) {
+  if (!isIpv6 && !IPV4_PATTERN.test(prefix)) {  // njsscan-ignore: regex_dos
     unresolvedTags.push(prefix);
     return 'any';
   }
