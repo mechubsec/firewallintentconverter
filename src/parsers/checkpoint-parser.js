@@ -471,7 +471,7 @@ function resolveAction(uidOrObj, uidMap) {
   if (obj) {
     if (obj._action) return obj._action;
     const name = (obj.name || '').toLowerCase();
-    if (name === 'accept' || name === 'inner layer') return 'allow';
+    if (name === 'accept') return 'allow';
     if (name === 'drop' || name === 'reject') return 'deny';
   }
   // Check if the UID itself is a known action name
@@ -479,7 +479,7 @@ function resolveAction(uidOrObj, uidMap) {
   const rawLower = (raw || '').toLowerCase();
   if (rawLower === 'accept' || rawLower.includes('accept')) return 'allow';
   if (rawLower === 'drop' || rawLower === 'reject' || rawLower.includes('drop')) return 'deny';
-  return 'allow';
+  return null;
 }
 
 /**
@@ -621,7 +621,7 @@ function parseAddressObjects(uidMap, warnings) {
       });
     } else if (type === 'network') {
       const subnet = obj['subnet4'] || obj['subnet6'] || '';
-      const maskLen = obj['mask-length4'] || obj['mask-length6'] || obj['mask-length'] || '';
+      const maskLen = obj['mask-length4'] ?? obj['mask-length6'] ?? obj['mask-length'] ?? '';
       if (!subnet) continue;
       addressObjects.push({
         name,
@@ -999,7 +999,9 @@ function flattenRulebase(rules, uidMap, layerName, sectionName, warnings) {
         const inlineObj = resolveUid(inlineLayerRef, uidMap);
         if (inlineObj && Array.isArray(inlineObj.rulebase)) {
           const inlineFlat = flattenRulebase(inlineObj.rulebase, uidMap, inlineObj.name || layerName, sectionName, warnings);
+          for (const child of inlineFlat) child._inlineParents = [...(child._inlineParents || []), item];
           flat.push(...inlineFlat);
+          item._inlineExpanded = true;
         }
       }
     } else if (type === 'place-holder') {
@@ -1014,6 +1016,37 @@ function flattenRulebase(rules, uidMap, layerName, sectionName, warnings) {
   }
 
   return flat;
+}
+
+/**
+ * ANDs the match of every enclosing inline-layer parent into a child rule's
+ * src/dst/service. 'any' intersected with X is X; two different specific
+ * lists, or any negation, cannot be represented, so the child fails closed.
+ */
+function intersectInlineParents(rule, uidMap, warnings, ruleName, src, dst, svc) {
+  const match = { src, dst, svc, failed: false };
+  const intersect = (childList, parentList) => {
+    if (parentList.length === 1 && parentList[0] === 'any') return childList;
+    if (childList.length === 1 && childList[0] === 'any') return parentList;
+    const sameSet = childList.length === parentList.length && childList.every(name => parentList.includes(name));
+    if (sameSet) return childList;
+    match.failed = true;
+    return childList;
+  };
+  for (const parent of rule._inlineParents || []) {
+    const parentName = parent.name || parent.uid || 'parent';
+    if (parent.enabled === false) match.failed = true;
+    if (parent['source-negate'] === true || parent['destination-negate'] === true || rule['source-negate'] === true || rule['destination-negate'] === true) match.failed = true;
+    match.src = intersect(match.src, resolveUidArray(parent.source, uidMap, warnings, `rule/${parentName}/source`));
+    match.dst = intersect(match.dst, resolveUidArray(parent.destination, uidMap, warnings, `rule/${parentName}/destination`));
+    match.svc = intersect(match.svc, resolveServiceArray(parent.service, uidMap, warnings));
+  }
+  if (match.failed) {
+    warnings.push(createWarning('warning', `rule/${ruleName}/inline-layer`,
+      `Rule "${ruleName}" is in an inline layer whose parent match cannot be combined with the rule match; rule deactivated`,
+      'Merge the inline layer parent conditions into this rule manually'));
+  }
+  return match;
 }
 
 /**
@@ -1059,8 +1092,18 @@ function buildPolicyFromRule(rule, uidMap, ruleIndex, layerName, warnings) {
   // Resolve services
   const serviceNames = resolveServiceArray(rule.service, uidMap, warnings);
 
-  // Resolve action
-  const action = resolveAction(rule.action, uidMap);
+  // Resolve action; an unknown action fails closed. A parent of an inline layer is not
+  // emitted: its match is ANDed into the children, and traffic matching no child hits
+  // the layer's implicit cleanup (drop).
+  if (rule._inlineExpanded) return null;
+  let action = resolveAction(rule.action, uidMap);
+  if (!action) {
+    action = 'deny';
+    warnings.push(createWarning('warning', `rule/${ruleName}/action`,
+      `Rule "${ruleName}" has an unresolved or unsupported action; converted as deny`,
+      'Review the rule and set the intended action manually'));
+  }
+  const parentMatch = intersectInlineParents(rule, uidMap, warnings, ruleName, srcAddrs, dstAddrs, serviceNames);
 
   // Resolve track/log
   const logEnabled = resolveTrack(rule.track, uidMap);
@@ -1081,12 +1124,12 @@ function buildPolicyFromRule(rule, uidMap, ruleIndex, layerName, warnings) {
     name: ruleName,
     src_zones: srcZones,
     dst_zones: dstZones,
-    src_addresses: srcAddrs,
-    dst_addresses: dstAddrs,
+    src_addresses: parentMatch.src,
+    dst_addresses: parentMatch.dst,
     negate_source: negateSource,
     negate_destination: negateDest,
     applications: [],  // Check Point doesn't have app-id in traditional rules
-    services: serviceNames,
+    services: parentMatch.svc,
     action,
     log_start: false,
     log_end: logEnabled,
@@ -1094,7 +1137,7 @@ function buildPolicyFromRule(rule, uidMap, ruleIndex, layerName, warnings) {
     security_profiles: {},
     description: comments,
     tags: [],
-    disabled: !enabled,
+    disabled: !enabled || parentMatch.failed,
     schedule: '',
     source_users: srcIdentities,
     _rule_index: ruleIndex,
