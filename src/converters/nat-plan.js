@@ -675,8 +675,16 @@ export function planNat({
           comments.push(skipUnresolved('destination', ruleName, 'dst_addresses', rule));
           continue;
         }
+        // An "any" source adds no match; the rule's own src_addresses must never be dropped.
+        const source = planMatchField(ruleIndex, rule, 'src_addresses',
+          { anyAddress: natAnyAddress(rule), allowGroups: true, keepAny: false, limit: NAT_MATCH_ADDRESS_LIMIT, element: `nat/destination/${ruleName}` });
+        if (source.unresolved) {
+          planned.skipped = true;
+          comments.push(skipUnresolved('destination', ruleName, 'src_addresses', rule, source));
+          continue;
+        }
         planned.match = {
-          source: [],
+          source: rule.src_addresses?.includes('any') ? [] : source.entries,
           destination: firstDestination('destination', ruleName, destination.entries, natAnyAddress(rule)),
           protocol: planProtocol(rule),
           destinationPort: planPort(rule),

@@ -18,7 +18,7 @@
  * (clean / warning / unsupported) for the warnings panel.
  */
 
-import { sanitizeJunosName, mapAppToJunos, hasSpecificService, mapProfileToSrx, createWarning, isPredefEquivalent, JUNOS_PREDEFINED_APPS } from '../parsers/parser-utils.js';
+import { sanitizeJunosName, mapAppToJunos, hasSpecificService, mapProfileToSrx, createWarning, isPredefEquivalent, normalizeAddressPrefix, JUNOS_PREDEFINED_APPS } from '../parsers/parser-utils.js';
 import {
   deriveManagementServices,
   hostInboundEntries,
@@ -785,24 +785,14 @@ function convertAddressObjects(objects, commands, warnings, summary, identifiers
           continue;
         }
         {
-          // Validate IP/mask: if host bits are set (e.g., 198.51.100.9/27), Junos rejects it.
-          // Fix: for host addresses with non-/32 mask, use /32 (it's a host, not a network).
-          let fixedAddr = addrValue;
-          const cidrMatch = addrValue.match(/^(\d+\.\d+\.\d+\.\d+)\/(\d+)$/);
-          if (cidrMatch) {
-            const [, ip, maskStr] = cidrMatch;
-            const mask = parseInt(maskStr);
-            if (mask < 32) {
-              // Check if host bits are set
-              const ipNum = ip.split('.').reduce((acc, oct) => (acc << 8) + parseInt(oct), 0) >>> 0;
-              const netMask = mask === 0 ? 0 : (0xFFFFFFFF << (32 - mask)) >>> 0;
-              if ((ipNum & ~netMask) !== 0) {
-                // Host bits set — use /32 for address-book entry
-                fixedAddr = `${ip}/32`;
-              }
-            }
+          // Junos rejects host bits in a prefix: a host becomes /32, anything else its network address.
+          const { prefix, masked } = normalizeAddressPrefix(obj.type, addrValue);
+          if (masked) {
+            warnings.push(createWarning('warning', `address/${name}`,
+              `Address "${obj.name}" has host bits set (${addrValue}) — converted to ${prefix}`,
+              'Confirm the network address is the intended range'));
           }
-          commands.push(`set security address-book global address ${name} ${fixedAddr}`);
+          commands.push(`set security address-book global address ${name} ${prefix}`);
         }
         break;
       case 'range':
@@ -987,6 +977,7 @@ function convertServiceObjects(services, commands, warnings, summary, identifier
           const subName = identifiers.nameForGenerated(ownerPath, `service-port:${part}`);
           commands.push(`set applications application ${subName} protocol ${protocol}`);
           commands.push(`set applications application ${subName} destination-port ${part}`);
+          if (svc.source_port) commands.push(`set applications application ${subName} source-port ${svc.source_port}`);
         }
         for (const part of portParts) {
           const subName = identifiers.nameForGenerated(ownerPath, `service-port:${part}`);
@@ -995,10 +986,7 @@ function convertServiceObjects(services, commands, warnings, summary, identifier
       } else {
         commands.push(`set applications application ${name} protocol ${protocol}`);
         commands.push(`set applications application ${name} destination-port ${port}`);
-      }
-
-      if (svc.source_port) {
-        commands.push(`set applications application ${name} source-port ${svc.source_port}`);
+        if (svc.source_port) commands.push(`set applications application ${name} source-port ${svc.source_port}`);
       }
     }
 
@@ -2332,6 +2320,7 @@ function convertNatRules(
       rule.comments.forEach(comment);
       if (rule.skipped) continue;
       const rulePath = `${ruleSetPath} rule ${rule.name}`;
+      commands.push(...matchLines(rulePath, 'source-address', rule.match.source));
       commands.push(...matchLines(rulePath, 'destination-address', rule.match.destination));
       if (rule.match.destinationPort) commands.push(`set ${rulePath} match destination-port ${portText(rule.match.destinationPort)}`);
       if (rule.match.protocol) commands.push(`set ${rulePath} match protocol ${rule.match.protocol}`);
