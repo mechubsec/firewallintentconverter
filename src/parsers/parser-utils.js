@@ -89,6 +89,27 @@ export function getNestedValue(obj, path, defaultValue = undefined) {
 }
 
 /**
+ * Makes an IPv4 address-book prefix valid for Junos when host bits are set
+ * (e.g. 198.51.100.9/27). A host becomes a /32; any other type keeps its mask
+ * and is rounded down to the network address, so the range is never shrunk.
+ * @param {string} type - Address object type
+ * @param {string} value - Address or CIDR prefix
+ * @returns {{ prefix: string, masked: boolean }} masked is true when a non-host prefix was rounded to its network
+ */
+export function normalizeAddressPrefix(type, value) {
+  const cidrMatch = String(value).match(/^(\d+)\.(\d+)\.(\d+)\.(\d+)\/(\d+)$/);
+  if (!cidrMatch) return { prefix: value, masked: false };
+  const mask = parseInt(cidrMatch[5], 10);
+  if (mask >= 32) return { prefix: value, masked: false };
+  const ipNumber = ((cidrMatch[1] << 24) | (cidrMatch[2] << 16) | (cidrMatch[3] << 8) | Number(cidrMatch[4])) >>> 0;
+  const netMask = mask === 0 ? 0 : (0xFFFFFFFF << (32 - mask)) >>> 0;
+  if ((ipNumber & ~netMask) === 0) return { prefix: value, masked: false };
+  if (type === 'host') return { prefix: `${cidrMatch[1]}.${cidrMatch[2]}.${cidrMatch[3]}.${cidrMatch[4]}/32`, masked: false };
+  const network = (ipNumber & netMask) >>> 0;
+  return { prefix: `${network >>> 24}.${(network >>> 16) & 255}.${(network >>> 8) & 255}.${network & 255}/${mask}`, masked: true };
+}
+
+/**
  * Generates a conversion warning object.
  *
  * @param {'clean'|'warning'|'unsupported'|'interview_required'} severity

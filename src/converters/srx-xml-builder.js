@@ -10,7 +10,7 @@
  * Phase 2+: Full XML with NAT, routing, VPN, UTM.
  */
 
-import { sanitizeJunosName, mapAppToJunos, hasSpecificService, mapProfileToSrx, createWarning, isPredefEquivalent } from '../parsers/parser-utils.js';
+import { sanitizeJunosName, mapAppToJunos, hasSpecificService, mapProfileToSrx, createWarning, isPredefEquivalent, normalizeAddressPrefix } from '../parsers/parser-utils.js';
 import {
   setEnum,
   setInteger,
@@ -156,7 +156,7 @@ export function buildSrxXml(config, interfaceMappings = {}, targetContext = null
   buildZonesXml(config.zones, lines, interfaceMappings, identifierNames, warnings);
 
   // Address book
-  buildAddressBookXml(config.address_objects, config.address_groups, lines, identifierNames);
+  buildAddressBookXml(config.address_objects, config.address_groups, lines, identifierNames, warnings);
 
   // UTM
   buildUtmXml(utmProfiles, lines, identifierNames);
@@ -321,7 +321,7 @@ function buildZonesXml(zones, lines, interfaceMappings = {}, identifierNames, wa
 // Address Book XML Builder
 // ---------------------------------------------------------------------------
 
-function buildAddressBookXml(addressObjects, addressGroups, lines, identifierNames) {
+function buildAddressBookXml(addressObjects, addressGroups, lines, identifierNames, warnings = []) {
   if ((!addressObjects || addressObjects.length === 0) &&
       (!addressGroups || addressGroups.length === 0)) return;
 
@@ -332,14 +332,33 @@ function buildAddressBookXml(addressObjects, addressGroups, lines, identifierNam
   for (let objectIndex = 0; objectIndex < (addressObjects || []).length; objectIndex += 1) {
     const obj = addressObjects[objectIndex];
     const name = identifierNames.definition(`address_objects[${objectIndex}].name`);
+    // Same value lookup as the set output (SonicWall uses subnet/network/address)
+    const addrValue = obj.value || obj.ip || obj.network || obj.subnet || obj.address;
+    const needsValue = ['host', 'subnet', 'network', 'ip-netmask', 'ip-prefix', 'range'].includes(obj.type);
+    if (needsValue && !addrValue) {
+      warnings.push(createWarning('warning', `address/${name}`,
+        `Address "${obj.name}" (type: ${obj.type}) has no IP/subnet value — skipped`,
+        'Add an IP address or subnet to this address object'));
+      continue;
+    }
     lines.push('      <address>');
     lines.push(`        <name>${xmlText(name)}</name>`);
 
     switch (obj.type) {
       case 'host':
       case 'subnet':
-        lines.push(`        <ip-prefix>${xmlText(obj.value)}</ip-prefix>`);
+      case 'network':
+      case 'ip-netmask':
+      case 'ip-prefix': {
+        const { prefix, masked } = normalizeAddressPrefix(obj.type, addrValue);
+        if (masked) {
+          warnings.push(createWarning('warning', `address/${name}`,
+            `Address "${obj.name}" has host bits set (${addrValue}) — converted to ${prefix}`,
+            'Confirm the network address is the intended range'));
+        }
+        lines.push(`        <ip-prefix>${xmlText(prefix)}</ip-prefix>`);
         break;
+      }
       case 'fqdn': {
         const fqdnValue = (obj.value && obj.value.startsWith('*.')) ? obj.value.slice(2) : obj.value;
         lines.push(`        <dns-name>`);
@@ -355,7 +374,7 @@ function buildAddressBookXml(addressObjects, addressGroups, lines, identifierNam
       case 'range':
         lines.push(`        <range-address>`);
         lines.push(`          <name>${xmlText(name)}</name>`);
-        const [low, high] = obj.value.split('-').map(s => s.trim());
+        const [low, high] = addrValue.split('-').map(s => s.trim());
         lines.push(`          <low>${xmlText(low)}</low>`);
         lines.push(`          <high>${xmlText(high)}</high>`);
         lines.push(`        </range-address>`);
@@ -823,6 +842,7 @@ function buildNatXml(config, lines, warnings, identifierNames, interfaceMappings
         lines.push('          <rule>');
         lines.push(`            <name>${xmlText(rule.name)}</name>`);
         lines.push('            <dest-nat-rule-match>');
+        matchElements('              ', 'source-address', rule.match.source);
         dstAddrElements('              ', rule.match.destination);
         if (rule.match.destinationPort) lines.push(portElement('              ', rule.match.destinationPort));
         if (rule.match.protocol) lines.push(`              <protocol>${xmlText(rule.match.protocol)}</protocol>`);
@@ -932,6 +952,7 @@ function buildApplicationsXml(serviceObjects, applications, serviceGroups, lines
         lines.push('    <application>');
         lines.push(`      <name>${xmlText(childName)}</name>`);
         lines.push(`      <protocol>${xmlText(protocol)}</protocol>`);
+        if (app.source_port) lines.push(`      <source-port>${xmlText(app.source_port)}</source-port>`);
         lines.push(`      <destination-port>${xmlText(part)}</destination-port>`);
         lines.push('    </application>');
       }
@@ -981,6 +1002,7 @@ function buildApplicationsXml(serviceObjects, applications, serviceGroups, lines
       lines.push('    <application>');
       lines.push(`      <name>${xmlText(name)}</name>`);
       lines.push(`      <protocol>${xmlText(protocol)}</protocol>`);
+      if (app.source_port) lines.push(`      <source-port>${xmlText(app.source_port)}</source-port>`);
       lines.push(`      <destination-port>${xmlText(port)}</destination-port>`);
       if (app.description) {
         lines.push(`      <description>${xmlText(app.description)}</description>`);
