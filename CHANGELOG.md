@@ -2,6 +2,86 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.4.0] - 2026-11-11
+
+Correctness release from a full review of the parsers, converters, analysis,
+bridge and UI. Many fixes change generated policy and NAT, and several rules
+that used to convert wider than the source now convert deactivated with a
+warning. Review the **Security** section before re-exporting configurations
+made with 1.3.x.
+
+### Security
+- Converted rules no longer match more than the source rule:
+  - ASA `permit object-group SVC any host X` widened the destination to any;
+    `neq`/`gt`/`lt` ports matched a single port (#178).
+  - Azure `VirtualNetwork` and other service tags mapped to `0.0.0.0/0`, so
+    the default `AllowVnetInBound` permitted all inbound; those rules are now
+    disabled until the CIDRs are filled in. Tcp/Udp port `*` and protocol `*`
+    became application any; outbound rules dropped their source (#179).
+  - PAN-OS `intrazone`/`interzone` rule types were ignored (#182).
+  - FortiGate policies without `set action` (default deny) converted to
+    permit; `service-negate`, `internet-service` and v6-only policies widened
+    to any and are now deactivated with a warning (#181).
+  - Check Point inline-layer parents became an unconditional allow and their
+    children lost the parent's match; unknown actions converted to allow
+    (#183).
+  - SRX policies and NAT rules with numeric names were reordered; deactivated
+    NAT rules converted active (#183).
+  - Huawei inline addresses in unrecognised forms fell back to any (#180).
+  - Policies with one `any` zone lost the other zone in XML and set
+    `zone-pair` output (#184).
+  - Destination NAT dropped its source match; subnet objects with host bits
+    shrank to `/32` in set output (#185).
+  - PAN-OS destination NAT with a predefined service matched all ports, and
+    no-NAT exemptions were dropped (#182).
+- Analysis no longer reports rules as shadowed, redundant or mergeable across
+  different users, when `application any` has a specific service, or when
+  `application-default` differs (#175).
+- pyez-bridge: quoted keywords (`set system "root-authentication"`) passed the
+  forbidden-hierarchy check; `/commit` reported a confirm timer it had not set
+  (#174).
+- `__proto__` names in FortiGate and SRX configs polluted `Object.prototype`
+  (#181, #183).
+- The convert gate counted accepted source rules in the PAN-OS view while
+  exporting the translated rules (#177).
+
+### Added
+- SRX parser: destination NAT pools, named and zone-attached address-books
+  (#183).
+- PAN-OS weekly schedules with per-day times (#182).
+- XML sub-interface VLAN tagging (#184).
+- Service source ports in set and XML output; FortiGate and Azure source ports
+  parsed (#179, #181, #185).
+- ICMP type and code from AWS security groups and Huawei service-sets (#179,
+  #180).
+
+### Fixed
+- Conversion no longer throws on AWS and ASA duplicate rule names, AWS ICMP
+  ports, multiple Azure NSGs, PAN-OS multi-vsys or Check Point `/0` networks
+  (#178, #179, #182, #183).
+- GCP priority 0 sorted as 1000 (#179); ASA `access-group global` produced a
+  `global` zone (#178); SonicWall rules with quoted names were dropped and
+  nested groups split (#180); Huawei service-sets with source ports were
+  dropped and wildcard masks read as netmasks (#180); PAN-OS numeric member
+  names were mangled (#182).
+- XML address-book entries for `ip-netmask`, `ip-prefix` and `network` objects
+  were empty (#185); policies referenced schedules that were not emitted
+  (#184); NAT warnings carry the owning rule (#141).
+- UI: Inspector edits were lost in source view and after a rename; select-all
+  included filtered-out rows; bulk actions in merge mode changed the wrong
+  config; undo crossed project loads; section acceptance was not saved; Day 2
+  hit counts were shared across zone pairs; Check Point JSON was detected as
+  PAN-OS; blocked localStorage blanked the page (#176, #177).
+
+### Changed
+- `permit` and `accept` actions convert to permit in set and XML output (set
+  previously emitted deny, XML reject) (#184).
+- PAN-OS intrazone and interzone rules are expanded per zone and named
+  `<rule>-<zone>` (#182).
+- Multi-VDOM FortiGate backups raise an error: per-VDOM parsing is not
+  implemented (#181).
+- CI: the SAST job runs on Python 3.12 (#173).
+
 ## [1.3.0] - 2026-10-26
 
 Conversion-fidelity release. Several fixes change generated policy and NAT
