@@ -9,6 +9,7 @@ import { useCallback } from 'react';
 import { useConfigContext } from '../contexts/ConfigContext.jsx';
 import { useUIContext } from '../contexts/UIContext.jsx';
 import { useMergeContext } from '../contexts/MergeContext.jsx';
+import { useUndoContext } from '../contexts/UndoContext.jsx';
 import useUndoRedo from './useUndoRedo.js';
 import { parseConfig, sanitizeConfig } from '../utils/engine.js';
 
@@ -27,6 +28,7 @@ export default function useConfig() {
   const { state: uiState, dispatch: uiDispatch } = useUIContext();
   const { state: mergeState, dispatch: mergeDispatch } = useMergeContext();
   const { pushSnapshot } = useUndoRedo();
+  const { dispatch: undoDispatch } = useUndoContext();
 
   // -----------------------------------------------------------------------
   // updateConfig — wraps config dispatch with merge mode awareness
@@ -94,6 +96,9 @@ export default function useConfig() {
 
     uiDispatch({ type: 'SET_LOADING', isLoading: true, message: 'Sanitizing & parsing configuration...' });
     uiDispatch({ type: 'CLEAR_ERROR' });
+
+    // Old snapshots belong to the config being replaced; Ctrl+Z must not restore them
+    undoDispatch({ type: 'CLEAR' });
 
     // Reset conversion & translation state
     configDispatch({ type: 'SET_FIELD', field: 'srxTranslatedPolicies', value: null });
@@ -171,7 +176,7 @@ export default function useConfig() {
     } finally {
       uiDispatch({ type: 'SET_LOADING', isLoading: false });
     }
-  }, [configState.configText, configState.isSanitized, mergeState.mergeMode, configDispatch, uiDispatch]);
+  }, [configState.configText, configState.isSanitized, mergeState.mergeMode, undoDispatch, configDispatch, uiDispatch]);
 
   // -----------------------------------------------------------------------
   // Security policy CRUD
