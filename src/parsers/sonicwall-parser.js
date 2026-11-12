@@ -980,9 +980,10 @@ function parseCliAddressGroups(lines, warnings) {
   for (const line of lines) {
     const trimmed = line.trim();
 
-    // Start of a new group
+    // Start of a new group (only at top level; an indented line is a nested member)
     const grpMatch = trimmed.match(/^address-group\s+ipv4\s+"([^"]+)"/i);
-    if (grpMatch) {
+    const isIndented = line.startsWith(' ') || line.startsWith('\t');
+    if (grpMatch && !(currentGroup && isIndented)) {
       if (currentGroup) groups.push(currentGroup);
       currentGroup = { name: grpMatch[1], members: [], description: '', tags: [] };
       continue;
@@ -1052,54 +1053,59 @@ function parseCliAccessRules(lines, warnings) {
     const trimmed = line.trim();
 
     const ruleMatch = trimmed.match(
-      /^access-rule\s+ipv4\s+from\s+(\S+)\s+to\s+(\S+)\s+action\s+(\S+)\s+source\s+(\S+)\s+destination\s+(\S+)\s+service\s+(.+)/i
+      /^access-rule\s+ipv4\s+from\s+(\S+)\s+to\s+(\S+)\s+action\s+(\S+)\s+source\s+("[^"]+"|\S+)\s+destination\s+("[^"]+"|\S+)\s+service\s+(.+)/i
     );
-    if (ruleMatch) {
-      const fromZone = ruleMatch[1];
-      const toZone = ruleMatch[2];
-      let action = ruleMatch[3].toLowerCase();
-      const src = ruleMatch[4];
-      const dst = ruleMatch[5];
-      const svc = ruleMatch[6].trim();
-
-      if (action === 'discard' || action === 'drop') action = 'deny';
-      if (action === 'permit') action = 'allow';
-
-      // Resolve 'any' keyword
-      const srcAddrs = src.toLowerCase() === 'any' ? ['any'] : [unquote(src)];
-      const dstAddrs = dst.toLowerCase() === 'any' ? ['any'] : [unquote(dst)];
-      const serviceNames = svc.toLowerCase() === 'any' ? ['any'] : [unquote(svc)];
-
-      policies.push({
-        name: `Rule-${ruleIndex}`,
-        src_zones: [fromZone],
-        dst_zones: [toZone],
-        src_addresses: srcAddrs,
-        dst_addresses: dstAddrs,
-        negate_source: false,
-        negate_destination: false,
-        applications: [],
-        services: serviceNames,
-        action,
-        log_start: false,
-        log_end: false,
-        profile_group: '',
-        security_profiles: {},
-        description: '',
-        tags: [],
-        disabled: false,
-        schedule: '',
-        source_users: [],
-        _rule_index: ruleIndex++,
-        _sonicwall: {
-          uuid: '',
-          priority: null,
-          connectionLimit: false,
-          dpi: false,
-          schedule: '',
-        },
-      });
+    if (!ruleMatch) {
+      if (/^access-rule\s/i.test(trimmed)) {
+        warnings.push(createWarning('warning', 'access-rule', `Could not parse access-rule line: ${trimmed}`,
+          'Review this rule by hand; it was not converted'));
+      }
+      continue;
     }
+    const fromZone = ruleMatch[1];
+    const toZone = ruleMatch[2];
+    let action = ruleMatch[3].toLowerCase();
+    const src = ruleMatch[4];
+    const dst = ruleMatch[5];
+    const svc = ruleMatch[6].trim();
+
+    if (action === 'discard' || action === 'drop') action = 'deny';
+    if (action === 'permit') action = 'allow';
+
+    // Resolve 'any' keyword
+    const srcAddrs = src.toLowerCase() === 'any' ? ['any'] : [unquote(src)];
+    const dstAddrs = dst.toLowerCase() === 'any' ? ['any'] : [unquote(dst)];
+    const serviceNames = svc.toLowerCase() === 'any' ? ['any'] : [unquote(svc)];
+
+    policies.push({
+      name: `Rule-${ruleIndex}`,
+      src_zones: [fromZone],
+      dst_zones: [toZone],
+      src_addresses: srcAddrs,
+      dst_addresses: dstAddrs,
+      negate_source: false,
+      negate_destination: false,
+      applications: [],
+      services: serviceNames,
+      action,
+      log_start: false,
+      log_end: false,
+      profile_group: '',
+      security_profiles: {},
+      description: '',
+      tags: [],
+      disabled: false,
+      schedule: '',
+      source_users: [],
+      _rule_index: ruleIndex++,
+      _sonicwall: {
+        uuid: '',
+        priority: null,
+        connectionLimit: false,
+        dpi: false,
+        schedule: '',
+      },
+    });
   }
 
   return policies;
