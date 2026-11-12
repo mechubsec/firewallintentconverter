@@ -90,60 +90,37 @@ function expandPorts(portRange, portRanges) {
   return results.length > 0 ? results : ['any'];
 }
 
-/**
- * Azure service tags that map to well-known address concepts.
- */
-const SERVICE_TAG_MAP = {
-  '*': 'any',
-  'Internet': 'any',
-  'VirtualNetwork': 'VirtualNetwork',
-  'AzureLoadBalancer': 'AzureLoadBalancer',
-};
+const IPV4_PATTERN = /^\d{1,3}(\.\d{1,3}){3}(\/\d{1,2})?$/;
 
 /**
  * Resolve an Azure address prefix to an address object name, creating the
- * object if it does not already exist.
+ * object if it does not already exist. "*" and "Internet" mean any. Service
+ * tags (VirtualNetwork, Storage, ...) cannot be resolved from an NSG export, so
+ * they are recorded in unresolvedTags and the caller must not enable the rule.
  *
- * @param {string} prefix - e.g. "10.0.0.0/24", "*", "VirtualNetwork"
+ * @param {string} prefix - e.g. "10.0.0.0/24", "2001:db8::1", "*", "VirtualNetwork"
  * @param {string} zoneName
  * @param {Object[]} addressObjects
  * @param {Set} addressObjectSet
- * @param {Object[]} warnings
+ * @param {string[]} unresolvedTags - collects unresolvable service tags
  * @returns {string} - address object name or "any"
  */
-function resolveAddress(prefix, zoneName, addressObjects, addressObjectSet, warnings) {
-  if (!prefix || prefix === '*') return 'any';
+function resolveAddress(prefix, zoneName, addressObjects, addressObjectSet, unresolvedTags) {
+  if (!prefix || prefix === '*' || prefix === 'Internet') return 'any';
 
-  // Check service tags
-  const tagName = SERVICE_TAG_MAP[prefix];
-  if (tagName === 'any') return 'any';
-
-  if (tagName) {
-    const objName = `azure-tag-${prefix}`;
-    if (!addressObjectSet.has(objName)) {
-      addressObjectSet.add(objName);
-      addressObjects.push({
-        name: objName,
-        type: 'ip-netmask',
-        value: '0.0.0.0/0',
-        zone: zoneName,
-      });
-      warnings.push(createWarning('info', `address/${objName}`,
-        `Azure service tag "${prefix}" mapped as placeholder 0.0.0.0/0`,
-        'Replace with actual CIDR ranges for the Azure service tag'));
-    }
-    return objName;
+  const isIpv6 = prefix.includes(':');
+  if (!isIpv6 && !IPV4_PATTERN.test(prefix)) {
+    unresolvedTags.push(prefix);
+    return 'any';
   }
 
-  // CIDR or IP address
   const addrName = `addr-${prefix.replace(/[/:]/g, '_')}`;
   if (!addressObjectSet.has(addrName)) {
     addressObjectSet.add(addrName);
-    const isCidr = prefix.includes('/') || prefix.includes(':');
     addressObjects.push({
       name: addrName,
-      type: isCidr ? 'ip-netmask' : 'ip-netmask',
-      value: prefix.includes('/') ? prefix : `${prefix}/32`,
+      type: 'ip-netmask',
+      value: prefix.includes('/') ? prefix : `${prefix}/${isIpv6 ? 128 : 32}`,
       zone: zoneName,
     });
   }
@@ -157,23 +134,64 @@ function resolveAddress(prefix, zoneName, addressObjects, addressObjectSet, warn
  * @param {string} zoneName
  * @param {Object[]} addressObjects
  * @param {Set} addressObjectSet
- * @param {Object[]} warnings
+ * @param {string[]} unresolvedTags
  * @returns {string[]}
  */
-function resolveAddresses(prefix, prefixes, zoneName, addressObjects, addressObjectSet, warnings) {
+function resolveAddresses(prefix, prefixes, zoneName, addressObjects, addressObjectSet, unresolvedTags) {
   const results = [];
 
   if (prefix) {
-    results.push(resolveAddress(prefix, zoneName, addressObjects, addressObjectSet, warnings));
+    results.push(resolveAddress(prefix, zoneName, addressObjects, addressObjectSet, unresolvedTags));
   }
 
   if (Array.isArray(prefixes)) {
     for (const p of prefixes) {
-      results.push(resolveAddress(p, zoneName, addressObjects, addressObjectSet, warnings));
+      results.push(resolveAddress(p, zoneName, addressObjects, addressObjectSet, unresolvedTags));
     }
   }
 
   return results.length > 0 ? results : ['any'];
+}
+
+const FULL_PORT_RANGE = '1-65535';
+
+/**
+ * Build (and register) the service objects for one rule. A protocol with "*" ports
+ * covers every port of that protocol only; protocol "*" with a port covers tcp and udp.
+ *
+ * @param {string} protocol - normalized protocol
+ * @param {string[]} dstPorts - expanded destination ports ("any" for wildcard)
+ * @param {string[]} srcPorts - expanded source ports ("any" for wildcard)
+ * @param {Object[]} serviceObjects
+ * @param {Set} serviceObjectSet
+ * @param {string[]} issues - collects reasons the rule cannot be translated
+ * @returns {string[]} service names
+ */
+function buildServices(protocol, dstPorts, srcPorts, serviceObjects, serviceObjectSet, issues) {
+  const sourcePort = srcPorts[0] === 'any' ? '' : srcPorts[0];
+  if (srcPorts.length > 1) issues.push('multiple source port ranges are not supported');
+
+  const anyDestination = dstPorts.every(portSpec => portSpec === 'any');
+  if (protocol === 'any' && anyDestination && !sourcePort) return ['any'];
+
+  const protocols = protocol === 'any' ? ['tcp', 'udp'] : [protocol];
+  const names = [];
+  for (const proto of protocols) {
+    if (!['tcp', 'udp', 'icmp'].includes(proto)) {
+      issues.push(`protocol "${proto}" has no service mapping`);
+      continue;
+    }
+    const portSpecs = proto === 'icmp' ? [''] : dstPorts.map(portSpec => (portSpec === 'any' ? FULL_PORT_RANGE : portSpec));
+    for (const port of portSpecs) {
+      const svcName = proto === 'icmp' ? 'icmp' : `${proto}/${sourcePort ? `${sourcePort}:` : ''}${port}`;
+      if (!serviceObjectSet.has(svcName)) {
+        serviceObjectSet.add(svcName);
+        serviceObjects.push({ name: svcName, protocol: proto, port, source_port: proto === 'icmp' ? '' : sourcePort });
+      }
+      names.push(svcName);
+    }
+  }
+  return [...new Set(names)];
 }
 
 // ---------------------------------------------------------------------------
@@ -198,40 +216,28 @@ export function parseAzureNsg(configText) {
   }
 
   // Locate the security rules — multiple possible structures
-  let securityRules = [];
-  let defaultRules = [];
-  let nsgName = 'azure-nsg';
-
+  const nsgs = [];
   if (Array.isArray(parsed)) {
-    // Array of NSGs — take all rules from all NSGs
     for (const nsg of parsed) {
-      const rules = extractRulesFromNsg(nsg);
-      securityRules.push(...rules.securityRules);
-      defaultRules.push(...rules.defaultRules);
-      if (nsg.name) nsgName = nsg.name;
+      if (nsg && typeof nsg === 'object') nsgs.push({ name: nsg.name || 'azure-nsg', ...extractRulesFromNsg(nsg) });
     }
   } else if (parsed && typeof parsed === 'object') {
     // Direct NSG object or ARM template
-    const rules = extractRulesFromNsg(parsed);
-    securityRules = rules.securityRules;
-    defaultRules = rules.defaultRules;
-    if (parsed.name) nsgName = parsed.name;
+    nsgs.push({ name: parsed.name || 'azure-nsg', ...extractRulesFromNsg(parsed) });
   }
 
-  if (securityRules.length === 0 && defaultRules.length === 0) {
+  if (nsgs.every(nsg => nsg.securityRules.length === 0 && nsg.defaultRules.length === 0)) {
     warnings.push(createWarning('warning', 'input', 'No security rules found in input', 'Ensure input contains "securityRules" or is a valid ARM template with NSG resources'));
   }
 
-  // Merge and sort all rules by priority
-  const allRules = [...securityRules, ...defaultRules];
-  allRules.sort((a, b) => {
-    const prioA = getPriority(a);
-    const prioB = getPriority(b);
-    return prioA - prioB;
-  });
+  // Merge and sort all rules by priority, each tagged with its NSG and zone
+  const prefixNames = nsgs.length > 1;
+  const allRules = nsgs.flatMap(nsg => [...nsg.securityRules, ...nsg.defaultRules]
+    .map(rule => ({ rule, nsgName: nsg.name, zoneName: `nsg-${nsg.name}` })));
+  allRules.sort((a, b) => getPriority(a.rule) - getPriority(b.rule));
 
-  const zoneName = `nsg-${nsgName}`;
-  const zones = [{ name: zoneName, interfaces: [] }];
+  const nsgName = nsgs.length > 0 ? nsgs[nsgs.length - 1].name : 'azure-nsg';
+  const zones = [...new Set(nsgs.map(nsg => `nsg-${nsg.name}`))].map(name => ({ name, interfaces: [] }));
 
   const addressObjects = [];
   const addressObjectSet = new Set();
@@ -240,51 +246,44 @@ export function parseAzureNsg(configText) {
   const securityPolicies = [];
 
   for (let idx = 0; idx < allRules.length; idx++) {
-    const rule = allRules[idx];
+    const { rule, nsgName: ruleNsgName, zoneName } = allRules[idx];
     const props = rule.properties || rule;
-    const ruleName = rule.name || props.name || `rule-${idx}`;
+    const baseName = rule.name || props.name || `rule-${idx}`;
+    const ruleName = prefixNames ? `${ruleNsgName}-${baseName}` : baseName;
     const priority = getPriority(rule);
     const direction = (props.direction || 'Inbound').toLowerCase();
     const access = (props.access || 'Allow').toLowerCase();
     const protocol = normalizeProtocol(props.protocol);
 
-    // Resolve source addresses
+    const unresolvedTags = [];
     const srcAddresses = resolveAddresses(
       props.sourceAddressPrefix,
       props.sourceAddressPrefixes,
-      zoneName, addressObjects, addressObjectSet, warnings
+      zoneName, addressObjects, addressObjectSet, unresolvedTags
     );
 
     // Resolve destination addresses
     const dstAddresses = resolveAddresses(
       props.destinationAddressPrefix,
       props.destinationAddressPrefixes,
-      zoneName, addressObjects, addressObjectSet, warnings
+      zoneName, addressObjects, addressObjectSet, unresolvedTags
     );
 
-    // Build service objects from destination ports
-    const dstPorts = expandPorts(props.destinationPortRange, props.destinationPortRanges);
-    const serviceNames = [];
+    const issues = unresolvedTags.map(tag => `service tag "${tag}" cannot be resolved from an NSG export`);
+    const uniqueServices = buildServices(
+      protocol,
+      expandPorts(props.destinationPortRange, props.destinationPortRanges),
+      expandPorts(props.sourcePortRange, props.sourcePortRanges),
+      serviceObjects, serviceObjectSet, issues
+    );
 
-    for (const portSpec of dstPorts) {
-      if (portSpec === 'any' || protocol === 'any') {
-        serviceNames.push('any');
-        continue;
-      }
-      const svcName = `${protocol}/${portSpec}`;
-      if (!serviceObjectSet.has(svcName)) {
-        serviceObjectSet.add(svcName);
-        serviceObjects.push({
-          name: svcName,
-          protocol,
-          port: portSpec,
-          source_port: '',
-        });
-      }
-      serviceNames.push(svcName);
+    // Fail closed: a rule we cannot translate faithfully is disabled, never widened
+    const disabled = issues.length > 0;
+    if (disabled) {
+      warnings.push(createWarning('warning', `policy/${ruleName}`,
+        `Rule "${ruleName}" disabled: ${issues.join('; ')}`,
+        'Replace the service tag with its CIDR ranges (e.g. the VNet address space), then enable the rule'));
     }
-
-    const uniqueServices = [...new Set(serviceNames)];
 
     const isInbound = direction === 'inbound';
     const action = access === 'allow' ? 'allow' : 'deny';
@@ -293,15 +292,15 @@ export function parseAzureNsg(configText) {
       name: ruleName,
       src_zones: isInbound ? ['any'] : [zoneName],
       dst_zones: isInbound ? [zoneName] : ['any'],
-      src_addresses: isInbound ? srcAddresses : ['any'],
-      dst_addresses: isInbound ? dstAddresses : dstAddresses,
-      services: uniqueServices.length > 0 ? uniqueServices : ['any'],
+      src_addresses: srcAddresses,
+      dst_addresses: dstAddresses,
+      services: uniqueServices.length > 0 ? uniqueServices : ['any'], // empty only when disabled
       applications: ['any'],
       action,
       logging: true,
-      disabled: false,
+      disabled,
       description: props.description || `Azure NSG rule (priority ${priority}, ${direction})`,
-      tags: [`azure-nsg:${nsgName}`, `priority:${priority}`],
+      tags: [`azure-nsg:${ruleNsgName}`, `priority:${priority}`],
       source_users: ['any'],
       _rule_index: idx,
     });
