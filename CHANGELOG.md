@@ -2,6 +2,13 @@
 
 All notable changes to this project will be documented in this file.
 
+## [1.4.1] - 2026-11-12
+
+### Security
+- Bump fast-xml-parser from 5.8.0 to 5.12.0, clearing the low-severity
+  stop-node advisory (quadratic CPU on unterminated stop-node tags). The app
+  sets no `stopNodes`, so it was not reachable (#186).
+
 ## [1.4.0] - 2026-11-11
 
 Correctness release from a full review of the parsers, converters, analysis,
