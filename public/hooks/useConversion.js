@@ -31,6 +31,14 @@ function safeJunosPlanningPath(candidate) {
   return SAFE_STRUCTURAL_PATH.test(structuralPath) ? structuralPath : undefined;
 }
 
+/**
+ * Policies that handleConvert will export: the translated set when present,
+ * otherwise the source rules. The acceptance gate must check the same set.
+ */
+export function getExportPolicies(srxTranslatedPolicies, intermediateConfig) {
+  return srxTranslatedPolicies || intermediateConfig?.security_policies || [];
+}
+
 export function formatJunosSerializationError(error, prefix) {
   if (error instanceof JunosIdentifierPlanningError) {
     const location = safeJunosPlanningPath(error.referencePaths?.[0])
@@ -149,9 +157,7 @@ export default function useConversion() {
   // -----------------------------------------------------------------------
   const handleConvertClick = useCallback((format = 'set') => {
     // Check if all rules are accepted
-    const policies = (uiState.platformView === 'srx' && srxTranslatedPolicies)
-      ? srxTranslatedPolicies
-      : (intermediateConfig?.security_policies || []);
+    const policies = getExportPolicies(srxTranslatedPolicies, intermediateConfig);
     const accepted = policies.filter(r => r._review_status === 'accepted' || r.disabled).length;
     const allAccepted = policies.length > 0 && accepted === policies.length;
 
@@ -160,7 +166,7 @@ export default function useConversion() {
       return;
     }
     handleConvert(format);
-  }, [uiState.platformView, srxTranslatedPolicies, intermediateConfig, handleConvert, uiDispatch]);
+  }, [srxTranslatedPolicies, intermediateConfig, handleConvert, uiDispatch]);
 
   // -----------------------------------------------------------------------
   // handleMergeConvert — convert all parsed merge-mode slots to SRX output

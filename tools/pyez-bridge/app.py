@@ -661,7 +661,10 @@ def commit(name):
     elif not isinstance(data, dict):
         return _error_response("Request body must be a JSON object.")
     comment = data.get("comment", "")
-    confirm_minutes = data.get("confirm_minutes")
+    try:
+        confirm_minutes = max(int(data.get("confirm_minutes") or 0), 0)
+    except (TypeError, ValueError):
+        return _error_response("'confirm_minutes' must be an integer.")
 
     session = _get_session(name)
     if session is None or not session.checked:
@@ -671,14 +674,14 @@ def commit(name):
         kwargs = {}
         if comment:
             kwargs["comment"] = comment
-        if confirm_minutes and int(confirm_minutes) > 0:
-            kwargs["confirm"] = int(confirm_minutes)
+        if confirm_minutes:
+            kwargs["confirm"] = confirm_minutes
 
         session.cu.commit(**kwargs)
         _discard_session(name)
 
         msg = "Configuration committed successfully."
-        if confirm_minutes and int(confirm_minutes) > 0:
+        if confirm_minutes:
             msg = (
                 f"Configuration committed with {confirm_minutes}-minute confirm timer. "
                 f"Run 'confirm' within {confirm_minutes} minutes or the device will auto-rollback."

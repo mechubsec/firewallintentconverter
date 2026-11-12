@@ -1120,3 +1120,12 @@ describe('canonical project output', () => {
     expect(result.warnings).toEqual([]);
   });
 });
+
+describe('section acceptance persistence', () => {
+  it('saves sectionAcceptance and defaults it for older projects', () => {
+    const saved = buildProjectCore({ sectionAcceptance: { rules: true } }, 'p', { mode: 'unsanitized' });
+    expect(saved.state.sectionAcceptance).toEqual({ rules: true });
+    const legacy = { fpic_version: 5, state: { configText: 'x' } };
+    expect(validateProjectFile(legacy).project.state.sectionAcceptance).toEqual({});
+  });
+});

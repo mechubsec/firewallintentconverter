@@ -458,6 +458,9 @@ export default function useProject() {
     invalidatePendingImport();
     const s = validated.snapshot.project.state;
 
+    // The previous project's undo history must not be restorable over this one
+    undoDispatch({ type: 'CLEAR' });
+
     // Dispatch LOAD_PROJECT to each context with its relevant state subset
     configDispatch({
       type: 'LOAD_PROJECT',
@@ -526,7 +529,7 @@ export default function useProject() {
       field: 'llmWarningDismissed',
       value: s.isSanitized || s.greenfieldMode || false,
     });
-  }, [configDispatch, conversionDispatch, invalidatePendingImport, mergeDispatch, uiDispatch]);
+  }, [configDispatch, conversionDispatch, invalidatePendingImport, mergeDispatch, undoDispatch, uiDispatch]);
 
   // -----------------------------------------------------------------------
   // resetWorkspace — clear all working-data contexts and transient UI state,

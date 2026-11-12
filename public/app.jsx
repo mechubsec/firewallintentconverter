@@ -318,7 +318,7 @@ export default function App() {
       const slots = splits.map(s => ({
         id: crypto.randomUUID(), lsName: s.lsName, configText: cfg.configText,
         intermediateConfig: s.intermediateConfig, sourceVendor: prompt.vendor,
-        sourceModel: '', interfaceMappings: {}, parseWarnings: cfg.parseWarnings,
+        sourceModel: '', interfaceMappings: {}, parseWarnings: [...(cfg.parseWarnings || []), ...(s.warnings || [])],
         parseStats: s.intermediateConfig.metadata, isSanitized: cfg.isSanitized,
         sanitizationTable: cfg.sanitizationTable, srxTranslatedPolicies: null, warningStatuses: {},
       }));

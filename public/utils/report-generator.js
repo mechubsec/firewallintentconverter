@@ -144,8 +144,8 @@ export function generateReportHtml(data) {
   const gpGateways = arr(ic?.global_protect?.gateways);
   if (gpGateways.length > 0) {
     const raRows = gpGateways.map(g => [
-      esc(g.tunnel_interface || ''),
-      esc(g.name || ''),
+      g.tunnel_interface || '',
+      g.name || '',
       'Rebuild as Juniper Secure Connect / IPsec dial-up (re-implement MFA via RADIUS).',
     ]);
     const raHtml = `<p>SSL-VPN remote access is <strong>not auto-converted</strong>. `

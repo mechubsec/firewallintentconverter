@@ -5,12 +5,21 @@ import { useUIContext, isDeterministicMode } from '../../contexts/UIContext.jsx'
 import { countOverrides } from '../../utils/app-mapping-overrides.js';
 import BrandLockup from '../brand/BrandLockup.jsx';
 
+/** Read the stored theme without throwing when storage is blocked. */
+function readStoredTheme() {
+  try {
+    return localStorage.getItem('theme');
+  } catch {
+    return null;
+  }
+}
+
 /**
  * Resolves the active theme ('dark' or 'light') based on localStorage and OS preference.
  * @returns {'dark'|'light'}
  */
 function getEffectiveTheme() {
-  const stored = localStorage.getItem('theme');
+  const stored = readStoredTheme();
   if (stored === 'dark' || stored === 'light') return stored;
   // Auto: follow OS preference
   if (typeof window !== 'undefined' && window.matchMedia?.('(prefers-color-scheme: light)').matches) {
@@ -35,7 +44,7 @@ function useTheme() {
     const mq = window.matchMedia?.('(prefers-color-scheme: light)');
     if (!mq) return;
     const handler = () => {
-      const stored = localStorage.getItem('theme');
+      const stored = readStoredTheme();
       if (!stored) setThemeState(mq.matches ? 'light' : 'dark');
     };
     mq.addEventListener('change', handler);
@@ -45,7 +54,11 @@ function useTheme() {
   const toggleTheme = useCallback(() => {
     setThemeState(prev => {
       const next = prev === 'dark' ? 'light' : 'dark';
-      localStorage.setItem('theme', next);
+      try {
+        localStorage.setItem('theme', next);
+      } catch {
+        // Storage blocked: the toggle still applies for this session
+      }
       return next;
     });
   }, []);
