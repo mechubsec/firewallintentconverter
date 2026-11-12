@@ -222,6 +222,40 @@ class LoadCommitSessionTests(unittest.TestCase):
         self.assertIsNone(app_module._get_session("edge"))
         dev.close.assert_called_once_with()
 
+    def test_confirm_active_reflects_the_timer_actually_set(self):
+        for minutes, expected in ((5, True), ("5", True), (0, False), ("0", False), (-1, False)):
+            with self.subTest(minutes=minutes):
+                dev = Mock()
+                config = Mock()
+                self._load(dev, config)
+                self.client.post("/devices/edge/commit-check", headers=self.auth)
+
+                response = self.client.post(
+                    "/devices/edge/commit",
+                    json={"confirm_minutes": minutes},
+                    headers=self.auth,
+                )
+                self.assertEqual(response.get_json()["confirm_active"], expected)
+                if expected:
+                    config.commit.assert_called_once_with(confirm=5)
+                else:
+                    config.commit.assert_called_once_with()
+
+    def test_invalid_confirm_minutes_is_rejected_before_commit(self):
+        dev = Mock()
+        config = Mock()
+        self._load(dev, config)
+        self.client.post("/devices/edge/commit-check", headers=self.auth)
+
+        response = self.client.post(
+            "/devices/edge/commit",
+            json={"confirm_minutes": "soon"},
+            headers=self.auth,
+        )
+        self.assertEqual(response.status_code, 400)
+        config.commit.assert_not_called()
+        self.assertIsNotNone(app_module._get_session("edge"))
+
     def test_failed_commit_discards_the_session(self):
         dev = Mock()
         config = Mock()
