@@ -51,6 +51,12 @@ class ConfigValidationTests(unittest.TestCase):
             "set logical-systems tenant-a system services rlogin",
             "set system scripts commit file attacker.slax",
             "set event-options policy persist events UI_COMMIT",
+            # Quoting a keyword must not hide it from the hierarchy checks.
+            'set system "root-authentication" encrypted-password "$6$x"',
+            'set system root-"authentication" plain-text-password-value x',
+            'set system services "telnet"',
+            'set system "scripts" language python',
+            'set logical-systems tenant-a "system" services "rlogin"',
         )
         for text in payloads:
             with self.subTest(text=text):
