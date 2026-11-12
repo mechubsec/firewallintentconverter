@@ -144,6 +144,16 @@ function resolveAddress(cidr, zoneName, addressObjects, addressObjectSet) {
 // ---------------------------------------------------------------------------
 
 /**
+ * Rule priority; 0 is valid (highest), so only a missing or non-numeric value defaults to 1000.
+ * @param {Object} rule
+ * @returns {number}
+ */
+function getPriority(rule) {
+  const priority = Number(rule?.priority ?? NaN);
+  return Number.isFinite(priority) ? priority : 1000;
+}
+
+/**
  * Parses GCP VPC Firewall Rules JSON into the intermediate config schema.
  *
  * @param {string} configText - Raw JSON from `gcloud compute firewall-rules list --format=json`
@@ -180,9 +190,7 @@ export function parseGcpFirewallRules(configText) {
 
   // Sort by priority (lower = higher precedence, default 1000)
   rules.sort((a, b) => {
-    const prioA = Number(a.priority) || 1000;
-    const prioB = Number(b.priority) || 1000;
-    return prioA - prioB;
+    return getPriority(a) - getPriority(b);
   });
 
   const zones = [];
@@ -205,7 +213,7 @@ export function parseGcpFirewallRules(configText) {
     const networkName = extractNetworkName(rule.network);
     const zoneName = `net-${networkName}`;
     const direction = (rule.direction || 'INGRESS').toUpperCase();
-    const priority = Number(rule.priority) || 1000;
+    const priority = getPriority(rule);
     const isDisabled = rule.disabled === true;
     const description = rule.description || '';
 

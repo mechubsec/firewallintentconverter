@@ -38,6 +38,18 @@ function safeParse(text) {
 }
 
 /**
+ * ICMP uses FromPort as the type and ToPort as the code; -1 means any.
+ * @param {string} proto
+ * @param {number|undefined} fromPort - ICMP type
+ * @param {number|undefined} toPort - ICMP code
+ * @returns {string} e.g. "icmp", "icmp/8", "icmp/3/1"
+ */
+function icmpSuffix(proto, fromPort, toPort) {
+  if (!(fromPort >= 0)) return proto;
+  return toPort >= 0 ? `${proto}/${fromPort}/${toPort}` : `${proto}/${fromPort}`;
+}
+
+/**
  * Build a human-readable service name from protocol/port info.
  * @param {string} protocol
  * @param {number|undefined} fromPort
@@ -47,6 +59,7 @@ function safeParse(text) {
 function buildServiceName(protocol, fromPort, toPort) {
   if (protocol === '-1' || protocol === 'all') return 'any';
   const proto = protocol.toLowerCase();
+  if (proto === 'icmp') return icmpSuffix(proto, fromPort, toPort);
   if (fromPort === undefined || fromPort === null) return proto;
   if (fromPort === toPort) return `${proto}/${fromPort}`;
   return `${proto}/${fromPort}-${toPort}`;
@@ -309,7 +322,8 @@ function buildRulesFromPermission(perm, ctx) {
   const serviceName = buildServiceName(protocol, fromPort, toPort);
   if (serviceName !== 'any' && !serviceObjectSet.has(serviceName)) {
     serviceObjectSet.add(serviceName);
-    const portStr = (fromPort !== undefined && fromPort !== null)
+    const isIcmp = protocol === 'icmp';
+    const portStr = (!isIcmp && fromPort !== undefined && fromPort !== null)
       ? (fromPort === toPort ? String(fromPort) : `${fromPort}-${toPort}`)
       : '';
     serviceObjects.push({
@@ -317,6 +331,8 @@ function buildRulesFromPermission(perm, ctx) {
       protocol,
       port: portStr,
       source_port: '',
+      ...(isIcmp && fromPort >= 0 ? { icmp_type: String(fromPort) } : {}),
+      ...(isIcmp && fromPort >= 0 && toPort >= 0 ? { icmp_code: String(toPort) } : {}),
     });
   }
 
@@ -397,7 +413,7 @@ function buildRulesFromPermission(perm, ctx) {
     }
 
     const isInbound = direction === 'inbound';
-    const ruleName = `${sgName}-${direction}-${protocol}-${rules.length}`;
+    const ruleName = `${sgName}-${direction}-${protocol}-${ctx.ruleIndex + rules.length}`;
 
     rules.push({
       name: ruleName,
